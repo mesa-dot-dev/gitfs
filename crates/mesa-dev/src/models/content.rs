@@ -38,11 +38,19 @@ pub enum Content {
     },
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub enum DirEntryType {
+    #[serde(rename = "file")]
+    File,
+    #[serde(rename = "dir")]
+    Dir,
+}
+
 /// An entry within a directory listing.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DirEntry {
     /// Type of entry (`"file"` or `"dir"`).
-    pub entry_type: String,
+    pub entry_type: DirEntryType,
     /// Entry name.
     pub name: String,
     /// Entry path.

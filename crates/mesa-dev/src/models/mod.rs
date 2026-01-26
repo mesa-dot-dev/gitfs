@@ -16,7 +16,7 @@ pub use commit::{
     ListCommitsResponse,
 };
 pub use common::SuccessResponse;
-pub use content::{Content, DirEntry};
+pub use content::{Content, DirEntry, DirEntryType};
 pub use diff::{Diff, DiffFile, DiffStats};
 pub use pagination::{Paginated, PaginationParams};
 pub use repo::{CreateRepoRequest, ListReposResponse, RenameRepoRequest, Repo};
