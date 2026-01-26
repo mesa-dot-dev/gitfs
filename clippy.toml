@@ -1,0 +1,17 @@
+# Allow print/dbg/unwrap in test code
+allow-print-in-tests = true
+allow-dbg-in-tests = true
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+# Cognitive complexity threshold
+cognitive-complexity-threshold = 15
+
+# Max function lines
+too-many-lines-threshold = 100
+
+# Max function arguments
+too-many-arguments-threshold = 6
+
+# Max struct bool fields
+max-struct-bools = 3

@@ -1,0 +1,67 @@
+[workspace]
+members = [
+    "crates/mesa-dev",
+    "crates/git-fs",
+]
+resolver = "2"
+
+# ── Rust compiler lints ──────────────────────────────────────────────
+[workspace.lints.rust]
+unsafe_code                = "deny"
+missing_docs               = "warn"
+unreachable_pub            = "warn"
+unused_qualifications      = "warn"
+elided_lifetimes_in_paths  = "warn"
+non_ascii_idents           = "forbid"
+keyword_idents_2024        = "forbid"
+let_underscore_drop        = "warn"
+trivial_numeric_casts      = "warn"
+unused_import_braces       = "warn"
+variant_size_differences   = "warn"
+
+# ── Clippy lint groups ───────────────────────────────────────────────
+[workspace.lints.clippy]
+all      = { level = "deny",  priority = -1 }
+pedantic = { level = "warn",  priority = -1 }
+nursery  = { level = "warn",  priority = -1 }
+cargo    = { level = "warn",  priority = -1 }
+
+# Pedantic exceptions
+module_name_repetitions = "allow"
+missing_errors_doc      = "allow"
+
+# Nursery exceptions
+missing_const_for_fn         = "allow"
+significant_drop_tightening  = "allow"
+option_if_let_else           = "allow"
+
+# Cherry-picked restriction lints
+allow_attributes                  = "warn"
+clone_on_ref_ptr                  = "warn"
+create_dir                        = "warn"
+dbg_macro                         = "warn"
+empty_enum_variants_with_brackets = "warn"
+error_impl_error                  = "warn"
+exit                              = "warn"
+expect_used                       = "warn"
+format_push_string                = "warn"
+if_then_some_else_none            = "warn"
+infinite_loop                     = "warn"
+lossy_regex_match                 = "warn"
+mem_forget                        = "warn"
+missing_assert_message            = "warn"
+mutex_atomic                      = "warn"
+print_stderr                      = "warn"
+print_stdout                      = "warn"
+rest_pat_in_fully_bound_structs   = "warn"
+self_named_module_files           = "warn"
+str_to_string                     = "warn"
+string_to_string                  = "warn"
+todo                              = "warn"
+undocumented_unsafe_blocks        = "warn"
+unimplemented                     = "warn"
+unnecessary_safety_comment        = "warn"
+unused_result_ok                  = "warn"
+unused_trait_names                = "warn"
+unwrap_used                       = "warn"
+wildcard_enum_match_arm           = "warn"
