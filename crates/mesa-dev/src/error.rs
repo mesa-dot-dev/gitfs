@@ -31,12 +31,13 @@ pub enum MesaError {
         /// Number of attempts made.
         attempts: u32,
         /// The last error encountered.
-        last_error: Box<MesaError>,
+        last_error: Box<Self>,
     },
 }
 
 impl MesaError {
     /// Returns `true` if this error is retryable (429 or 5xx).
+    #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Api { status, .. } => {
@@ -45,15 +46,20 @@ impl MesaError {
             Self::HttpClient(
                 HttpClientError::Timeout | HttpClientError::Connection(_),
             ) => true,
-            _ => false,
+            Self::HttpClient(HttpClientError::Other(_))
+            | Self::Serialization(_)
+            | Self::RetriesExhausted { .. } => false,
         }
     }
 
     /// Returns the HTTP status code, if this is an API error.
+    #[must_use]
     pub fn status(&self) -> Option<StatusCode> {
         match self {
             Self::Api { status, .. } => Some(*status),
-            _ => None,
+            Self::HttpClient(_)
+            | Self::Serialization(_)
+            | Self::RetriesExhausted { .. } => None,
         }
     }
 }
@@ -81,6 +87,7 @@ pub enum ApiErrorCode {
 
 impl ApiErrorCode {
     /// Parse an error code string from the API.
+    #[must_use]
     pub fn from_code(s: &str) -> Self {
         match s {
             "bad_request" => Self::BadRequest,

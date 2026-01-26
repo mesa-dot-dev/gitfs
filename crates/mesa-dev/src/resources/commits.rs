@@ -1,5 +1,7 @@
 //! Commit resource.
 
+use std::sync::Arc;
+
 use http::Method;
 
 use crate::client::MesaClient;
@@ -66,13 +68,14 @@ impl<'c, C: HttpClient> CommitsResource<'c, C> {
     /// Return a [`PageStream`] that iterates over all commits.
     ///
     /// Optionally filter by ref (branch name or SHA).
+    #[must_use]
     pub fn list_all(&self, ref_: Option<&str>) -> PageStream<C, ListCommitsResponse> {
         let path = format!("/{}/{}/commits", self.org, self.repo);
         let extra = match ref_ {
             Some(r) => vec![("ref".to_owned(), r.to_owned())],
             None => Vec::new(),
         };
-        PageStream::new(self.client.inner.clone(), path, extra)
+        PageStream::new(Arc::clone(&self.client.inner), path, extra)
     }
 
     /// Get a single commit by SHA.

@@ -111,12 +111,14 @@ impl ClientBuilder {
 
     /// Build a [`MesaClient`] with the default reqwest backend.
     #[cfg(feature = "reqwest-client")]
+    #[must_use]
     pub fn build(self) -> MesaClient<crate::backends::ReqwestClient> {
         let http = crate::backends::ReqwestClient::new(self.config.timeout);
         self.build_with(http)
     }
 
     /// Build a [`MesaClient`] with a custom HTTP client backend.
+    #[must_use]
     pub fn build_with<C: HttpClient>(self, http_client: C) -> MesaClient<C> {
         MesaClient {
             inner: Arc::new(ClientInner {
@@ -137,7 +139,8 @@ pub struct MesaClient<C: HttpClient> {
 
 /// Internal shared state for the client.
 #[derive(Debug)]
-pub(crate) struct ClientInner<C: HttpClient> {
+#[expect(unreachable_pub)]
+pub struct ClientInner<C: HttpClient> {
     pub(crate) config: ClientConfig,
     pub(crate) http: C,
 }
@@ -168,10 +171,10 @@ impl<C: HttpClient> ClientInner<C> {
 
         for attempt in 0..max_attempts {
             if attempt > 0 {
-                if let Some(ref err) = last_error {
-                    if !err.is_retryable() {
-                        break;
-                    }
+                if let Some(ref err) = last_error
+                    && !err.is_retryable()
+                {
+                    break;
                 }
 
                 let backoff = compute_backoff(
@@ -264,7 +267,7 @@ impl<C: HttpClient> MesaClient<C> {
         method: Method,
         path: &str,
         query: &[(&str, &str)],
-        body: Option<&impl Serialize>,
+        body: Option<&(impl Serialize + Sync)>,
     ) -> Result<T, MesaError> {
         let json_body = match body {
             Some(b) => Some(Bytes::from(serde_json::to_vec(b)?)),
@@ -276,11 +279,13 @@ impl<C: HttpClient> MesaClient<C> {
     // ── Resource namespace accessors ──
 
     /// Access repository operations for the given organization.
+    #[must_use]
     pub fn repos(&self, org: &str) -> crate::resources::ReposResource<'_, C> {
         crate::resources::ReposResource::new(self, org.to_owned())
     }
 
     /// Access branch operations for the given repository.
+    #[must_use]
     pub fn branches(
         &self,
         org: &str,
@@ -290,6 +295,7 @@ impl<C: HttpClient> MesaClient<C> {
     }
 
     /// Access commit operations for the given repository.
+    #[must_use]
     pub fn commits(
         &self,
         org: &str,
@@ -299,6 +305,7 @@ impl<C: HttpClient> MesaClient<C> {
     }
 
     /// Access content operations for the given repository.
+    #[must_use]
     pub fn content(
         &self,
         org: &str,
@@ -308,6 +315,7 @@ impl<C: HttpClient> MesaClient<C> {
     }
 
     /// Access diff operations for the given repository.
+    #[must_use]
     pub fn diffs(
         &self,
         org: &str,
@@ -317,6 +325,7 @@ impl<C: HttpClient> MesaClient<C> {
     }
 
     /// Access admin operations (API keys) for the given organization.
+    #[must_use]
     pub fn admin(&self, org: &str) -> crate::resources::AdminResource<'_, C> {
         crate::resources::AdminResource::new(self, org.to_owned())
     }
@@ -369,6 +378,7 @@ const fn hex_digit(nibble: u8) -> char {
 }
 
 /// Compute exponential backoff with jitter for the given attempt number.
+#[expect(clippy::cast_possible_truncation)] // millis fits in u64 for any reasonable backoff
 fn compute_backoff(attempt: u32, initial: Duration, max: Duration) -> Duration {
     let base = initial.saturating_mul(1 << attempt.min(16));
     let capped = base.min(max);
@@ -380,6 +390,7 @@ fn compute_backoff(attempt: u32, initial: Duration, max: Duration) -> Duration {
 
 /// Produce a simple pseudo-random u64 using the current time.
 /// Not cryptographically secure — only used for retry jitter.
+#[expect(clippy::cast_possible_truncation)] // intentional wrapping for jitter
 fn simple_random_u64() -> u64 {
     use std::time::SystemTime;
     SystemTime::now()
@@ -388,7 +399,8 @@ fn simple_random_u64() -> u64 {
 }
 
 /// Parse an API error response body into a [`MesaError`].
-pub(crate) fn parse_api_error(status: StatusCode, body: &[u8]) -> MesaError {
+#[expect(unreachable_pub)]
+pub fn parse_api_error(status: StatusCode, body: &[u8]) -> MesaError {
     match serde_json::from_slice::<ApiErrorResponse>(body) {
         Ok(resp) => MesaError::Api {
             status,

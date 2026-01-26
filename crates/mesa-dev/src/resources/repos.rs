@@ -1,5 +1,7 @@
 //! Repository resource.
 
+use std::sync::Arc;
+
 use http::Method;
 
 use crate::client::MesaClient;
@@ -57,9 +59,11 @@ impl<'c, C: HttpClient> ReposResource<'c, C> {
     }
 
     /// Return a [`PageStream`] that iterates over all repositories.
+    #[must_use]
     pub fn list_all(&self) -> PageStream<C, ListReposResponse> {
         let path = format!("/{}/repos", self.org);
-        PageStream::new(self.client.inner.clone(), path, Vec::new())
+        // TODO(markovejnovic): Do we need Arc here?
+        PageStream::new(Arc::clone(&self.client.inner), path, Vec::new())
     }
 
     /// Get a single repository by name.

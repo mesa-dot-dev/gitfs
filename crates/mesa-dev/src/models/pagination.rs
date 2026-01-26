@@ -16,7 +16,7 @@ pub struct PaginationParams {
 /// Trait for paginated response types.
 pub trait Paginated {
     /// The individual item type within a page.
-    type Item;
+    type Item: Send + Sync;
 
     /// Returns the items from this page.
     fn items(self) -> Vec<Self::Item>;

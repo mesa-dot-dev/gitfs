@@ -2,8 +2,6 @@
 
 use std::time::Duration;
 
-use bytes::Bytes;
-
 use crate::error::HttpClientError;
 use crate::http_client::{HttpClient, HttpRequest, HttpResponse};
 
@@ -15,6 +13,7 @@ pub struct ReqwestClient {
 
 impl ReqwestClient {
     /// Create a new `ReqwestClient` with the given timeout.
+    #[must_use]
     pub fn new(timeout: Duration) -> Self {
         let client = reqwest::Client::builder()
             .timeout(timeout)
@@ -24,6 +23,7 @@ impl ReqwestClient {
     }
 
     /// Create a `ReqwestClient` from an existing [`reqwest::Client`].
+    #[must_use]
     pub fn from_client(client: reqwest::Client) -> Self {
         Self { client }
     }
@@ -42,7 +42,7 @@ impl HttpClient for ReqwestClient {
 
         let status = response.status();
         let headers = response.headers().clone();
-        let body = Bytes::from(response.bytes().await.map_err(map_reqwest_error)?);
+        let body = response.bytes().await.map_err(map_reqwest_error)?;
 
         Ok(HttpResponse {
             status,

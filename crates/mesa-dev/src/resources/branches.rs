@@ -1,5 +1,7 @@
 //! Branch resource.
 
+use std::sync::Arc;
+
 use http::Method;
 
 use crate::client::MesaClient;
@@ -56,9 +58,10 @@ impl<'c, C: HttpClient> BranchesResource<'c, C> {
     }
 
     /// Return a [`PageStream`] that iterates over all branches.
+    #[must_use]
     pub fn list_all(&self) -> PageStream<C, ListBranchesResponse> {
         let path = format!("/{}/{}/branches", self.org, self.repo);
-        PageStream::new(self.client.inner.clone(), path, Vec::new())
+        PageStream::new(Arc::clone(&self.client.inner), path, Vec::new())
     }
 
     /// Delete a branch.

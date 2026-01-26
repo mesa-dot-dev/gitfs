@@ -20,6 +20,7 @@ pub struct UreqClient {
 
 impl UreqClient {
     /// Create a new `UreqClient` with the given timeout.
+    #[must_use]
     pub fn new(timeout: Duration) -> Self {
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(timeout))
