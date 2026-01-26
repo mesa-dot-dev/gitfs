@@ -298,6 +298,54 @@ impl<C: HttpClient> MesaClient<C> {
     ) -> Result<(), MesaError> {
         self.inner.request_no_content(method, path, query).await
     }
+
+    // ── Resource namespace accessors ──
+
+    /// Access repository operations for the given organization.
+    pub fn repos(&self, org: &str) -> crate::resources::ReposResource<'_, C> {
+        crate::resources::ReposResource::new(self, org.to_owned())
+    }
+
+    /// Access branch operations for the given repository.
+    pub fn branches(
+        &self,
+        org: &str,
+        repo: &str,
+    ) -> crate::resources::BranchesResource<'_, C> {
+        crate::resources::BranchesResource::new(self, org.to_owned(), repo.to_owned())
+    }
+
+    /// Access commit operations for the given repository.
+    pub fn commits(
+        &self,
+        org: &str,
+        repo: &str,
+    ) -> crate::resources::CommitsResource<'_, C> {
+        crate::resources::CommitsResource::new(self, org.to_owned(), repo.to_owned())
+    }
+
+    /// Access content operations for the given repository.
+    pub fn content(
+        &self,
+        org: &str,
+        repo: &str,
+    ) -> crate::resources::ContentResource<'_, C> {
+        crate::resources::ContentResource::new(self, org.to_owned(), repo.to_owned())
+    }
+
+    /// Access diff operations for the given repository.
+    pub fn diffs(
+        &self,
+        org: &str,
+        repo: &str,
+    ) -> crate::resources::DiffsResource<'_, C> {
+        crate::resources::DiffsResource::new(self, org.to_owned(), repo.to_owned())
+    }
+
+    /// Access admin operations (API keys) for the given organization.
+    pub fn admin(&self, org: &str) -> crate::resources::AdminResource<'_, C> {
+        crate::resources::AdminResource::new(self, org.to_owned())
+    }
 }
 
 /// Build a full URL from base, path, and query parameters.
