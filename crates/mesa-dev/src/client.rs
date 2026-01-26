@@ -12,7 +12,7 @@ use crate::error::{ApiErrorCode, ApiErrorResponse, HttpClientError, MesaError};
 use crate::http_client::{HttpClient, HttpRequest, HttpResponse};
 
 /// Default base URL for the Mesa API.
-const DEFAULT_BASE_URL: &str = "https://depot.mesa.dev";
+const DEFAULT_BASE_URL: &str = "https://depot.mesa.dev/api/v1";
 
 /// Default request timeout.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
