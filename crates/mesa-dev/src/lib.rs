@@ -9,3 +9,4 @@ mod pagination;
 mod resources;
 
 pub use error::{ApiErrorCode, HttpClientError, MesaError};
+pub use http_client::{HttpClient, HttpRequest, HttpResponse};
