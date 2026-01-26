@@ -4,7 +4,7 @@ mod backends;
 mod client;
 pub mod error;
 mod http_client;
-mod models;
+pub mod models;
 mod pagination;
 mod resources;
 
