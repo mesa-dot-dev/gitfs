@@ -2,8 +2,10 @@
 
 mod backends;
 mod client;
-mod error;
+pub mod error;
 mod http_client;
 mod models;
 mod pagination;
 mod resources;
+
+pub use error::{ApiErrorCode, HttpClientError, MesaError};
