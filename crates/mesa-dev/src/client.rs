@@ -156,22 +156,6 @@ impl<C: HttpClient> ClientInner<C> {
         serde_json::from_slice(&response.body).map_err(MesaError::from)
     }
 
-    /// Send an API request that returns an empty/success response.
-    pub(crate) async fn request_no_content(
-        &self,
-        method: Method,
-        path: &str,
-        query: &[(&str, &str)],
-    ) -> Result<(), MesaError> {
-        let url = build_url(&self.config.base_url, path, query);
-        let response = self.send_with_retry(method, &url, None).await?;
-        if response.status.is_success() {
-            Ok(())
-        } else {
-            Err(parse_api_error(response.status, &response.body))
-        }
-    }
-
     /// Send a request with retry logic (exponential backoff + jitter).
     async fn send_with_retry(
         &self,
@@ -287,16 +271,6 @@ impl<C: HttpClient> MesaClient<C> {
             None => None,
         };
         self.inner.request(method, path, query, json_body).await
-    }
-
-    /// Send an API request that returns an empty/success response.
-    pub(crate) async fn request_no_content(
-        &self,
-        method: Method,
-        path: &str,
-        query: &[(&str, &str)],
-    ) -> Result<(), MesaError> {
-        self.inner.request_no_content(method, path, query).await
     }
 
     // ── Resource namespace accessors ──
