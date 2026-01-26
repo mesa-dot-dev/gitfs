@@ -13,3 +13,4 @@ pub use client::{ClientBuilder, ClientConfig, MesaClient};
 pub use client::Mesa;
 pub use error::{ApiErrorCode, HttpClientError, MesaError};
 pub use http_client::{HttpClient, HttpRequest, HttpResponse};
+pub use pagination::PageStream;

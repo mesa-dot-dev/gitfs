@@ -142,57 +142,29 @@ pub(crate) struct ClientInner<C: HttpClient> {
     pub(crate) http: C,
 }
 
-/// Convenience type alias when using the default reqwest backend.
-#[cfg(feature = "reqwest-client")]
-pub type Mesa = MesaClient<crate::backends::ReqwestClient>;
-
-#[cfg(feature = "reqwest-client")]
-impl Mesa {
-    /// Create a new client with the default reqwest backend.
-    pub fn new(api_key: impl Into<String>) -> Self {
-        ClientBuilder::new(api_key).build()
-    }
-}
-
-impl<C: HttpClient> MesaClient<C> {
-    /// Create a new client from a builder.
-    pub fn builder(api_key: impl Into<String>) -> ClientBuilder {
-        ClientBuilder::new(api_key)
-    }
-
+impl<C: HttpClient> ClientInner<C> {
     /// Send an API request, deserializing the response as JSON.
     pub(crate) async fn request<T: DeserializeOwned>(
         &self,
         method: Method,
         path: &str,
         query: &[(&str, &str)],
-        body: Option<&impl Serialize>,
+        body: Option<Bytes>,
     ) -> Result<T, MesaError> {
-        let url = build_url(&self.inner.config.base_url, path, query);
-
-        let json_body = match body {
-            Some(b) => Some(Bytes::from(serde_json::to_vec(b)?)),
-            None => None,
-        };
-
-        let response = self
-            .send_with_retry(method, &url, json_body.as_ref().cloned())
-            .await?;
-
-        let body_bytes = &response.body;
-        serde_json::from_slice(body_bytes).map_err(MesaError::from)
+        let url = build_url(&self.config.base_url, path, query);
+        let response = self.send_with_retry(method, &url, body).await?;
+        serde_json::from_slice(&response.body).map_err(MesaError::from)
     }
 
-    /// Send an API request that returns an empty/success response (ignores body).
+    /// Send an API request that returns an empty/success response.
     pub(crate) async fn request_no_content(
         &self,
         method: Method,
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<(), MesaError> {
-        let url = build_url(&self.inner.config.base_url, path, query);
+        let url = build_url(&self.config.base_url, path, query);
         let response = self.send_with_retry(method, &url, None).await?;
-
         if response.status.is_success() {
             Ok(())
         } else {
@@ -207,7 +179,7 @@ impl<C: HttpClient> MesaClient<C> {
         url: &str,
         body: Option<Bytes>,
     ) -> Result<HttpResponse, MesaError> {
-        let max_attempts = self.inner.config.max_retries + 1;
+        let max_attempts = self.config.max_retries + 1;
         let mut last_error: Option<MesaError> = None;
 
         for attempt in 0..max_attempts {
@@ -220,14 +192,14 @@ impl<C: HttpClient> MesaClient<C> {
 
                 let backoff = compute_backoff(
                     attempt,
-                    self.inner.config.initial_backoff,
-                    self.inner.config.max_backoff,
+                    self.config.initial_backoff,
+                    self.config.max_backoff,
                 );
                 std::thread::sleep(backoff);
             }
 
             let request = self.build_request(method.clone(), url, body.clone());
-            match self.inner.http.send(request).await {
+            match self.http.send(request).await {
                 Ok(response) if response.status.is_success() => return Ok(response),
                 Ok(response) => {
                     let err = parse_api_error(response.status, &response.body);
@@ -255,10 +227,10 @@ impl<C: HttpClient> MesaClient<C> {
 
     /// Build an [`HttpRequest`] with the configured headers.
     fn build_request(&self, method: Method, url: &str, body: Option<Bytes>) -> HttpRequest {
-        let mut headers = self.inner.config.default_headers.clone();
+        let mut headers = self.config.default_headers.clone();
 
         if let Ok(auth) =
-            HeaderValue::from_str(&format!("Bearer {}", self.inner.config.api_key))
+            HeaderValue::from_str(&format!("Bearer {}", self.config.api_key))
         {
             headers.insert(http::header::AUTHORIZATION, auth);
         }
@@ -281,6 +253,50 @@ impl<C: HttpClient> MesaClient<C> {
             headers,
             body,
         }
+    }
+}
+
+/// Convenience type alias when using the default reqwest backend.
+#[cfg(feature = "reqwest-client")]
+pub type Mesa = MesaClient<crate::backends::ReqwestClient>;
+
+#[cfg(feature = "reqwest-client")]
+impl Mesa {
+    /// Create a new client with the default reqwest backend.
+    pub fn new(api_key: impl Into<String>) -> Self {
+        ClientBuilder::new(api_key).build()
+    }
+}
+
+impl<C: HttpClient> MesaClient<C> {
+    /// Create a new builder for configuring a client.
+    pub fn builder(api_key: impl Into<String>) -> ClientBuilder {
+        ClientBuilder::new(api_key)
+    }
+
+    /// Send an API request with a JSON body, deserializing the response.
+    pub(crate) async fn request<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<&impl Serialize>,
+    ) -> Result<T, MesaError> {
+        let json_body = match body {
+            Some(b) => Some(Bytes::from(serde_json::to_vec(b)?)),
+            None => None,
+        };
+        self.inner.request(method, path, query, json_body).await
+    }
+
+    /// Send an API request that returns an empty/success response.
+    pub(crate) async fn request_no_content(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<(), MesaError> {
+        self.inner.request_no_content(method, path, query).await
     }
 }
 
