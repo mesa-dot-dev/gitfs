@@ -6,11 +6,12 @@ use fuser::MountOption;
 use tracing::error;
 use tracing_subscriber::{EnvFilter, fmt};
 
-mod domain;
-mod mesafs;
+mod ssfs;
 mod util;
+mod domain;
+mod mesafuse;
 
-use mesafs::MesaFS;
+use mesafuse::MesaFS;
 
 use crate::domain::GhRepoInfo;
 
@@ -43,8 +44,7 @@ fn main() {
     let options = vec![
         MountOption::RO,
         MountOption::AutoUnmount,
-        MountOption::AllowRoot,
-        MountOption::FSName("mesafs".to_owned()),
+        MountOption::FSName("mesafs".to_string())
     ];
 
     let mesa_fs = MesaFS::new(&args.mesa_api_key, args.repo, args.r#ref.as_deref());
