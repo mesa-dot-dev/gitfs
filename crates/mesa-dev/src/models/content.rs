@@ -50,6 +50,7 @@ pub enum DirEntryType {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DirEntry {
     /// Type of entry (`"file"` or `"dir"`).
+    #[serde(rename = "type")]
     pub entry_type: DirEntryType,
     /// Entry name.
     pub name: String,
