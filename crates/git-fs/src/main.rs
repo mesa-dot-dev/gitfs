@@ -6,10 +6,10 @@ use fuser::MountOption;
 use tracing::error;
 use tracing_subscriber::{EnvFilter, fmt};
 
-mod ssfs;
-mod util;
 mod domain;
 mod mesafuse;
+mod ssfs;
+mod util;
 
 use mesafuse::MesaFS;
 
@@ -44,7 +44,7 @@ fn main() {
     let options = vec![
         MountOption::RO,
         MountOption::AutoUnmount,
-        MountOption::FSName("mesafs".to_string())
+        MountOption::FSName("mesafs".to_string()),
     ];
 
     let mesa_fs = MesaFS::new(&args.mesa_api_key, args.repo, args.r#ref.as_deref());

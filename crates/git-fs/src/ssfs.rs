@@ -10,7 +10,14 @@
 //! absurdly large sizes, especially for large repositories. We need to implement some kind of LRU
 //! or TTL-based eviction policy.
 
-use std::{ffi::{OsStr, OsString}, pin::Pin, sync::{atomic::{AtomicU32, Ordering}, Arc}};
+use std::{
+    ffi::{OsStr, OsString},
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+};
 
 use fuser::FUSE_ROOT_ID;
 use rustc_hash::FxHashMap;
@@ -229,9 +236,9 @@ impl<B: SsfsBackend> SsFs<B> {
                 break;
             }
 
-            let (name, parent) = self.nodes.read_sync(&current, |_, inode| {
-                (inode.name.clone(), inode.parent)
-            })?;
+            let (name, parent) = self
+                .nodes
+                .read_sync(&current, |_, inode| (inode.name.clone(), inode.parent))?;
 
             components.push(name.to_string_lossy().into_owned());
             current = parent;
@@ -245,9 +252,9 @@ impl<B: SsfsBackend> SsFs<B> {
     ///
     /// If the directory is unpopulated, initiates a backend fetch.
     pub fn readdir(&self, ino: INo) -> SsfsResult<Vec<(INo, INodeKind, Path)>> {
-        let state = self.nodes.read_sync(&ino, |_, inode| {
-            (inode.kind(), inode.children.clone())
-        });
+        let state = self
+            .nodes
+            .read_sync(&ino, |_, inode| (inode.kind(), inode.children.clone()));
 
         let (kind, children) = match state {
             Some(s) => s,
@@ -262,19 +269,29 @@ impl<B: SsfsBackend> SsFs<B> {
             DirChildren::NotADirectory => Err(SsfsResolutionError::EntryIsNotDirectory),
             DirChildren::Populated(map) => {
                 // Fast path: children are already known.
-                debug!(ino, count = map.len(), "readdir: cache hit (already populated)");
-                let entries: Vec<(INo, INodeKind, Path)> = map.iter().filter_map(|(name, &child_ino)| {
-                    self.nodes.read_sync(&child_ino, |_, child| {
-                        (child_ino, child.kind(), name.clone())
+                debug!(
+                    ino,
+                    count = map.len(),
+                    "readdir: cache hit (already populated)"
+                );
+                let entries: Vec<(INo, INodeKind, Path)> = map
+                    .iter()
+                    .filter_map(|(name, &child_ino)| {
+                        self.nodes.read_sync(&child_ino, |_, child| {
+                            (child_ino, child.kind(), name.clone())
+                        })
                     })
-                }).collect();
+                    .collect();
                 Ok(SsfsOk::Resolved(entries))
-            },
+            }
             DirChildren::Unpopulated => {
                 // Need to fetch from backend.
-                debug!(ino, "readdir: cache miss (unpopulated), fetching from backend");
+                debug!(
+                    ino,
+                    "readdir: cache miss (unpopulated), fetching from backend"
+                );
                 self.initiate_readdir(ino)
-            },
+            }
         }
     }
 
@@ -286,7 +303,10 @@ impl<B: SsfsBackend> SsFs<B> {
 
         if let Some(existing_notify) = existing {
             // Someone else is already fetching. Wait on their notification.
-            debug!(ino, "initiate_readdir: joining existing in-flight fetch (dedup)");
+            debug!(
+                ino,
+                "initiate_readdir: joining existing in-flight fetch (dedup)"
+            );
             let nodes = Arc::clone(&self.nodes);
             let fut = async move {
                 existing_notify.notified().await;
@@ -300,10 +320,13 @@ impl<B: SsfsBackend> SsFs<B> {
         match self.pending_updates.insert_sync(ino, Arc::clone(&notify)) {
             Ok(()) => {
                 // We successfully claimed the fetch. Spawn the backend task.
-            },
+            }
             Err((_key, _val)) => {
                 // Someone else raced us. Read their notify and wait.
-                debug!(ino, "initiate_readdir: lost insert race, joining existing fetch");
+                debug!(
+                    ino,
+                    "initiate_readdir: lost insert race, joining existing fetch"
+                );
                 let existing = self.pending_updates.read_sync(&ino, |_, v| Arc::clone(v));
                 match existing {
                     Some(existing_notify) => {
@@ -313,7 +336,7 @@ impl<B: SsfsBackend> SsFs<B> {
                             Self::collect_children(&nodes, ino)
                         };
                         return Ok(SsfsOk::Future(Box::pin(fut)));
-                    },
+                    }
                     None => {
                         // The other fetch completed between our failed insert and this read.
                         // The directory should now be populated.
@@ -321,9 +344,9 @@ impl<B: SsfsBackend> SsFs<B> {
                         return Ok(SsfsOk::Future(Box::pin(async move {
                             Self::collect_children(&nodes, ino)
                         })));
-                    },
+                    }
                 }
-            },
+            }
         }
 
         // Spawn the fetch task.
@@ -369,15 +392,17 @@ impl<B: SsfsBackend> SsFs<B> {
                     }
 
                     // Update the parent's children to Populated.
-                    nodes.update_async(&ino, |_, inode| {
-                        inode.children = DirChildren::Populated(Arc::new(children_map));
-                    }).await;
-                },
+                    nodes
+                        .update_async(&ino, |_, inode| {
+                            inode.children = DirChildren::Populated(Arc::new(children_map));
+                        })
+                        .await;
+                }
                 Err(ref e) => {
                     debug!(ino, ?e, "backend fetch failed");
                     // Leave directory as Unpopulated on error. Waiters will detect this
                     // and return IoError.
-                },
+                }
             }
 
             // Remove from pending and notify all waiters.
@@ -403,13 +428,16 @@ impl<B: SsfsBackend> SsFs<B> {
         let state = nodes.read_sync(&ino, |_, inode| inode.children.clone());
         match state {
             Some(DirChildren::Populated(map)) => {
-                let entries: Vec<(INo, INodeKind, Path)> = map.iter().filter_map(|(name, &child_ino)| {
-                    nodes.read_sync(&child_ino, |_, child| {
-                        (child_ino, child.kind(), name.clone())
+                let entries: Vec<(INo, INodeKind, Path)> = map
+                    .iter()
+                    .filter_map(|(name, &child_ino)| {
+                        nodes.read_sync(&child_ino, |_, child| {
+                            (child_ino, child.kind(), name.clone())
+                        })
                     })
-                }).collect();
+                    .collect();
                 Ok(entries)
-            },
+            }
             _ => Err(SsfsResolutionError::IoError),
         }
     }
@@ -420,7 +448,9 @@ impl<B: SsfsBackend> SsFs<B> {
     /// `initiate_readdir`. This is fire-and-forget: failures are silently ignored since
     /// this is only a speculative prefetch.
     pub fn prefetch_subdirectories(&self, ino: INo) {
-        let children = self.nodes.read_sync(&ino, |_, inode| inode.children.clone());
+        let children = self
+            .nodes
+            .read_sync(&ino, |_, inode| inode.children.clone());
         let map = match children {
             Some(DirChildren::Populated(map)) => map,
             _ => return,
@@ -441,7 +471,12 @@ impl<B: SsfsBackend> SsFs<B> {
             }
         }
 
-        debug!(ino, prefetch_count, total_children = map.len(), "prefetch_subdirectories");
+        debug!(
+            ino,
+            prefetch_count,
+            total_children = map.len(),
+            "prefetch_subdirectories"
+        );
     }
 
     pub fn get_abspath(&self, ino: INo) -> Result<SsfsOk<Path>, GetINodeError> {
@@ -465,49 +500,57 @@ impl<B: SsfsBackend> SsFs<B> {
                             Some(child_ino) => self.get_inode(child_ino).map_err(|e| e.into()),
                             None => Err(SsfsResolutionError::DoesNotExist),
                         }
-                    },
+                    }
                     Some(DirChildren::Unpopulated) => {
-                        debug!(parent, ?path, "lookup: children unpopulated, fetching from backend");
+                        debug!(
+                            parent,
+                            ?path,
+                            "lookup: children unpopulated, fetching from backend"
+                        );
                         match self.initiate_readdir(parent)? {
                             SsfsOk::Resolved(_) => {
                                 // Children now populated inline — look up the child.
-                                let maybe_child_ino = self.nodes.read_sync(&parent, |_, n| {
-                                    match &n.children {
+                                let maybe_child_ino = self
+                                    .nodes
+                                    .read_sync(&parent, |_, n| match &n.children {
                                         DirChildren::Populated(m) => m.get(path).copied(),
                                         _ => None,
-                                    }
-                                }).flatten();
+                                    })
+                                    .flatten();
                                 match maybe_child_ino {
-                                    Some(child_ino) => self.get_inode(child_ino).map_err(|e| e.into()),
+                                    Some(child_ino) => {
+                                        self.get_inode(child_ino).map_err(|e| e.into())
+                                    }
                                     None => Err(SsfsResolutionError::DoesNotExist),
                                 }
-                            },
+                            }
                             SsfsOk::Future(readdir_fut) => {
                                 let nodes = Arc::clone(&self.nodes);
                                 let path = path.to_owned();
                                 Ok(SsfsOk::Future(Box::pin(async move {
                                     readdir_fut.await?;
-                                    let maybe_child_ino = nodes.read_sync(&parent, |_, n| {
-                                        match &n.children {
+                                    let maybe_child_ino = nodes
+                                        .read_sync(&parent, |_, n| match &n.children {
                                             DirChildren::Populated(m) => m.get(&path).copied(),
                                             _ => None,
-                                        }
-                                    }).flatten();
+                                        })
+                                        .flatten();
                                     match maybe_child_ino {
-                                        Some(child_ino) => {
-                                            nodes.read_sync(&child_ino, |_, inode| inode.handle())
-                                                .ok_or(SsfsResolutionError::DoesNotExist)
-                                        },
+                                        Some(child_ino) => nodes
+                                            .read_sync(&child_ino, |_, inode| inode.handle())
+                                            .ok_or(SsfsResolutionError::DoesNotExist),
                                         None => Err(SsfsResolutionError::DoesNotExist),
                                     }
                                 })))
-                            },
+                            }
                         }
-                    },
-                    Some(DirChildren::NotADirectory) => Err(SsfsResolutionError::EntryIsNotDirectory),
+                    }
+                    Some(DirChildren::NotADirectory) => {
+                        Err(SsfsResolutionError::EntryIsNotDirectory)
+                    }
                     None => Err(SsfsResolutionError::DoesNotExist),
                 }
-            },
+            }
             SsfsOk::Future(fut) => {
                 // TODO(markovejnovic): This Arc gives me the ick, I couldn't figure out a way to
                 // write this without it though. It does seem that multiple futures may need to
@@ -521,24 +564,25 @@ impl<B: SsfsBackend> SsFs<B> {
                     }
 
                     // After the parent resolves, look up the child.
-                    let maybe_child_ino = nodes.read_sync(&parent_handle.ino, |_, parent_inode| {
-                        match &parent_inode.children {
-                            DirChildren::Populated(map) => map.get(&path).copied(),
-                            _ => None,
-                        }
-                    }).flatten();
+                    let maybe_child_ino = nodes
+                        .read_sync(&parent_handle.ino, |_, parent_inode| {
+                            match &parent_inode.children {
+                                DirChildren::Populated(map) => map.get(&path).copied(),
+                                _ => None,
+                            }
+                        })
+                        .flatten();
 
                     match maybe_child_ino {
-                        Some(child_ino) => {
-                            nodes.read_sync(&child_ino, |_, inode| inode.handle())
-                                .ok_or(SsfsResolutionError::DoesNotExist)
-                        },
+                        Some(child_ino) => nodes
+                            .read_sync(&child_ino, |_, inode| inode.handle())
+                            .ok_or(SsfsResolutionError::DoesNotExist),
                         None => Err(SsfsResolutionError::DoesNotExist),
                     }
                 };
 
                 Ok(SsfsOk::Future(Box::pin(fut)))
-            },
+            }
         }
     }
 
@@ -552,7 +596,8 @@ impl<B: SsfsBackend> SsFs<B> {
             let nodes = Arc::clone(&self.nodes);
             let fut = async move {
                 notify.notified().await;
-                Ok(nodes.read_sync(&ino, |_, inode| inode.handle())
+                Ok(nodes
+                    .read_sync(&ino, |_, inode| inode.handle())
                     .expect("INode should exist after pending update"))
             };
 

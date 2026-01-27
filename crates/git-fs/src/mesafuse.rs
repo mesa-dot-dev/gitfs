@@ -1,16 +1,20 @@
-use std::{ffi::{OsStr, OsString}, sync::Arc, time::Duration};
+use std::{
+    ffi::{OsStr, OsString},
+    sync::Arc,
+    time::Duration,
+};
 
+use crate::{
+    domain::GhRepoInfo,
+    ssfs::{
+        GetINodeError, INodeHandle, INodeKind, SsFs, SsfsBackend, SsfsBackendError, SsfsDirEntry,
+        SsfsOk, SsfsResolutionError,
+    },
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use fuser::{Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request};
 use mesa_dev::Mesa;
 use mesa_dev::models::{Content, DirEntryType};
-use crate::{
-    domain::GhRepoInfo,
-    ssfs::{
-        GetINodeError, INodeHandle, INodeKind, SsFs, SsfsBackend, SsfsBackendError,
-        SsfsDirEntry, SsfsOk, SsfsResolutionError,
-    },
-};
 use tracing::instrument;
 
 impl Into<fuser::FileAttr> for INodeHandle {
@@ -31,7 +35,11 @@ impl Into<fuser::FileAttr> for INodeHandle {
             crtime: std::time::SystemTime::now(),
             kind,
             perm,
-            nlink: if matches!(self.kind, INodeKind::Directory) { 2 } else { 1 },
+            nlink: if matches!(self.kind, INodeKind::Directory) {
+                2
+            } else {
+                1
+            },
             uid: 1000,
             gid: 1000,
             rdev: 0,
@@ -105,7 +113,7 @@ impl SsfsBackend for MesaBackend {
                         })
                         .collect();
                     Ok(dir_entries)
-                },
+                }
                 Ok(Content::File { .. }) => Err(SsfsBackendError::NotFound),
                 Err(e) => Err(SsfsBackendError::Io(Box::new(e))),
             }
@@ -129,16 +137,23 @@ impl SsfsBackend for MesaBackend {
                 .await;
 
             match result {
-                Ok(Content::File { content, encoding, .. }) => {
+                Ok(Content::File {
+                    content, encoding, ..
+                }) => {
                     if encoding != "base64" {
                         return Err(SsfsBackendError::Io(
                             format!("unsupported encoding: {encoding}").into(),
                         ));
                     }
                     // Mesa/GitHub line-wraps base64 at 76 chars; strip whitespace before decoding.
-                    let cleaned: String = content.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-                    BASE64.decode(&cleaned).map_err(|e| SsfsBackendError::Io(Box::new(e)))
-                },
+                    let cleaned: String = content
+                        .chars()
+                        .filter(|c| !c.is_ascii_whitespace())
+                        .collect();
+                    BASE64
+                        .decode(&cleaned)
+                        .map_err(|e| SsfsBackendError::Io(Box::new(e)))
+                }
                 Ok(Content::Dir { .. }) => Err(SsfsBackendError::NotFound),
                 Err(e) => Err(SsfsBackendError::Io(Box::new(e))),
             }
@@ -191,15 +206,13 @@ impl Filesystem for MesaFS {
                 SsfsOk::Resolved(inode_handle) => {
                     let attr: fuser::FileAttr = inode_handle.into();
                     reply.entry(&Self::KERNEL_TTL, &attr, 0);
-                },
-                SsfsOk::Future(fut) => {
-                    match self.rt.block_on(fut) {
-                        Ok(inode_handle) => {
-                            let attr: fuser::FileAttr = inode_handle.into();
-                            reply.entry(&Self::KERNEL_TTL, &attr, 0);
-                        },
-                        Err(err) => reply.error(ssfs_err_to_errno(&err)),
+                }
+                SsfsOk::Future(fut) => match self.rt.block_on(fut) {
+                    Ok(inode_handle) => {
+                        let attr: fuser::FileAttr = inode_handle.into();
+                        reply.entry(&Self::KERNEL_TTL, &attr, 0);
                     }
+                    Err(err) => reply.error(ssfs_err_to_errno(&err)),
                 },
             },
             Err(err) => reply.error(ssfs_err_to_errno(&err)),
@@ -213,15 +226,13 @@ impl Filesystem for MesaFS {
                 SsfsOk::Resolved(inode_handle) => {
                     let attr: fuser::FileAttr = inode_handle.into();
                     reply.attr(&Self::KERNEL_TTL, &attr);
-                },
-                SsfsOk::Future(fut) => {
-                    match self.rt.block_on(fut) {
-                        Ok(inode_handle) => {
-                            let attr: fuser::FileAttr = inode_handle.into();
-                            reply.attr(&Self::KERNEL_TTL, &attr);
-                        },
-                        Err(err) => reply.error(ssfs_err_to_errno(&err)),
+                }
+                SsfsOk::Future(fut) => match self.rt.block_on(fut) {
+                    Ok(inode_handle) => {
+                        let attr: fuser::FileAttr = inode_handle.into();
+                        reply.attr(&Self::KERNEL_TTL, &attr);
                     }
+                    Err(err) => reply.error(ssfs_err_to_errno(&err)),
                 },
             },
             Err(err) => reply.error(get_inode_err_to_errno(&err)),
@@ -229,22 +240,30 @@ impl Filesystem for MesaFS {
     }
 
     #[instrument(skip(self, _req, ino, _fh, offset, size, _flags, _lock_owner, reply))]
-    fn read(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
+    fn read(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        size: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyData,
+    ) {
         let data = match self.ssfs.read(ino as u32) {
-            Ok(SsfsOk::Future(fut)) => {
-                match self.rt.block_on(fut) {
-                    Ok(data) => data,
-                    Err(err) => {
-                        reply.error(ssfs_err_to_errno(&err));
-                        return;
-                    },
+            Ok(SsfsOk::Future(fut)) => match self.rt.block_on(fut) {
+                Ok(data) => data,
+                Err(err) => {
+                    reply.error(ssfs_err_to_errno(&err));
+                    return;
                 }
             },
             Ok(SsfsOk::Resolved(data)) => data,
             Err(err) => {
                 reply.error(ssfs_err_to_errno(&err));
                 return;
-            },
+            }
         };
 
         let offset = offset as usize;
@@ -258,43 +277,46 @@ impl Filesystem for MesaFS {
     }
 
     #[instrument(skip(self, _req, ino, _fh, offset, reply))]
-    fn readdir(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
+    fn readdir(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectory,
+    ) {
         let ino = ino as u32;
 
         // Get the directory's parent for the .. entry.
         let parent_ino = match self.ssfs.get_inode(ino) {
             Ok(SsfsOk::Resolved(handle)) => handle.parent,
-            Ok(SsfsOk::Future(fut)) => {
-                match self.rt.block_on(fut) {
-                    Ok(handle) => handle.parent,
-                    Err(err) => {
-                        reply.error(ssfs_err_to_errno(&err));
-                        return;
-                    },
+            Ok(SsfsOk::Future(fut)) => match self.rt.block_on(fut) {
+                Ok(handle) => handle.parent,
+                Err(err) => {
+                    reply.error(ssfs_err_to_errno(&err));
+                    return;
                 }
             },
             Err(err) => {
                 reply.error(get_inode_err_to_errno(&err));
                 return;
-            },
+            }
         };
 
         // Get directory children.
         let children = match self.ssfs.readdir(ino) {
             Ok(SsfsOk::Resolved(entries)) => entries,
-            Ok(SsfsOk::Future(fut)) => {
-                match self.rt.block_on(fut) {
-                    Ok(entries) => entries,
-                    Err(err) => {
-                        reply.error(ssfs_err_to_errno(&err));
-                        return;
-                    },
+            Ok(SsfsOk::Future(fut)) => match self.rt.block_on(fut) {
+                Ok(entries) => entries,
+                Err(err) => {
+                    reply.error(ssfs_err_to_errno(&err));
+                    return;
                 }
             },
             Err(err) => {
                 reply.error(ssfs_err_to_errno(&err));
                 return;
-            },
+            }
         };
 
         // Prefetch subdirectories in the background.
@@ -305,7 +327,12 @@ impl Filesystem for MesaFS {
 
         // . entry
         if i >= offset {
-            if reply.add(ino as u64, (i + 1) as i64, fuser::FileType::Directory, OsStr::new(".")) {
+            if reply.add(
+                ino as u64,
+                (i + 1) as i64,
+                fuser::FileType::Directory,
+                OsStr::new("."),
+            ) {
                 reply.ok();
                 return;
             }
@@ -314,7 +341,12 @@ impl Filesystem for MesaFS {
 
         // .. entry
         if i >= offset {
-            if reply.add(parent_ino as u64, (i + 1) as i64, fuser::FileType::Directory, OsStr::new("..")) {
+            if reply.add(
+                parent_ino as u64,
+                (i + 1) as i64,
+                fuser::FileType::Directory,
+                OsStr::new(".."),
+            ) {
                 reply.ok();
                 return;
             }
