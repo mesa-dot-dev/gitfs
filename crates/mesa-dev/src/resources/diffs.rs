@@ -23,7 +23,12 @@ impl<'c, C: HttpClient> DiffsResource<'c, C> {
     pub async fn get(&self, base: &str, head: &str) -> Result<Diff, MesaError> {
         let path = format!("/{}/{}/diff", self.org, self.repo);
         self.client
-            .request(Method::GET, &path, &[("base", base), ("head", head)], None::<&()>)
+            .request(
+                Method::GET,
+                &path,
+                &[("base", base), ("head", head)],
+                None::<&()>,
+            )
             .await
     }
 }

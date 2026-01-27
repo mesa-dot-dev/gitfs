@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use crate::error::{ApiErrorCode, ApiErrorResponse, HttpClientError, MesaError};
 use crate::http_client::{HttpClient, HttpRequest, HttpResponse};
@@ -216,9 +216,7 @@ impl<C: HttpClient> ClientInner<C> {
     fn build_request(&self, method: Method, url: &str, body: Option<Bytes>) -> HttpRequest {
         let mut headers = self.config.default_headers.clone();
 
-        if let Ok(auth) =
-            HeaderValue::from_str(&format!("Bearer {}", self.config.api_key))
-        {
+        if let Ok(auth) = HeaderValue::from_str(&format!("Bearer {}", self.config.api_key)) {
             headers.insert(http::header::AUTHORIZATION, auth);
         }
 
@@ -286,41 +284,25 @@ impl<C: HttpClient> MesaClient<C> {
 
     /// Access branch operations for the given repository.
     #[must_use]
-    pub fn branches(
-        &self,
-        org: &str,
-        repo: &str,
-    ) -> crate::resources::BranchesResource<'_, C> {
+    pub fn branches(&self, org: &str, repo: &str) -> crate::resources::BranchesResource<'_, C> {
         crate::resources::BranchesResource::new(self, org.to_owned(), repo.to_owned())
     }
 
     /// Access commit operations for the given repository.
     #[must_use]
-    pub fn commits(
-        &self,
-        org: &str,
-        repo: &str,
-    ) -> crate::resources::CommitsResource<'_, C> {
+    pub fn commits(&self, org: &str, repo: &str) -> crate::resources::CommitsResource<'_, C> {
         crate::resources::CommitsResource::new(self, org.to_owned(), repo.to_owned())
     }
 
     /// Access content operations for the given repository.
     #[must_use]
-    pub fn content(
-        &self,
-        org: &str,
-        repo: &str,
-    ) -> crate::resources::ContentResource<'_, C> {
+    pub fn content(&self, org: &str, repo: &str) -> crate::resources::ContentResource<'_, C> {
         crate::resources::ContentResource::new(self, org.to_owned(), repo.to_owned())
     }
 
     /// Access diff operations for the given repository.
     #[must_use]
-    pub fn diffs(
-        &self,
-        org: &str,
-        repo: &str,
-    ) -> crate::resources::DiffsResource<'_, C> {
+    pub fn diffs(&self, org: &str, repo: &str) -> crate::resources::DiffsResource<'_, C> {
         crate::resources::DiffsResource::new(self, org.to_owned(), repo.to_owned())
     }
 

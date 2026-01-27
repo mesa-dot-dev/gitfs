@@ -59,9 +59,9 @@ mod pagination;
 pub mod resources;
 
 // ── Core client types ──
-pub use client::{ClientBuilder, ClientConfig, MesaClient};
 #[cfg(feature = "reqwest-client")]
 pub use client::Mesa;
+pub use client::{ClientBuilder, ClientConfig, MesaClient};
 
 // ── Error types ──
 pub use error::{ApiErrorCode, HttpClientError, MesaError};

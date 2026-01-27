@@ -40,12 +40,8 @@ impl MesaError {
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Api { status, .. } => {
-                status.as_u16() == 429 || status.is_server_error()
-            }
-            Self::HttpClient(
-                HttpClientError::Timeout | HttpClientError::Connection(_),
-            ) => true,
+            Self::Api { status, .. } => status.as_u16() == 429 || status.is_server_error(),
+            Self::HttpClient(HttpClientError::Timeout | HttpClientError::Connection(_)) => true,
             Self::HttpClient(HttpClientError::Other(_))
             | Self::Serialization(_)
             | Self::RetriesExhausted { .. } => false,
@@ -57,9 +53,7 @@ impl MesaError {
     pub fn status(&self) -> Option<StatusCode> {
         match self {
             Self::Api { status, .. } => Some(*status),
-            Self::HttpClient(_)
-            | Self::Serialization(_)
-            | Self::RetriesExhausted { .. } => None,
+            Self::HttpClient(_) | Self::Serialization(_) | Self::RetriesExhausted { .. } => None,
         }
     }
 }

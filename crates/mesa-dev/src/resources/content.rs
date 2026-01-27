@@ -23,11 +23,7 @@ impl<'c, C: HttpClient> ContentResource<'c, C> {
     ///
     /// - `path`: file or directory path within the repo (optional, defaults to root).
     /// - `ref_`: branch name or commit SHA (optional, defaults to the default branch).
-    pub async fn get(
-        &self,
-        path: Option<&str>,
-        ref_: Option<&str>,
-    ) -> Result<Content, MesaError> {
+    pub async fn get(&self, path: Option<&str>, ref_: Option<&str>) -> Result<Content, MesaError> {
         let url_path = format!("/{}/{}/content", self.org, self.repo);
         let mut query = Vec::new();
         if let Some(p) = path {

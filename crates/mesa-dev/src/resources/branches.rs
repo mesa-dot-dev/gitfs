@@ -27,14 +27,13 @@ impl<'c, C: HttpClient> BranchesResource<'c, C> {
     /// Create a new branch.
     pub async fn create(&self, req: &CreateBranchRequest) -> Result<Branch, MesaError> {
         let path = format!("/{}/{}/branches", self.org, self.repo);
-        self.client.request(Method::POST, &path, &[], Some(req)).await
+        self.client
+            .request(Method::POST, &path, &[], Some(req))
+            .await
     }
 
     /// List branches with pagination parameters.
-    pub async fn list(
-        &self,
-        params: &PaginationParams,
-    ) -> Result<ListBranchesResponse, MesaError> {
+    pub async fn list(&self, params: &PaginationParams) -> Result<ListBranchesResponse, MesaError> {
         let path = format!("/{}/{}/branches", self.org, self.repo);
         let mut query = Vec::new();
         if let Some(ref cursor) = params.cursor {

@@ -38,10 +38,13 @@ pub enum Content {
     },
 }
 
+/// The type of a directory entry.
 #[derive(Debug, Clone, Deserialize)]
 pub enum DirEntryType {
+    /// A file.
     #[serde(rename = "file")]
     File,
+    /// A subdirectory.
     #[serde(rename = "dir")]
     Dir,
 }
