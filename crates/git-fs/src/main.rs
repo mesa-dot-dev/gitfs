@@ -7,10 +7,11 @@ use tracing::error;
 use tracing_subscriber::{EnvFilter, fmt};
 
 mod domain;
-mod mesafs;
+mod mesafuse;
+mod ssfs;
 mod util;
 
-use mesafs::MesaFS;
+use mesafuse::MesaFS;
 
 use crate::domain::GhRepoInfo;
 
@@ -43,7 +44,6 @@ fn main() {
     let options = vec![
         MountOption::RO,
         MountOption::AutoUnmount,
-        MountOption::AllowRoot,
         MountOption::FSName("mesafs".to_owned()),
     ];
 
