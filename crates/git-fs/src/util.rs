@@ -5,4 +5,3 @@ macro_rules! critical_bug {
         panic!("Critical error in Mesa. Please report this on https://github.com/mesa-dot-dev/git-fs: {}", format_args!($($arg)*))
     };
 }
-

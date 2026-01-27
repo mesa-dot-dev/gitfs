@@ -476,7 +476,9 @@ impl<B: SsfsBackend> SsFs<B> {
                     Some(DirChildren::Populated(map)) => {
                         debug!(parent, ?path, "lookup: cache hit, direct child lookup");
                         match map.get(path).copied() {
-                            Some(child_ino) => self.get_inode(child_ino).map_err(SsfsResolutionError::from),
+                            Some(child_ino) => {
+                                self.get_inode(child_ino).map_err(SsfsResolutionError::from)
+                            }
                             None => Err(SsfsResolutionError::DoesNotExist),
                         }
                     }
@@ -489,13 +491,14 @@ impl<B: SsfsBackend> SsFs<B> {
                         match self.initiate_readdir(parent)? {
                             SsfsOk::Resolved(_) => {
                                 // Children now populated inline — look up the child.
-                                let maybe_child_ino = self
-                                    .nodes
-                                    .read_sync(&parent, |_, n| match &n.children {
-                                        DirChildren::Populated(m) => m.get(path).copied(),
-                                        DirChildren::NotADirectory | DirChildren::Unpopulated => None,
-                                    })
-                                    .flatten();
+                                let maybe_child_ino =
+                                    self.nodes
+                                        .read_sync(&parent, |_, n| match &n.children {
+                                            DirChildren::Populated(m) => m.get(path).copied(),
+                                            DirChildren::NotADirectory
+                                            | DirChildren::Unpopulated => None,
+                                        })
+                                        .flatten();
                                 match maybe_child_ino {
                                     Some(child_ino) => {
                                         self.get_inode(child_ino).map_err(SsfsResolutionError::from)
@@ -511,7 +514,8 @@ impl<B: SsfsBackend> SsFs<B> {
                                     let maybe_child_ino = nodes
                                         .read_sync(&parent, |_, n| match &n.children {
                                             DirChildren::Populated(m) => m.get(&path).copied(),
-                                            DirChildren::NotADirectory | DirChildren::Unpopulated => None,
+                                            DirChildren::NotADirectory
+                                            | DirChildren::Unpopulated => None,
                                         })
                                         .flatten();
                                     match maybe_child_ino {
