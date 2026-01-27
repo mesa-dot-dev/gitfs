@@ -27,14 +27,13 @@ impl<'c, C: HttpClient> ReposResource<'c, C> {
     /// Create a new repository.
     pub async fn create(&self, req: &CreateRepoRequest) -> Result<Repo, MesaError> {
         let path = format!("/{}/repos", self.org);
-        self.client.request(Method::POST, &path, &[], Some(req)).await
+        self.client
+            .request(Method::POST, &path, &[], Some(req))
+            .await
     }
 
     /// List repositories with pagination parameters.
-    pub async fn list(
-        &self,
-        params: &PaginationParams,
-    ) -> Result<ListReposResponse, MesaError> {
+    pub async fn list(&self, params: &PaginationParams) -> Result<ListReposResponse, MesaError> {
         let path = format!("/{}/repos", self.org);
         let mut query = Vec::new();
         if let Some(ref cursor) = params.cursor {
@@ -75,11 +74,7 @@ impl<'c, C: HttpClient> ReposResource<'c, C> {
     }
 
     /// Rename a repository.
-    pub async fn rename(
-        &self,
-        repo: &str,
-        req: &RenameRepoRequest,
-    ) -> Result<Repo, MesaError> {
+    pub async fn rename(&self, repo: &str, req: &RenameRepoRequest) -> Result<Repo, MesaError> {
         let path = format!("/{}/{repo}", self.org);
         self.client
             .request(Method::PATCH, &path, &[], Some(req))

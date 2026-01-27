@@ -61,18 +61,14 @@ impl HttpClient for UreqClient {
             Err(ureq::Error::HostNotFound) => {
                 Err(HttpClientError::Connection("host not found".to_owned()))
             }
-            Err(ureq::Error::Io(e)) => {
-                Err(HttpClientError::Connection(e.to_string()))
-            }
+            Err(ureq::Error::Io(e)) => Err(HttpClientError::Connection(e.to_string())),
             Err(e) => Err(HttpClientError::Other(Box::new(e))),
         }
     }
 }
 
 /// Convert a ureq `http::Response<Body>` into our [`HttpResponse`].
-fn convert_response(
-    response: http::Response<ureq::Body>,
-) -> Result<HttpResponse, HttpClientError> {
+fn convert_response(response: http::Response<ureq::Body>) -> Result<HttpResponse, HttpClientError> {
     let (parts, body) = response.into_parts();
 
     let mut body_bytes = Vec::new();

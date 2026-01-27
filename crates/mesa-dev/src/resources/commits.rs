@@ -34,19 +34,15 @@ impl<'c, C: HttpClient> CommitsResource<'c, C> {
     }
 
     /// Create a new commit.
-    pub async fn create(
-        &self,
-        req: &CreateCommitRequest,
-    ) -> Result<CommitSummary, MesaError> {
+    pub async fn create(&self, req: &CreateCommitRequest) -> Result<CommitSummary, MesaError> {
         let path = format!("/{}/{}/commits", self.org, self.repo);
-        self.client.request(Method::POST, &path, &[], Some(req)).await
+        self.client
+            .request(Method::POST, &path, &[], Some(req))
+            .await
     }
 
     /// List commits with pagination and optional ref filter.
-    pub async fn list(
-        &self,
-        params: &ListCommitsParams,
-    ) -> Result<ListCommitsResponse, MesaError> {
+    pub async fn list(&self, params: &ListCommitsParams) -> Result<ListCommitsResponse, MesaError> {
         let path = format!("/{}/{}/commits", self.org, self.repo);
         let mut query: Vec<(&str, String)> = Vec::new();
         if let Some(ref cursor) = params.pagination.cursor {
@@ -58,8 +54,7 @@ impl<'c, C: HttpClient> CommitsResource<'c, C> {
         if let Some(ref r) = params.ref_ {
             query.push(("ref", r.clone()));
         }
-        let query_refs: Vec<(&str, &str)> =
-            query.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let query_refs: Vec<(&str, &str)> = query.iter().map(|(k, v)| (*k, v.as_str())).collect();
         self.client
             .request(Method::GET, &path, &query_refs, None::<&()>)
             .await

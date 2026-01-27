@@ -3,11 +3,12 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use fuser::MountOption;
+use tracing::error;
 use tracing_subscriber::{EnvFilter, fmt};
 
+mod domain;
 mod mesafs;
 mod util;
-mod domain;
 
 use mesafs::MesaFS;
 
@@ -22,7 +23,7 @@ struct Args {
     /// The path to the mount point.
     mount_point: PathBuf,
 
-    /// The Mesa API key. Can also be provided via the MESA_API_KEY environment variable.
+    /// The Mesa API key. Can also be provided via the `MESA_API_KEY` environment variable.
     #[arg(long, env = "MESA_API_KEY")]
     mesa_api_key: String,
 
@@ -43,9 +44,11 @@ fn main() {
         MountOption::RO,
         MountOption::AutoUnmount,
         MountOption::AllowRoot,
-        MountOption::FSName("mesafs".to_string())
+        MountOption::FSName("mesafs".to_owned()),
     ];
 
-    let mesa_fs = MesaFS::new(&args.mesa_api_key, args.repo.clone(), args.r#ref.as_deref());
-    fuser::mount2(mesa_fs, &args.mount_point, &options).unwrap();
+    let mesa_fs = MesaFS::new(&args.mesa_api_key, args.repo, args.r#ref.as_deref());
+    if let Err(e) = fuser::mount2(mesa_fs, &args.mount_point, &options) {
+        error!("Failed to mount filesystem: {e}");
+    }
 }

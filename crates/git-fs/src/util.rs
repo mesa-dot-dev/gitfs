@@ -1,3 +1,4 @@
+/// Panics with an error message asking the user to report a bug.
 #[macro_export]
 macro_rules! critical_bug {
     ($($arg:tt)*) => {
@@ -5,4 +6,4 @@ macro_rules! critical_bug {
     };
 }
 
-pub use critical_bug;
+pub(crate) use critical_bug;

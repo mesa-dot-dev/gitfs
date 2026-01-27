@@ -5,7 +5,9 @@ use http::Method;
 use crate::client::MesaClient;
 use crate::error::MesaError;
 use crate::http_client::HttpClient;
-use crate::models::{ApiKey, ApiKeyCreated, CreateApiKeyRequest, ListApiKeysResponse, SuccessResponse};
+use crate::models::{
+    ApiKey, ApiKeyCreated, CreateApiKeyRequest, ListApiKeysResponse, SuccessResponse,
+};
 
 /// Operations on API keys for an organization.
 pub struct AdminResource<'c, C: HttpClient> {
@@ -24,7 +26,9 @@ impl<'c, C: HttpClient> AdminResource<'c, C> {
         req: &CreateApiKeyRequest,
     ) -> Result<ApiKeyCreated, MesaError> {
         let path = format!("/{}/api-keys", self.org);
-        self.client.request(Method::POST, &path, &[], Some(req)).await
+        self.client
+            .request(Method::POST, &path, &[], Some(req))
+            .await
     }
 
     /// List all API keys.
