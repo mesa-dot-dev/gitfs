@@ -44,7 +44,7 @@ fn main() {
     let options = vec![
         MountOption::RO,
         MountOption::AutoUnmount,
-        MountOption::FSName("mesafs".to_string()),
+        MountOption::FSName("mesafs".to_owned()),
     ];
 
     let mesa_fs = MesaFS::new(&args.mesa_api_key, args.repo, args.r#ref.as_deref());

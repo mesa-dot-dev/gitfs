@@ -17,17 +17,17 @@ use mesa_dev::Mesa;
 use mesa_dev::models::{Content, DirEntryType};
 use tracing::instrument;
 
-impl Into<fuser::FileAttr> for INodeHandle {
-    fn into(self) -> fuser::FileAttr {
-        let (kind, perm) = match self.kind {
+impl From<INodeHandle> for fuser::FileAttr {
+    fn from(val: INodeHandle) -> Self {
+        let (kind, perm) = match val.kind {
             INodeKind::File => (fuser::FileType::RegularFile, 0o444),
             INodeKind::Directory => (fuser::FileType::Directory, 0o755),
         };
 
         // TODO(markovejnovic): A lot of these falues are placeholders.
-        fuser::FileAttr {
-            ino: self.ino as u64,
-            size: self.size,
+        Self {
+            ino: u64::from(val.ino),
+            size: val.size,
             blocks: 0,
             atime: std::time::SystemTime::now(),
             mtime: std::time::SystemTime::now(),
@@ -35,7 +35,7 @@ impl Into<fuser::FileAttr> for INodeHandle {
             crtime: std::time::SystemTime::now(),
             kind,
             perm,
-            nlink: if matches!(self.kind, INodeKind::Directory) {
+            nlink: if matches!(val.kind, INodeKind::Directory) {
                 2
             } else {
                 1
@@ -49,7 +49,7 @@ impl Into<fuser::FileAttr> for INodeHandle {
     }
 }
 
-fn inode_kind_to_file_type(kind: &INodeKind) -> fuser::FileType {
+fn inode_kind_to_file_type(kind: INodeKind) -> fuser::FileType {
     match kind {
         INodeKind::File => fuser::FileType::RegularFile,
         INodeKind::Directory => fuser::FileType::Directory,
@@ -170,7 +170,7 @@ pub struct MesaFS {
     /// request.
     rt: tokio::runtime::Runtime,
 
-    /// This is the backing memory for the filesystem. SsFs is responsible for managing how it
+    /// This is the backing memory for the filesystem. `SsFs` is responsible for managing how it
     /// serializes to disk and how it loads from disk. We are responsible for giving it the true
     /// state of reality.
     ssfs: SsFs<MesaBackend>,
@@ -182,6 +182,7 @@ impl MesaFS {
     /// attributes.
     const KERNEL_TTL: Duration = Duration::from_mins(1);
 
+    #[expect(clippy::expect_used)] // Runtime creation is infallible in practice; no recovery path.
     pub fn new(api_key: &str, gh_repo: GhRepoInfo, git_ref: Option<&str>) -> Self {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
@@ -189,7 +190,7 @@ impl MesaFS {
             mesa: Mesa::builder(api_key).build(),
             org: gh_repo.org,
             repo: gh_repo.repo,
-            git_ref: git_ref.map(|s| s.to_string()),
+            git_ref: git_ref.map(ToOwned::to_owned),
         });
 
         let ssfs = SsFs::new(backend, rt.handle().clone());
@@ -198,6 +199,11 @@ impl MesaFS {
     }
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 impl Filesystem for MesaFS {
     #[instrument(skip(self, _req, name, reply))]
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
@@ -326,38 +332,38 @@ impl Filesystem for MesaFS {
         let mut i = 0usize;
 
         // . entry
-        if i >= offset {
-            if reply.add(
-                ino as u64,
+        if i >= offset
+            && reply.add(
+                u64::from(ino),
                 (i + 1) as i64,
                 fuser::FileType::Directory,
                 OsStr::new("."),
-            ) {
-                reply.ok();
-                return;
-            }
+            )
+        {
+            reply.ok();
+            return;
         }
         i += 1;
 
         // .. entry
-        if i >= offset {
-            if reply.add(
-                parent_ino as u64,
+        if i >= offset
+            && reply.add(
+                u64::from(parent_ino),
                 (i + 1) as i64,
                 fuser::FileType::Directory,
                 OsStr::new(".."),
-            ) {
-                reply.ok();
-                return;
-            }
+            )
+        {
+            reply.ok();
+            return;
         }
         i += 1;
 
         // Child entries
         for (child_ino, kind, name) in &children {
             if i >= offset {
-                let file_type = inode_kind_to_file_type(kind);
-                if reply.add(*child_ino as u64, (i + 1) as i64, file_type, name) {
+                let file_type = inode_kind_to_file_type(*kind);
+                if reply.add(u64::from(*child_ino), (i + 1) as i64, file_type, name) {
                     reply.ok();
                     return;
                 }

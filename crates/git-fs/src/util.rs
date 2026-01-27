@@ -6,4 +6,3 @@ macro_rules! critical_bug {
     };
 }
 
-pub(crate) use critical_bug;

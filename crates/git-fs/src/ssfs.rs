@@ -24,10 +24,10 @@ use rustc_hash::FxHashMap;
 use tokio::sync::Notify;
 use tracing::debug;
 
-/// Each filesystem INode is identified by a unique inode number (INo).
+/// Each filesystem `INode` is identified by a unique inode number (`INo`).
 pub type INo = u32;
 
-/// Each path component is represented as an OsString.
+/// Each path component is represented as an `OsString`.
 pub type Path = OsString;
 
 // A lightweight view into a path component.
@@ -50,7 +50,7 @@ pub enum DirChildren {
     Populated(Arc<FxHashMap<Path, INo>>),
 }
 
-/// Each node on the filesystem tree is represented by an INode.
+/// Each node on the filesystem tree is represented by an `INode`.
 #[derive(Debug)]
 pub struct INode {
     /// The unique inode number for this node.
@@ -65,17 +65,12 @@ pub struct INode {
     /// The children of this node.
     pub children: DirChildren,
 
-    /// The UNIX permissions for this node.
-    ///
-    /// TODO(markovejnovic): Could and should be a bitfield.
-    pub permissions: u16,
-
     /// The size of this node in bytes.
     pub size: u64,
 }
 
 impl INode {
-    /// Returns the kind of this INode (file or directory).
+    /// Returns the kind of this `INode` (file or directory).
     pub fn kind(&self) -> INodeKind {
         match &self.children {
             DirChildren::NotADirectory => INodeKind::File,
@@ -83,19 +78,18 @@ impl INode {
         }
     }
 
-    /// Returns a lightweight handle containing the copyable metadata of this INode.
+    /// Returns a lightweight handle containing the copyable metadata of this `INode`.
     pub fn handle(&self) -> INodeHandle {
         INodeHandle {
             ino: self.ino,
             parent: self.parent,
             kind: self.kind(),
-            permissions: self.permissions,
             size: self.size,
         }
     }
 }
 
-/// A lightweight, copyable handle to an INode's metadata.
+/// A lightweight, copyable handle to an `INode`'s metadata.
 ///
 /// This avoids cloning the potentially large children map when only scalar metadata is needed.
 #[derive(Debug, Clone, Copy)]
@@ -103,7 +97,6 @@ pub struct INodeHandle {
     pub ino: INo,
     pub parent: INo,
     pub kind: INodeKind,
-    pub permissions: u16,
     pub size: u64,
 }
 
@@ -121,10 +114,10 @@ pub enum GetINodeError {
     DoesNotExist,
 }
 
-impl Into<SsfsResolutionError> for GetINodeError {
-    fn into(self) -> SsfsResolutionError {
-        match self {
-            GetINodeError::DoesNotExist => SsfsResolutionError::DoesNotExist,
+impl From<GetINodeError> for SsfsResolutionError {
+    fn from(value: GetINodeError) -> Self {
+        match value {
+            GetINodeError::DoesNotExist => Self::DoesNotExist,
         }
     }
 }
@@ -151,6 +144,7 @@ pub struct SsfsDirEntry {
 #[derive(Debug)]
 pub enum SsfsBackendError {
     NotFound,
+    #[expect(dead_code)]
     Io(Box<dyn std::error::Error + Send + Sync>),
 }
 
@@ -169,7 +163,7 @@ pub trait SsfsBackend: Send + Sync + 'static {
 
 /// TODO(markovejnovic): In the future, we'll have to figure out how ssfs will serialize to disk.
 pub struct SsFs<B: SsfsBackend> {
-    /// Mapping from inode numbers to INodes.
+    /// Mapping from inode numbers to `INode`s.
     nodes: Arc<scc::HashMap<INo, INode>>,
 
     /// Holds notifications for pending updates to inodes.
@@ -192,6 +186,7 @@ pub struct SsFs<B: SsfsBackend> {
 }
 
 impl<B: SsfsBackend> SsFs<B> {
+    #[expect(clippy::cast_possible_truncation)] // FUSE_ROOT_ID is always 1
     pub const ROOT_INO: INo = FUSE_ROOT_ID as u32;
 
     /// Creates a new filesystem with the given backend and runtime handle.
@@ -202,10 +197,9 @@ impl<B: SsfsBackend> SsFs<B> {
             parent: Self::ROOT_INO,
             name: OsString::new(),
             children: DirChildren::Unpopulated,
-            permissions: 0o755,
             size: 0,
         };
-        let _ = nodes.insert_sync(Self::ROOT_INO, root);
+        drop(nodes.insert_sync(Self::ROOT_INO, root));
 
         let s = Self {
             nodes,
@@ -216,7 +210,7 @@ impl<B: SsfsBackend> SsFs<B> {
         };
 
         // Eagerly prefetch the root directory so it's likely cached before the first FUSE call.
-        let _ = s.initiate_readdir(Self::ROOT_INO);
+        drop(s.initiate_readdir(Self::ROOT_INO));
 
         s
     }
@@ -256,9 +250,8 @@ impl<B: SsfsBackend> SsFs<B> {
             .nodes
             .read_sync(&ino, |_, inode| (inode.kind(), inode.children.clone()));
 
-        let (kind, children) = match state {
-            Some(s) => s,
-            None => return Err(SsfsResolutionError::DoesNotExist),
+        let Some((kind, children)) = state else {
+            return Err(SsfsResolutionError::DoesNotExist);
         };
 
         if kind != INodeKind::Directory {
@@ -295,7 +288,7 @@ impl<B: SsfsBackend> SsFs<B> {
         }
     }
 
-    /// Initiate a backend readdir fetch. Uses pending_updates for deduplication so that
+    /// Initiate a backend readdir fetch. Uses `pending_updates` for deduplication so that
     /// concurrent callers share a single in-flight request.
     fn initiate_readdir(&self, ino: INo) -> SsfsResult<Vec<(INo, INodeKind, Path)>> {
         // Check if there's already a pending fetch for this directory.
@@ -328,24 +321,20 @@ impl<B: SsfsBackend> SsFs<B> {
                     "initiate_readdir: lost insert race, joining existing fetch"
                 );
                 let existing = self.pending_updates.read_sync(&ino, |_, v| Arc::clone(v));
-                match existing {
-                    Some(existing_notify) => {
-                        let nodes = Arc::clone(&self.nodes);
-                        let fut = async move {
-                            existing_notify.notified().await;
-                            Self::collect_children(&nodes, ino)
-                        };
-                        return Ok(SsfsOk::Future(Box::pin(fut)));
-                    }
-                    None => {
-                        // The other fetch completed between our failed insert and this read.
-                        // The directory should now be populated.
-                        let nodes = Arc::clone(&self.nodes);
-                        return Ok(SsfsOk::Future(Box::pin(async move {
-                            Self::collect_children(&nodes, ino)
-                        })));
-                    }
+                if let Some(existing_notify) = existing {
+                    let nodes = Arc::clone(&self.nodes);
+                    let fut = async move {
+                        existing_notify.notified().await;
+                        Self::collect_children(&nodes, ino)
+                    };
+                    return Ok(SsfsOk::Future(Box::pin(fut)));
                 }
+                // The other fetch completed between our failed insert and this read.
+                // The directory should now be populated.
+                let nodes = Arc::clone(&self.nodes);
+                return Ok(SsfsOk::Future(Box::pin(async move {
+                    Self::collect_children(&nodes, ino)
+                })));
             }
         }
 
@@ -356,9 +345,8 @@ impl<B: SsfsBackend> SsFs<B> {
         let pending = Arc::clone(&self.pending_updates);
         let task_notify = Arc::clone(&notify);
 
-        let path = match self.abspath(ino) {
-            Some(p) => p,
-            None => return Err(SsfsResolutionError::DoesNotExist),
+        let Some(path) = self.abspath(ino) else {
+            return Err(SsfsResolutionError::DoesNotExist);
         };
 
         debug!(ino, path = %path, "initiate_readdir: spawning backend fetch");
@@ -381,13 +369,9 @@ impl<B: SsfsBackend> SsFs<B> {
                                 INodeKind::Directory => DirChildren::Unpopulated,
                                 INodeKind::File => DirChildren::NotADirectory,
                             },
-                            permissions: match entry.kind {
-                                INodeKind::Directory => 0o755,
-                                INodeKind::File => 0o444,
-                            },
                             size: entry.size,
                         };
-                        let _ = nodes.insert_async(child_ino, child).await;
+                        drop(nodes.insert_async(child_ino, child).await);
                         children_map.insert(entry.name, child_ino);
                     }
 
@@ -406,7 +390,7 @@ impl<B: SsfsBackend> SsFs<B> {
             }
 
             // Remove from pending and notify all waiters.
-            let _ = pending.remove_async(&ino).await;
+            drop(pending.remove_async(&ino).await);
             task_notify.notify_waiters();
         });
 
@@ -420,7 +404,7 @@ impl<B: SsfsBackend> SsFs<B> {
     }
 
     /// Collect children entries from a (presumably now-populated) directory.
-    /// Returns IoError if the directory is still unpopulated after a fetch attempt.
+    /// Returns `IoError` if the directory is still unpopulated after a fetch attempt.
     fn collect_children(
         nodes: &scc::HashMap<INo, INode>,
         ino: INo,
@@ -451,9 +435,8 @@ impl<B: SsfsBackend> SsFs<B> {
         let children = self
             .nodes
             .read_sync(&ino, |_, inode| inode.children.clone());
-        let map = match children {
-            Some(DirChildren::Populated(map)) => map,
-            _ => return,
+        let Some(DirChildren::Populated(map)) = children else {
+            return;
         };
 
         let mut prefetch_count = 0u32;
@@ -466,7 +449,7 @@ impl<B: SsfsBackend> SsFs<B> {
                 .unwrap_or(false);
 
             if is_unpopulated_dir {
-                let _ = self.initiate_readdir(child_ino);
+                drop(self.initiate_readdir(child_ino));
                 prefetch_count += 1;
             }
         }
@@ -479,13 +462,9 @@ impl<B: SsfsBackend> SsFs<B> {
         );
     }
 
-    pub fn get_abspath(&self, ino: INo) -> Result<SsfsOk<Path>, GetINodeError> {
-        unimplemented!();
-    }
-
     /// Query the filesystem for a child node given its parent inode number and name.
     pub fn lookup(&self, parent: INo, path: &PathView) -> SsfsResult<INodeHandle> {
-        match self.get_inode(parent).map_err(|e| e.into())? {
+        match self.get_inode(parent).map_err(SsfsResolutionError::from)? {
             SsfsOk::Resolved(parent_handle) => {
                 if parent_handle.kind != INodeKind::Directory {
                     return Err(SsfsResolutionError::EntryIsNotDirectory);
@@ -497,7 +476,7 @@ impl<B: SsfsBackend> SsFs<B> {
                     Some(DirChildren::Populated(map)) => {
                         debug!(parent, ?path, "lookup: cache hit, direct child lookup");
                         match map.get(path).copied() {
-                            Some(child_ino) => self.get_inode(child_ino).map_err(|e| e.into()),
+                            Some(child_ino) => self.get_inode(child_ino).map_err(SsfsResolutionError::from),
                             None => Err(SsfsResolutionError::DoesNotExist),
                         }
                     }
@@ -514,12 +493,12 @@ impl<B: SsfsBackend> SsFs<B> {
                                     .nodes
                                     .read_sync(&parent, |_, n| match &n.children {
                                         DirChildren::Populated(m) => m.get(path).copied(),
-                                        _ => None,
+                                        DirChildren::NotADirectory | DirChildren::Unpopulated => None,
                                     })
                                     .flatten();
                                 match maybe_child_ino {
                                     Some(child_ino) => {
-                                        self.get_inode(child_ino).map_err(|e| e.into())
+                                        self.get_inode(child_ino).map_err(SsfsResolutionError::from)
                                     }
                                     None => Err(SsfsResolutionError::DoesNotExist),
                                 }
@@ -532,7 +511,7 @@ impl<B: SsfsBackend> SsFs<B> {
                                     let maybe_child_ino = nodes
                                         .read_sync(&parent, |_, n| match &n.children {
                                             DirChildren::Populated(m) => m.get(&path).copied(),
-                                            _ => None,
+                                            DirChildren::NotADirectory | DirChildren::Unpopulated => None,
                                         })
                                         .flatten();
                                     match maybe_child_ino {
@@ -568,7 +547,7 @@ impl<B: SsfsBackend> SsFs<B> {
                         .read_sync(&parent_handle.ino, |_, parent_inode| {
                             match &parent_inode.children {
                                 DirChildren::Populated(map) => map.get(&path).copied(),
-                                _ => None,
+                                DirChildren::NotADirectory | DirChildren::Unpopulated => None,
                             }
                         })
                         .flatten();
@@ -596,9 +575,9 @@ impl<B: SsfsBackend> SsFs<B> {
             let nodes = Arc::clone(&self.nodes);
             let fut = async move {
                 notify.notified().await;
-                Ok(nodes
+                nodes
                     .read_sync(&ino, |_, inode| inode.handle())
-                    .expect("INode should exist after pending update"))
+                    .ok_or(SsfsResolutionError::DoesNotExist)
             };
 
             return Ok(SsfsOk::Future(Box::pin(fut)));
@@ -617,19 +596,16 @@ impl<B: SsfsBackend> SsFs<B> {
     /// Verifies the inode exists and is a file, resolves the path, and delegates to the backend.
     /// No caching -- always fetches from the backend.
     pub fn read(&self, ino: INo) -> SsfsResult<Vec<u8>> {
-        let handle = self.nodes.read_sync(&ino, |_, inode| inode.handle());
-        let handle = match handle {
-            Some(h) => h,
-            None => return Err(SsfsResolutionError::DoesNotExist),
+        let Some(handle) = self.nodes.read_sync(&ino, |_, inode| inode.handle()) else {
+            return Err(SsfsResolutionError::DoesNotExist);
         };
 
         if handle.kind != INodeKind::File {
             return Err(SsfsResolutionError::EntryIsNotFile);
         }
 
-        let path = match self.abspath(ino) {
-            Some(p) => p,
-            None => return Err(SsfsResolutionError::DoesNotExist),
+        let Some(path) = self.abspath(ino) else {
+            return Err(SsfsResolutionError::DoesNotExist);
         };
 
         let backend = Arc::clone(&self.backend);
