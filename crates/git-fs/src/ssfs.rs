@@ -22,7 +22,7 @@ use std::{
 use fuser::FUSE_ROOT_ID;
 use rustc_hash::FxHashMap;
 use tokio::sync::Notify;
-use tracing::debug;
+use tracing::{debug, error};
 
 /// Each filesystem `INode` is identified by a unique inode number (`INo`).
 pub type INo = u32;
@@ -383,7 +383,7 @@ impl<B: SsfsBackend> SsFs<B> {
                         .await;
                 }
                 Err(ref e) => {
-                    debug!(ino, ?e, "backend fetch failed");
+                    error!(ino, ?e, "backend fetch failed");
                     // Leave directory as Unpopulated on error. Waiters will detect this
                     // and return IoError.
                 }
