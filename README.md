@@ -1,31 +1,31 @@
 # git-fs
 
-Mount GitHub repositories as local filesystems via FUSE, powered by the [Mesa](https://mesa.dev) API. No cloning required.
+FUSE filesystem that mounts a GitHub repository as a read-only local directory, without cloning.
 
-## Workspace
-
-| Crate | Description |
-|-------|-------------|
-| [`git-fs`](crates/git-fs/) | FUSE binary that mounts a repo as a read-only filesystem |
-| [`mesa-dev`](crates/mesa-dev/) | Rust SDK for the mesa.dev API |
-
-## Quick start
+## Usage
 
 ```bash
-# Build
-cargo build --release
-
-# Mount a repository (reads MESA_API_KEY from env if --mesa-api-key is omitted)
-export MESA_API_KEY="your-api-key"
-./target/release/git-fs rust-lang/rust /mnt/rust
-
-# Or pass the key directly
-./target/release/git-fs rust-lang/rust /mnt/rust --mesa-api-key your-api-key
-
-# Pin to a specific branch, tag, or commit
-./target/release/git-fs rust-lang/rust /mnt/rust --ref main
+git-fs <org/repo> <mountpoint> --mesa-api-key <KEY> [--ref <REF>]
 ```
 
-Requires [macFUSE](https://osxfuse.github.io/) on macOS or `libfuse` on Linux.
+The API key can also be provided via the `MESA_API_KEY` environment variable:
 
-See the individual crate READMEs for more details.
+```bash
+export MESA_API_KEY="your-api-key"
+git-fs rust-lang/rust /mnt/rust
+```
+
+Pin to a specific branch, tag, or commit SHA with `--ref`:
+
+```bash
+git-fs rust-lang/rust /mnt/rust --ref v1.80.0
+```
+
+## Requirements
+
+- **macOS**: [macFUSE](https://osxfuse.github.io/)
+- **Linux**: `libfuse` (e.g. `apt install libfuse-dev` or `dnf install fuse-devel`)
+
+## Architecture
+
+FUSE operations are handled by `MesaFS`, which delegates to an inode cache (`SsFs`) backed by the Mesa API via `mesa-dev`. Directory contents and file data are fetched lazily on first access, with request deduplication and speculative prefetching of subdirectories.
