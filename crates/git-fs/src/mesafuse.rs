@@ -17,35 +17,34 @@ use mesa_dev::Mesa;
 use mesa_dev::models::{Content, DirEntryType};
 use tracing::instrument;
 
-impl From<INodeHandle> for fuser::FileAttr {
-    fn from(val: INodeHandle) -> Self {
-        let (kind, perm) = match val.kind {
-            INodeKind::File => (fuser::FileType::RegularFile, 0o444),
-            INodeKind::Directory => (fuser::FileType::Directory, 0o755),
-        };
+/// Convert an inode handle to FUSE file attributes.
+fn inode_to_file_attr(handle: INodeHandle) -> fuser::FileAttr {
+    let (kind, perm) = match handle.kind {
+        INodeKind::File => (fuser::FileType::RegularFile, 0o444),
+        INodeKind::Directory => (fuser::FileType::Directory, 0o755),
+    };
 
-        // TODO(markovejnovic): A lot of these falues are placeholders.
-        Self {
-            ino: u64::from(val.ino),
-            size: val.size,
-            blocks: 0,
-            atime: std::time::SystemTime::now(),
-            mtime: std::time::SystemTime::now(),
-            ctime: std::time::SystemTime::now(),
-            crtime: std::time::SystemTime::now(),
-            kind,
-            perm,
-            nlink: if matches!(val.kind, INodeKind::Directory) {
-                2
-            } else {
-                1
-            },
-            uid: 1000,
-            gid: 1000,
-            rdev: 0,
-            flags: 0,
-            blksize: 0,
-        }
+    // TODO(markovejnovic): A lot of these falues are placeholders.
+    fuser::FileAttr {
+        ino: u64::from(handle.ino),
+        size: handle.size,
+        blocks: 0,
+        atime: std::time::SystemTime::now(),
+        mtime: std::time::SystemTime::now(),
+        ctime: std::time::SystemTime::now(),
+        crtime: std::time::SystemTime::now(),
+        kind,
+        perm,
+        nlink: if matches!(handle.kind, INodeKind::Directory) {
+            2
+        } else {
+            1
+        },
+        uid: nix::unistd::getuid().as_raw(),
+        gid: nix::unistd::getgid().as_raw(),
+        rdev: 0,
+        flags: 0,
+        blksize: 0,
     }
 }
 
@@ -188,12 +187,12 @@ impl Filesystem for MesaFS {
         match self.ssfs.lookup(parent as u32, name) {
             Ok(entry) => match entry {
                 SsfsOk::Resolved(inode_handle) => {
-                    let attr: fuser::FileAttr = inode_handle.into();
+                    let attr = inode_to_file_attr(inode_handle);
                     reply.entry(&Self::KERNEL_TTL, &attr, 0);
                 }
                 SsfsOk::Future(fut) => match self.rt.block_on(fut) {
                     Ok(inode_handle) => {
-                        let attr: fuser::FileAttr = inode_handle.into();
+                        let attr = inode_to_file_attr(inode_handle);
                         reply.entry(&Self::KERNEL_TTL, &attr, 0);
                     }
                     Err(err) => reply.error(ssfs_err_to_errno(&err)),
@@ -208,12 +207,12 @@ impl Filesystem for MesaFS {
         match self.ssfs.get_inode(ino as u32) {
             Ok(entry) => match entry {
                 SsfsOk::Resolved(inode_handle) => {
-                    let attr: fuser::FileAttr = inode_handle.into();
+                    let attr = inode_to_file_attr(inode_handle);
                     reply.attr(&Self::KERNEL_TTL, &attr);
                 }
                 SsfsOk::Future(fut) => match self.rt.block_on(fut) {
                     Ok(inode_handle) => {
-                        let attr: fuser::FileAttr = inode_handle.into();
+                        let attr = inode_to_file_attr(inode_handle);
                         reply.attr(&Self::KERNEL_TTL, &attr);
                     }
                     Err(err) => reply.error(ssfs_err_to_errno(&err)),
