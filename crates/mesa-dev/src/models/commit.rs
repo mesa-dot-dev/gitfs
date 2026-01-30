@@ -24,6 +24,16 @@ pub enum CommitFileAction {
     Delete,
 }
 
+/// Encoding used for file content in a commit.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CommitEncoding {
+    /// Base64-encoded content.
+    Base64,
+    /// UTF-8 text content.
+    Utf8,
+}
+
 /// A file change within a commit.
 #[derive(Debug, Clone, Serialize)]
 pub struct CommitFile {
@@ -31,7 +41,9 @@ pub struct CommitFile {
     pub action: CommitFileAction,
     /// File path.
     pub path: String,
-    /// Base64-encoded file content (for upsert).
+    /// Content encoding.
+    pub encoding: CommitEncoding,
+    /// File content (for upsert).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
 }

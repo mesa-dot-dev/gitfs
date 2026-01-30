@@ -12,15 +12,25 @@ use crate::{
     },
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use fuser::{Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request};
+use fuser::{
+    Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
+    ReplyWrite, Request,
+};
 use mesa_dev::Mesa;
-use mesa_dev::models::{Content, DirEntryType};
-use tracing::instrument;
+use mesa_dev::models::{
+    Author as MesaAuthor, CommitEncoding, CommitFile, CommitFileAction, Content,
+    CreateCommitRequest, DirEntryType,
+};
+use tokio::sync::mpsc;
+use tracing::{error, info, instrument};
 
 /// Convert an inode handle to FUSE file attributes.
-fn inode_to_file_attr(handle: INodeHandle) -> fuser::FileAttr {
+fn inode_to_file_attr(handle: INodeHandle, writable: bool) -> fuser::FileAttr {
     let (kind, perm) = match handle.kind {
-        INodeKind::File => (fuser::FileType::RegularFile, 0o444),
+        INodeKind::File => {
+            let perm = if writable { 0o644 } else { 0o444 };
+            (fuser::FileType::RegularFile, perm)
+        }
         INodeKind::Directory => (fuser::FileType::Directory, 0o755),
     };
 
@@ -70,11 +80,28 @@ fn get_inode_err_to_errno(err: &GetINodeError) -> i32 {
     }
 }
 
+fn backend_err_to_errno(err: &SsfsBackendError) -> i32 {
+    match err {
+        SsfsBackendError::NotFound => libc::ENOENT,
+        SsfsBackendError::ReadOnly => libc::EROFS,
+        SsfsBackendError::Io(_) => libc::EIO,
+    }
+}
+
+/// A request to create a commit, sent to the background task.
+enum CommitRequest {
+    Create { path: String, content: Vec<u8> },
+    Update { path: String, content: Vec<u8> },
+    Delete { path: String },
+}
+
+#[derive(Clone)]
 pub struct MesaBackend {
     mesa: Mesa,
     org: String,
     repo: String,
     git_ref: Option<String>,
+    commit_tx: Arc<mpsc::UnboundedSender<CommitRequest>>,
 }
 
 impl SsfsBackend for MesaBackend {
@@ -136,6 +163,35 @@ impl SsfsBackend for MesaBackend {
             Err(e) => Err(SsfsBackendError::Io(Box::new(e))),
         }
     }
+
+    async fn create_file(&self, path: &str, content: &[u8]) -> Result<(), SsfsBackendError> {
+        let request = CommitRequest::Create {
+            path: path.to_owned(),
+            content: content.to_vec(),
+        };
+        self.commit_tx
+            .send(request)
+            .map_err(|_| SsfsBackendError::Io("channel closed".into()))
+    }
+
+    async fn update_file(&self, path: &str, content: &[u8]) -> Result<(), SsfsBackendError> {
+        let request = CommitRequest::Update {
+            path: path.to_owned(),
+            content: content.to_vec(),
+        };
+        self.commit_tx
+            .send(request)
+            .map_err(|_| SsfsBackendError::Io("channel closed".into()))
+    }
+
+    async fn delete_file(&self, path: &str) -> Result<(), SsfsBackendError> {
+        let request = CommitRequest::Delete {
+            path: path.to_owned(),
+        };
+        self.commit_tx
+            .send(request)
+            .map_err(|_| SsfsBackendError::Io("channel closed".into()))
+    }
 }
 
 pub struct MesaFS {
@@ -151,6 +207,9 @@ pub struct MesaFS {
     /// serializes to disk and how it loads from disk. We are responsible for giving it the true
     /// state of reality.
     ssfs: SsFs<MesaBackend>,
+
+    /// Whether the filesystem is mounted in writable mode.
+    writable: bool,
 }
 
 /// Mesa's FUSE filesystem implementation.
@@ -160,19 +219,121 @@ impl MesaFS {
     const KERNEL_TTL: Duration = Duration::from_mins(1);
 
     #[expect(clippy::expect_used)] // Runtime creation is infallible in practice; no recovery path.
-    pub fn new(api_key: &str, gh_repo: GhRepoInfo, git_ref: Option<&str>) -> Self {
+    pub fn new(
+        api_key: &str,
+        gh_repo: GhRepoInfo,
+        git_ref: Option<&str>,
+        author: Option<crate::Author>,
+    ) -> Self {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
+        // Create channel for commit requests
+        let (commit_tx, mut commit_rx) = mpsc::unbounded_channel();
+
+        // Extract data from inputs
+        let mesa = Mesa::builder(api_key).build();
+        let org = gh_repo.org;
+        let repo = gh_repo.repo;
+        let branch = git_ref.map_or_else(|| "main".to_owned(), ToOwned::to_owned);
+        let writable = author.is_some();
+        let mesa_author = author.map(|a| MesaAuthor {
+            name: a.name,
+            email: a.email,
+            date: None,
+        });
+
+        // Clone data needed for the background task
+        let task_mesa = mesa.clone();
+        let task_org = org.clone();
+        let task_repo = repo.clone();
+
+        // Spawn background task for creating commits
+        rt.spawn(async move {
+            while let Some(request) = commit_rx.recv().await {
+                let (message, files) = match request {
+                    CommitRequest::Create { path, content } => {
+                        // Use "." for empty files to work around Mesa API bug with empty content
+                        let content_bytes = if content.is_empty() {
+                            b".".as_slice()
+                        } else {
+                            &content
+                        };
+                        (
+                            format!("Create {path}"),
+                            vec![CommitFile {
+                                action: CommitFileAction::Upsert,
+                                path,
+                                encoding: CommitEncoding::Base64,
+                                content: Some(BASE64.encode(content_bytes)),
+                            }],
+                        )
+                    }
+                    CommitRequest::Update { path, content } => {
+                        // Use "." for empty files to work around Mesa API bug with empty content
+                        let content_bytes = if content.is_empty() {
+                            b".".as_slice()
+                        } else {
+                            &content
+                        };
+                        (
+                            format!("Update {path}"),
+                            vec![CommitFile {
+                                action: CommitFileAction::Upsert,
+                                path,
+                                encoding: CommitEncoding::Base64,
+                                content: Some(BASE64.encode(content_bytes)),
+                            }],
+                        )
+                    }
+                    CommitRequest::Delete { path } => (
+                        format!("Delete {path}"),
+                        vec![CommitFile {
+                            action: CommitFileAction::Delete,
+                            path,
+                            encoding: CommitEncoding::Base64,
+                            content: None,
+                        }],
+                    ),
+                };
+
+                let Some(ref author) = mesa_author else {
+                    error!("no author configured for commit");
+                    continue;
+                };
+
+                let create_commit_request = CreateCommitRequest {
+                    branch: branch.clone(),
+                    message: message.clone(),
+                    author: author.clone(),
+                    files,
+                    base_sha: None,
+                };
+
+                info!("about to commit the following: {:?}", create_commit_request);
+
+                let result = task_mesa
+                    .commits(&task_org, &task_repo)
+                    .create(&create_commit_request)
+                    .await;
+
+                match result {
+                    Ok(_) => info!(message = %message, "commit pushed"),
+                    Err(e) => error!(message = %message, error = %e, "commit failed"),
+                }
+            }
+        });
+
         let backend = Arc::new(MesaBackend {
-            mesa: Mesa::builder(api_key).build(),
-            org: gh_repo.org,
-            repo: gh_repo.repo,
+            mesa,
+            org,
+            repo,
             git_ref: git_ref.map(ToOwned::to_owned),
+            commit_tx: Arc::new(commit_tx),
         });
 
         let ssfs = SsFs::new(backend, rt.handle().clone());
 
-        Self { rt, ssfs }
+        Self { rt, ssfs, writable }
     }
 }
 
@@ -187,12 +348,12 @@ impl Filesystem for MesaFS {
         match self.ssfs.lookup(parent as u32, name) {
             Ok(entry) => match entry {
                 SsfsOk::Resolved(inode_handle) => {
-                    let attr = inode_to_file_attr(inode_handle);
+                    let attr = inode_to_file_attr(inode_handle, self.writable);
                     reply.entry(&Self::KERNEL_TTL, &attr, 0);
                 }
                 SsfsOk::Future(fut) => match self.rt.block_on(fut) {
                     Ok(inode_handle) => {
-                        let attr = inode_to_file_attr(inode_handle);
+                        let attr = inode_to_file_attr(inode_handle, self.writable);
                         reply.entry(&Self::KERNEL_TTL, &attr, 0);
                     }
                     Err(err) => reply.error(ssfs_err_to_errno(&err)),
@@ -207,12 +368,12 @@ impl Filesystem for MesaFS {
         match self.ssfs.get_inode(ino as u32) {
             Ok(entry) => match entry {
                 SsfsOk::Resolved(inode_handle) => {
-                    let attr = inode_to_file_attr(inode_handle);
+                    let attr = inode_to_file_attr(inode_handle, self.writable);
                     reply.attr(&Self::KERNEL_TTL, &attr);
                 }
                 SsfsOk::Future(fut) => match self.rt.block_on(fut) {
                     Ok(inode_handle) => {
-                        let attr = inode_to_file_attr(inode_handle);
+                        let attr = inode_to_file_attr(inode_handle, self.writable);
                         reply.attr(&Self::KERNEL_TTL, &attr);
                     }
                     Err(err) => reply.error(ssfs_err_to_errno(&err)),
@@ -348,6 +509,270 @@ impl Filesystem for MesaFS {
             i += 1;
         }
 
+        reply.ok();
+    }
+
+    #[instrument(skip(self, _req, name, _mode, _umask, _flags, reply))]
+    fn create(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        let parent_ino = parent as u32;
+
+        // Build the full path
+        let Some(parent_path) = self.ssfs.get_path(parent_ino) else {
+            reply.error(libc::ENOENT);
+            return;
+        };
+
+        let name_str = name.to_string_lossy();
+        let full_path = if parent_path.is_empty() {
+            name_str.to_string()
+        } else {
+            format!("{parent_path}/{name_str}")
+        };
+
+        // Create the file via backend (empty content)
+        info!(path = %full_path, "creating file");
+        let backend = self.ssfs.backend();
+        let result = self.rt.block_on(backend.create_file(&full_path, &[]));
+
+        match result {
+            Ok(()) => {
+                info!(path = %full_path, "file created, queued for commit");
+                // Update cache
+                if let Some(handle) = self.ssfs.insert_file(parent_ino, name, 0) {
+                    let attr = inode_to_file_attr(handle, self.writable);
+                    reply.created(&Self::KERNEL_TTL, &attr, 0, 0, 0);
+                } else {
+                    reply.error(libc::EIO);
+                }
+            }
+            Err(ref e) => {
+                info!(path = %full_path, error = ?e, "file creation failed (queue error)");
+                reply.error(backend_err_to_errno(e));
+            }
+        }
+    }
+
+    #[instrument(skip(
+        self,
+        _req,
+        ino,
+        _fh,
+        offset,
+        data,
+        _write_flags,
+        _flags,
+        _lock_owner,
+        reply
+    ))]
+    fn write(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyWrite,
+    ) {
+        let ino = ino as u32;
+
+        // Get the file path
+        let Some(path) = self.ssfs.get_path(ino) else {
+            reply.error(libc::ENOENT);
+            return;
+        };
+
+        // Read current content
+        let current_content = match self.ssfs.read(ino) {
+            Ok(SsfsOk::Future(fut)) => match self.rt.block_on(fut) {
+                Ok(data) => data,
+                Err(ref e) => {
+                    reply.error(ssfs_err_to_errno(e));
+                    return;
+                }
+            },
+            Ok(SsfsOk::Resolved(data)) => data,
+            Err(ref e) => {
+                // If file doesn't exist yet (new file), start with empty content
+                if matches!(e, SsfsResolutionError::DoesNotExist) {
+                    Vec::new()
+                } else {
+                    reply.error(ssfs_err_to_errno(e));
+                    return;
+                }
+            }
+        };
+
+        // Apply the write at offset
+        let offset = offset as usize;
+        let mut new_content = current_content;
+
+        // Extend if needed
+        if offset + data.len() > new_content.len() {
+            new_content.resize(offset + data.len(), 0);
+        }
+
+        // Copy data at offset
+        new_content[offset..offset + data.len()].copy_from_slice(data);
+
+        // Update via backend
+        info!(
+            path = %path,
+            offset,
+            write_size = data.len(),
+            new_total_size = new_content.len(),
+            "writing to file"
+        );
+        let backend = self.ssfs.backend();
+        let result = self.rt.block_on(backend.update_file(&path, &new_content));
+
+        match result {
+            Ok(()) => {
+                info!(path = %path, size = new_content.len(), "file updated, queued for commit");
+                // Update cache with new size
+                self.ssfs.update_file_size(ino, new_content.len() as u64);
+                reply.written(data.len() as u32);
+            }
+            Err(ref e) => {
+                info!(path = %path, error = ?e, "file write failed (queue error)");
+                reply.error(backend_err_to_errno(e));
+            }
+        }
+    }
+
+    #[instrument(skip(self, _req, name, reply))]
+    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let parent_ino = parent as u32;
+
+        // Build the full path
+        let Some(parent_path) = self.ssfs.get_path(parent_ino) else {
+            reply.error(libc::ENOENT);
+            return;
+        };
+
+        let name_str = name.to_string_lossy();
+        let full_path = if parent_path.is_empty() {
+            name_str.to_string()
+        } else {
+            format!("{parent_path}/{name_str}")
+        };
+
+        // Delete via backend
+        info!(path = %full_path, "deleting file");
+        let backend = self.ssfs.backend();
+        let result = self.rt.block_on(backend.delete_file(&full_path));
+
+        match result {
+            Ok(()) => {
+                info!(path = %full_path, "file deleted, queued for commit");
+                // Update cache
+                self.ssfs.remove_file(parent_ino, name);
+                reply.ok();
+            }
+            Err(ref e) => {
+                info!(path = %full_path, error = ?e, "file deletion failed (queue error)");
+                reply.error(backend_err_to_errno(e));
+            }
+        }
+    }
+
+    #[instrument(skip(
+        self, _req, ino, _mode, _uid, _gid, size, _atime, _mtime, _ctime, _fh, _crtime, _chgtime,
+        _bkuptime, _flags, reply
+    ))]
+    fn setattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<fuser::TimeOrNow>,
+        _mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<std::time::SystemTime>,
+        _fh: Option<u64>,
+        _crtime: Option<std::time::SystemTime>,
+        _chgtime: Option<std::time::SystemTime>,
+        _bkuptime: Option<std::time::SystemTime>,
+        _flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        let ino = ino as u32;
+
+        // Handle truncate
+        if let Some(new_size) = size {
+            let Some(path) = self.ssfs.get_path(ino) else {
+                reply.error(libc::ENOENT);
+                return;
+            };
+
+            // Read current content
+            let current_content = match self.ssfs.read(ino) {
+                Ok(SsfsOk::Future(fut)) => self.rt.block_on(fut).unwrap_or_default(),
+                Ok(SsfsOk::Resolved(data)) => data,
+                Err(_) => Vec::new(),
+            };
+
+            let old_size = current_content.len();
+
+            // Truncate or extend
+            let mut new_content = current_content;
+            new_content.resize(new_size as usize, 0);
+
+            // Update via backend
+            info!(path = %path, old_size, new_size, "truncating file");
+            let backend = self.ssfs.backend();
+            let result = self.rt.block_on(backend.update_file(&path, &new_content));
+
+            if let Err(ref e) = result {
+                info!(path = %path, error = ?e, "file truncate failed (queue error)");
+                reply.error(backend_err_to_errno(e));
+                return;
+            }
+
+            info!(path = %path, new_size, "file truncated, queued for commit");
+            // Update cache
+            self.ssfs.update_file_size(ino, new_size);
+        }
+
+        // Return current attributes
+        match self.ssfs.get_inode(ino) {
+            Ok(SsfsOk::Resolved(handle)) => {
+                let attr = inode_to_file_attr(handle, self.writable);
+                reply.attr(&Self::KERNEL_TTL, &attr);
+            }
+            Ok(SsfsOk::Future(fut)) => match self.rt.block_on(fut) {
+                Ok(handle) => {
+                    let attr = inode_to_file_attr(handle, self.writable);
+                    reply.attr(&Self::KERNEL_TTL, &attr);
+                }
+                Err(ref e) => reply.error(ssfs_err_to_errno(e)),
+            },
+            Err(ref e) => reply.error(get_inode_err_to_errno(e)),
+        }
+    }
+
+    fn fsync(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        // No-op: commits are pushed asynchronously via the channel
         reply.ok();
     }
 }
