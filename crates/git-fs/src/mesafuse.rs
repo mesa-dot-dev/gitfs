@@ -5,6 +5,7 @@ use std::{
 };
 
 use crate::{
+    commit_worker::{CommitRequest, CommitWorkerConfig, spawn_commit_worker},
     domain::GhRepoInfo,
     ssfs::{
         GetINodeError, INodeHandle, INodeKind, SsFs, SsfsBackend, SsfsBackendError, SsfsDirEntry,
@@ -17,12 +18,9 @@ use fuser::{
     ReplyWrite, Request,
 };
 use mesa_dev::Mesa;
-use mesa_dev::models::{
-    Author as MesaAuthor, CommitEncoding, CommitFile, CommitFileAction, Content,
-    CreateCommitRequest, DirEntryType,
-};
+use mesa_dev::models::{Author as MesaAuthor, Content, DirEntryType};
 use tokio::sync::mpsc;
-use tracing::{error, info, instrument};
+use tracing::{info, instrument};
 
 /// Convert an inode handle to FUSE file attributes.
 fn inode_to_file_attr(handle: INodeHandle, writable: bool) -> fuser::FileAttr {
@@ -86,13 +84,6 @@ fn backend_err_to_errno(err: &SsfsBackendError) -> i32 {
         SsfsBackendError::ReadOnly => libc::EROFS,
         SsfsBackendError::Io(_) => libc::EIO,
     }
-}
-
-/// A request to create a commit, sent to the background task.
-enum CommitRequest {
-    Create { path: String, content: Vec<u8> },
-    Update { path: String, content: Vec<u8> },
-    Delete { path: String },
 }
 
 #[derive(Clone)]
@@ -228,7 +219,7 @@ impl MesaFS {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
         // Create channel for commit requests
-        let (commit_tx, mut commit_rx) = mpsc::unbounded_channel();
+        let (commit_tx, commit_rx) = mpsc::unbounded_channel();
 
         // Extract data from inputs
         let mesa = Mesa::builder(api_key).build();
@@ -236,92 +227,22 @@ impl MesaFS {
         let repo = gh_repo.repo;
         let branch = git_ref.map_or_else(|| "main".to_owned(), ToOwned::to_owned);
         let writable = author.is_some();
-        let mesa_author = author.map(|a| MesaAuthor {
-            name: a.name,
-            email: a.email,
-            date: None,
-        });
 
-        // Clone data needed for the background task
-        let task_mesa = mesa.clone();
-        let task_org = org.clone();
-        let task_repo = repo.clone();
-
-        // Spawn background task for creating commits
-        rt.spawn(async move {
-            while let Some(request) = commit_rx.recv().await {
-                let (message, files) = match request {
-                    CommitRequest::Create { path, content } => {
-                        // Use "." for empty files to work around Mesa API bug with empty content
-                        let content_bytes = if content.is_empty() {
-                            b".".as_slice()
-                        } else {
-                            &content
-                        };
-                        (
-                            format!("Create {path}"),
-                            vec![CommitFile {
-                                action: CommitFileAction::Upsert,
-                                path,
-                                encoding: CommitEncoding::Base64,
-                                content: Some(BASE64.encode(content_bytes)),
-                            }],
-                        )
-                    }
-                    CommitRequest::Update { path, content } => {
-                        // Use "." for empty files to work around Mesa API bug with empty content
-                        let content_bytes = if content.is_empty() {
-                            b".".as_slice()
-                        } else {
-                            &content
-                        };
-                        (
-                            format!("Update {path}"),
-                            vec![CommitFile {
-                                action: CommitFileAction::Upsert,
-                                path,
-                                encoding: CommitEncoding::Base64,
-                                content: Some(BASE64.encode(content_bytes)),
-                            }],
-                        )
-                    }
-                    CommitRequest::Delete { path } => (
-                        format!("Delete {path}"),
-                        vec![CommitFile {
-                            action: CommitFileAction::Delete,
-                            path,
-                            encoding: CommitEncoding::Base64,
-                            content: None,
-                        }],
-                    ),
-                };
-
-                let Some(ref author) = mesa_author else {
-                    error!("no author configured for commit");
-                    continue;
-                };
-
-                let create_commit_request = CreateCommitRequest {
-                    branch: branch.clone(),
-                    message: message.clone(),
-                    author: author.clone(),
-                    files,
-                    base_sha: None,
-                };
-
-                info!("about to commit the following: {:?}", create_commit_request);
-
-                let result = task_mesa
-                    .commits(&task_org, &task_repo)
-                    .create(&create_commit_request)
-                    .await;
-
-                match result {
-                    Ok(_) => info!(message = %message, "commit pushed"),
-                    Err(e) => error!(message = %message, error = %e, "commit failed"),
-                }
-            }
-        });
+        // Spawn background commit worker if we have an author
+        if let Some(author) = author {
+            let config = CommitWorkerConfig {
+                mesa: mesa.clone(),
+                org: org.clone(),
+                repo: repo.clone(),
+                branch,
+                author: MesaAuthor {
+                    name: author.name,
+                    email: author.email,
+                    date: None,
+                },
+            };
+            spawn_commit_worker(&rt, config, commit_rx);
+        }
 
         let backend = Arc::new(MesaBackend {
             mesa,

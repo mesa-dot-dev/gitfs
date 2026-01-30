@@ -7,6 +7,7 @@ use fuser::MountOption;
 use tracing::error;
 use tracing_subscriber::{EnvFilter, fmt};
 
+mod commit_worker;
 mod domain;
 mod mesafuse;
 mod ssfs;
