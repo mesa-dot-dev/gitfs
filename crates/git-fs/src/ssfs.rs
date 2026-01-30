@@ -144,8 +144,8 @@ pub struct SsfsDirEntry {
 #[derive(Debug)]
 pub enum SsfsBackendError {
     NotFound,
-    #[expect(dead_code)]
-    Io(Box<dyn std::error::Error + Send + Sync>),
+    ReadOnly,
+    Io(#[expect(dead_code)] Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// Trait for the backend that provides directory listings and file content.
@@ -159,6 +159,32 @@ pub trait SsfsBackend: Send + Sync + 'static {
         &self,
         path: &str,
     ) -> impl Future<Output = Result<Vec<u8>, SsfsBackendError>> + Send;
+
+    /// Create a new file with the given content.
+    fn create_file(
+        &self,
+        _path: &str,
+        _content: &[u8],
+    ) -> impl Future<Output = Result<(), SsfsBackendError>> + Send {
+        async { Err(SsfsBackendError::ReadOnly) }
+    }
+
+    /// Update an existing file with new content.
+    fn update_file(
+        &self,
+        _path: &str,
+        _content: &[u8],
+    ) -> impl Future<Output = Result<(), SsfsBackendError>> + Send {
+        async { Err(SsfsBackendError::ReadOnly) }
+    }
+
+    /// Delete a file.
+    fn delete_file(
+        &self,
+        _path: &str,
+    ) -> impl Future<Output = Result<(), SsfsBackendError>> + Send {
+        async { Err(SsfsBackendError::ReadOnly) }
+    }
 }
 
 /// TODO(markovejnovic): In the future, we'll have to figure out how ssfs will serialize to disk.
@@ -616,8 +642,89 @@ impl<B: SsfsBackend> SsFs<B> {
         Ok(SsfsOk::Future(Box::pin(async move {
             backend.read_file(&path).await.map_err(|e| match e {
                 SsfsBackendError::NotFound => SsfsResolutionError::DoesNotExist,
-                SsfsBackendError::Io(_) => SsfsResolutionError::IoError,
+                SsfsBackendError::ReadOnly | SsfsBackendError::Io(_) => {
+                    SsfsResolutionError::IoError
+                }
             })
         })))
+    }
+
+    /// Insert a new file inode into the cache.
+    /// Returns the new inode number and handle.
+    pub fn insert_file(&self, parent: INo, name: &PathView, size: u64) -> Option<INodeHandle> {
+        // Verify parent exists and is a directory
+        let parent_children = self.nodes.read_sync(&parent, |_, n| n.children.clone())?;
+
+        let DirChildren::Populated(map) = parent_children else {
+            return None;
+        };
+
+        // Allocate new inode
+        let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
+
+        let inode = INode {
+            ino,
+            parent,
+            name: name.to_owned(),
+            children: DirChildren::NotADirectory,
+            size,
+        };
+        let handle = inode.handle();
+
+        // Insert the new inode
+        if self.nodes.insert_sync(ino, inode).is_err() {
+            return None;
+        }
+
+        // Update parent's children map
+        let mut new_map = (*map).clone();
+        new_map.insert(name.to_owned(), ino);
+        self.nodes.update_sync(&parent, |_, n| {
+            n.children = DirChildren::Populated(Arc::new(new_map));
+        });
+
+        Some(handle)
+    }
+
+    /// Update a file's size in the cache.
+    pub fn update_file_size(&self, ino: INo, new_size: u64) {
+        self.nodes.update_sync(&ino, |_, n| {
+            n.size = new_size;
+        });
+    }
+
+    /// Remove a file inode from the cache.
+    pub fn remove_file(&self, parent: INo, name: &PathView) -> Option<INo> {
+        // Get parent's children
+        let parent_children = self.nodes.read_sync(&parent, |_, n| n.children.clone())?;
+
+        let DirChildren::Populated(map) = parent_children else {
+            return None;
+        };
+
+        // Find the child inode
+        let child_ino = *map.get(name)?;
+
+        // Remove from parent's children map
+        let mut new_map = (*map).clone();
+        new_map.remove(name);
+        self.nodes.update_sync(&parent, |_, n| {
+            n.children = DirChildren::Populated(Arc::new(new_map));
+        });
+
+        // Remove the inode itself
+        self.nodes.remove_sync(&child_ino);
+
+        Some(child_ino)
+    }
+
+    /// Get the absolute path for an inode (public accessor for abspath).
+    pub fn get_path(&self, ino: INo) -> Option<String> {
+        self.abspath(ino)
+    }
+
+    /// Get a reference to the backend.
+    pub fn backend(&self) -> &Arc<B> {
+        &self.backend
     }
 }

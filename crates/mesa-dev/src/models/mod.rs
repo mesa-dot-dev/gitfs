@@ -12,8 +12,8 @@ mod repo;
 pub use admin::{ApiKey, ApiKeyCreated, ApiKeyScope, CreateApiKeyRequest, ListApiKeysResponse};
 pub use branch::{Branch, CreateBranchRequest, ListBranchesResponse};
 pub use commit::{
-    Author, Commit, CommitFile, CommitFileAction, CommitSummary, CreateCommitRequest,
-    ListCommitsResponse,
+    Author, Commit, CommitEncoding, CommitFile, CommitFileAction, CommitSummary,
+    CreateCommitRequest, ListCommitsResponse,
 };
 pub use common::SuccessResponse;
 pub use content::{Content, DirEntry, DirEntryType};

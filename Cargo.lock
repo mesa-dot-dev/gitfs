@@ -366,6 +366,7 @@ dependencies = [
  "fuser",
  "libc",
  "mesa-dev",
+ "nix",
  "rand",
  "rustc-hash",
  "scc",
