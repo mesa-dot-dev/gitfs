@@ -79,84 +79,62 @@ pub struct MesaBackend {
 }
 
 impl SsfsBackend for MesaBackend {
-    fn readdir(
-        &self,
-        path: &str,
-    ) -> impl Future<Output = Result<Vec<SsfsDirEntry>, SsfsBackendError>> + Send {
-        let path_arg: Option<String> = if path.is_empty() {
-            None
-        } else {
-            Some(path.to_owned())
-        };
-        let org = self.org.clone();
-        let repo = self.repo.clone();
-        let git_ref = self.git_ref.clone();
-        let mesa = self.mesa.clone();
+    async fn readdir(&self, path: &str) -> Result<Vec<SsfsDirEntry>, SsfsBackendError> {
+        let path_arg = if path.is_empty() { None } else { Some(path) };
 
-        async move {
-            let result = mesa
-                .content(&org, &repo)
-                .get(path_arg.as_deref(), git_ref.as_deref())
-                .await;
+        let result = self
+            .mesa
+            .content(&self.org, &self.repo)
+            .get(path_arg, self.git_ref.as_deref())
+            .await;
 
-            match result {
-                Ok(Content::Dir { entries, .. }) => {
-                    let dir_entries = entries
-                        .into_iter()
-                        .map(|e| SsfsDirEntry {
-                            name: OsString::from(e.name),
-                            kind: match e.entry_type {
-                                DirEntryType::Dir => INodeKind::Directory,
-                                DirEntryType::File => INodeKind::File,
-                            },
-                            size: e.size.unwrap_or(0),
-                        })
-                        .collect();
-                    Ok(dir_entries)
-                }
-                Ok(Content::File { .. }) => Err(SsfsBackendError::NotFound),
-                Err(e) => Err(SsfsBackendError::Io(Box::new(e))),
+        match result {
+            Ok(Content::Dir { entries, .. }) => {
+                let dir_entries = entries
+                    .into_iter()
+                    .map(|e| SsfsDirEntry {
+                        name: OsString::from(e.name),
+                        kind: match e.entry_type {
+                            DirEntryType::Dir => INodeKind::Directory,
+                            DirEntryType::File => INodeKind::File,
+                        },
+                        size: e.size.unwrap_or(0),
+                    })
+                    .collect();
+                Ok(dir_entries)
             }
+            Ok(Content::File { .. }) => Err(SsfsBackendError::NotFound),
+            Err(e) => Err(SsfsBackendError::Io(Box::new(e))),
         }
     }
 
-    fn read_file(
-        &self,
-        path: &str,
-    ) -> impl Future<Output = Result<Vec<u8>, SsfsBackendError>> + Send {
-        let org = self.org.clone();
-        let repo = self.repo.clone();
-        let git_ref = self.git_ref.clone();
-        let mesa = self.mesa.clone();
-        let path = path.to_owned();
+    async fn read_file(&self, path: &str) -> Result<Vec<u8>, SsfsBackendError> {
+        let result = self
+            .mesa
+            .content(&self.org, &self.repo)
+            .get(Some(path), self.git_ref.as_deref())
+            .await;
 
-        async move {
-            let result = mesa
-                .content(&org, &repo)
-                .get(Some(&path), git_ref.as_deref())
-                .await;
-
-            match result {
-                Ok(Content::File {
-                    content, encoding, ..
-                }) => {
-                    if encoding != "base64" {
-                        return Err(SsfsBackendError::Io(
-                            format!("unsupported encoding: {encoding}").into(),
-                        ));
-                    }
-                    // Mesa/GitHub line-wraps base64 at 76 chars; strip whitespace before decoding.
-                    let cleaned: String = content
-                        .chars()
-                        .filter(|c| !c.is_ascii_whitespace())
-                        .collect();
-                    BASE64
-                        .decode(&cleaned)
-                        .map_err(|e| SsfsBackendError::Io(Box::new(e)))
+        match result {
+            Ok(Content::File {
+                content, encoding, ..
+            }) => {
+                if encoding != "base64" {
+                    return Err(SsfsBackendError::Io(
+                        format!("unsupported encoding: {encoding}").into(),
+                    ));
                 }
-                Ok(Content::Dir { .. }) => Err(SsfsBackendError::NotFound),
-                Err(e) => Err(SsfsBackendError::Io(Box::new(e))),
+                // Mesa/GitHub line-wraps base64 at 76 chars; strip whitespace before decoding.
+                let cleaned: String = content
+                    .chars()
+                    .filter(|c| !c.is_ascii_whitespace())
+                    .collect();
+                BASE64
+                    .decode(&cleaned)
+                    .map_err(|e| SsfsBackendError::Io(Box::new(e)))
             }
+            Ok(Content::Dir { .. }) => Err(SsfsBackendError::NotFound),
+            Err(e) => Err(SsfsBackendError::Io(Box::new(e))),
         }
     }
 }
