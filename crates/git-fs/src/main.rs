@@ -1,9 +1,10 @@
 //! Mount a GitHub repository as a filesystem, without ever cloning.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use clap::Parser;
 use fuser::MountOption;
-use tracing::error;
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
 mod domain;
@@ -48,7 +49,85 @@ fn main() {
     ];
 
     let mesa_fs = MesaFS::new(&args.mesa_api_key, args.repo, args.r#ref.as_deref());
-    if let Err(e) = fuser::mount2(mesa_fs, &args.mount_point, &options) {
-        error!("Failed to mount filesystem: {e}");
+
+    // Use spawn_mount2 to get a BackgroundSession that can be properly cleaned up.
+    // When the session is dropped, the filesystem is unmounted.
+    let session = match fuser::spawn_mount2(mesa_fs, &args.mount_point, &options) {
+        Ok(session) => session,
+        Err(e) => {
+            error!("Failed to mount filesystem: {e}");
+            return;
+        }
+    };
+
+    info!(
+        "Mounted at {:?}. Press Ctrl+C to unmount.",
+        args.mount_point
+    );
+
+    // Wait for CTRL+C signal.
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Err(e) = ctrlc::set_handler(move || {
+        let _ = tx.send(());
+    }) {
+        error!("Failed to set Ctrl+C handler: {e}");
+        // Fall back to just joining the session thread
+        session.join();
+        return;
+    }
+
+    // Block until we receive the signal.
+    let _ = rx.recv();
+    info!("Received Ctrl+C, unmounting...");
+
+    // Force unmount the filesystem. This handles the case where something
+    // is still accessing the mount. The kernel will send DESTROY to our
+    // FUSE handler, causing the background thread to exit.
+    if force_unmount(&args.mount_point) {
+        // Force unmount succeeded. Forget the session to prevent fuser's
+        // destructor from trying to unmount again (which would fail with
+        // "Invalid argument" since it's already unmounted).
+        // The background thread has already exited due to DESTROY.
+        #[expect(clippy::mem_forget)]
+        std::mem::forget(session);
+    } else {
+        // Force unmount failed, let fuser try its normal cleanup.
+        session.join();
+    }
+
+    info!("Unmounted successfully.");
+}
+
+/// Force unmount a FUSE filesystem. Uses platform-specific commands.
+/// Returns true if unmount succeeded, false otherwise.
+fn force_unmount(mount_point: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    let result = Command::new("umount").arg("-f").arg(mount_point).status();
+
+    #[cfg(target_os = "linux")]
+    let result = Command::new("fusermount")
+        .arg("-uz") // lazy unmount
+        .arg(mount_point)
+        .status();
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let result: Result<std::process::ExitStatus, std::io::Error> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "unsupported platform",
+    ));
+
+    match result {
+        Ok(status) if status.success() => {
+            info!("Force unmount succeeded");
+            true
+        }
+        Ok(status) => {
+            warn!("Force unmount exited with status: {status}");
+            false
+        }
+        Err(e) => {
+            warn!("Force unmount failed: {e}");
+            false
+        }
     }
 }
