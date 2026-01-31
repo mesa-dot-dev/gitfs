@@ -6,23 +6,25 @@
 //! TODO(markovejnovic): A large part of these Arcs should be avoided, but the implementation is
 //! very rushed. We could squeeze out a lot more performance out of this cache.
 //!
-//! TODO(markovejnovic): This cache grows unbounded. There's no eviction policy, so it will grow to
-//! absurdly large sizes, especially for large repositories. We need to implement some kind of LRU
-//! or TTL-based eviction policy.
+//! File content caching: Files larger than `FileCacheConfig::min_file_size` are cached in memory.
+//! When the cache exceeds `FileCacheConfig::max_cache_size`, older entries are evicted using LRU.
+//! The default configuration caches files >= 4KB, with a 256MB max cache size.
 
 use std::{
     ffi::{OsStr, OsString},
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
 };
+
+use std::future::Future;
 
 use fuser::FUSE_ROOT_ID;
 use rustc_hash::FxHashMap;
 use tokio::sync::Notify;
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 
 /// Each filesystem `INode` is identified by a unique inode number (`INo`).
 pub type INo = u32;
@@ -98,6 +100,52 @@ pub struct INodeHandle {
     pub parent: INo,
     pub kind: INodeKind,
     pub size: u64,
+}
+
+/// Configuration for the file content cache.
+#[derive(Debug, Clone, Copy)]
+pub struct FileCacheConfig {
+    /// Minimum file size in bytes to cache. Files smaller than this are not cached.
+    pub min_file_size: u64,
+    /// Maximum total size in bytes for the cache. When exceeded, old entries are evicted.
+    pub max_cache_size: u64,
+}
+
+impl Default for FileCacheConfig {
+    fn default() -> Self {
+        Self {
+            // Only cache files >= 4KB (small files aren't worth caching overhead)
+            min_file_size: 4 * 1024,
+            // Default max cache size: 256MB
+            max_cache_size: 256 * 1024 * 1024,
+        }
+    }
+}
+
+/// A cached file entry with access tracking for LRU eviction.
+#[derive(Debug)]
+struct CachedFile {
+    /// The file contents.
+    data: Arc<Vec<u8>>,
+    /// Monotonic counter value when this entry was last accessed.
+    last_access: AtomicU64,
+}
+
+impl CachedFile {
+    fn new(data: Vec<u8>, access_counter: u64) -> Self {
+        Self {
+            data: Arc::new(data),
+            last_access: AtomicU64::new(access_counter),
+        }
+    }
+
+    fn touch(&self, access_counter: u64) {
+        self.last_access.store(access_counter, Ordering::Relaxed);
+    }
+
+    fn last_access(&self) -> u64 {
+        self.last_access.load(Ordering::Relaxed)
+    }
 }
 
 /// The result of resolving an inode number in the filesystem.
@@ -183,6 +231,22 @@ pub struct SsFs<B: SsfsBackend> {
 
     /// Handle to the tokio runtime for spawning async tasks.
     rt_handle: tokio::runtime::Handle,
+
+    // --- File content cache ---
+    /// Cache for file contents, keyed by inode number.
+    file_cache: Arc<scc::HashMap<INo, CachedFile>>,
+
+    /// Current total size of cached file contents in bytes.
+    file_cache_size: Arc<AtomicU64>,
+
+    /// Monotonically increasing counter for LRU access tracking.
+    file_cache_access_counter: Arc<AtomicU64>,
+
+    /// Configuration for the file cache.
+    file_cache_config: FileCacheConfig,
+
+    /// Pending file fetches for deduplication.
+    pending_file_fetches: Arc<scc::HashMap<INo, Arc<Notify>>>,
 }
 
 impl<B: SsfsBackend> SsFs<B> {
@@ -191,6 +255,15 @@ impl<B: SsfsBackend> SsFs<B> {
 
     /// Creates a new filesystem with the given backend and runtime handle.
     pub fn new(backend: Arc<B>, rt_handle: tokio::runtime::Handle) -> Self {
+        Self::with_config(backend, rt_handle, FileCacheConfig::default())
+    }
+
+    /// Creates a new filesystem with the given backend, runtime handle, and cache config.
+    pub fn with_config(
+        backend: Arc<B>,
+        rt_handle: tokio::runtime::Handle,
+        file_cache_config: FileCacheConfig,
+    ) -> Self {
         let nodes = Arc::new(scc::HashMap::new());
         let root = INode {
             ino: Self::ROOT_INO,
@@ -207,6 +280,11 @@ impl<B: SsfsBackend> SsFs<B> {
             next_ino: Arc::new(AtomicU32::new(Self::ROOT_INO + 1)),
             backend,
             rt_handle,
+            file_cache: Arc::new(scc::HashMap::new()),
+            file_cache_size: Arc::new(AtomicU64::new(0)),
+            file_cache_access_counter: Arc::new(AtomicU64::new(0)),
+            file_cache_config,
+            pending_file_fetches: Arc::new(scc::HashMap::new()),
         };
 
         // Eagerly prefetch the root directory so it's likely cached before the first FUSE call.
@@ -598,7 +676,8 @@ impl<B: SsfsBackend> SsFs<B> {
     /// Read the contents of a file by its inode number.
     ///
     /// Verifies the inode exists and is a file, resolves the path, and delegates to the backend.
-    /// No caching -- always fetches from the backend.
+    /// Files larger than `file_cache_config.min_file_size` are cached. When the cache exceeds
+    /// `file_cache_config.max_cache_size`, old entries are evicted using LRU.
     pub fn read(&self, ino: INo) -> SsfsResult<Vec<u8>> {
         let Some(handle) = self.nodes.read_sync(&ino, |_, inode| inode.handle()) else {
             return Err(SsfsResolutionError::DoesNotExist);
@@ -608,16 +687,466 @@ impl<B: SsfsBackend> SsFs<B> {
             return Err(SsfsResolutionError::EntryIsNotFile);
         }
 
+        // Check if the file is already in the cache.
+        let access_counter = self
+            .file_cache_access_counter
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(cached) = self.file_cache.read_sync(&ino, |_, entry| {
+            entry.touch(access_counter);
+            Arc::clone(&entry.data)
+        }) {
+            debug!(ino, size = cached.len(), "read: cache hit");
+            return Ok(SsfsOk::Resolved((*cached).clone()));
+        }
+
+        // Check for a pending fetch - deduplicate concurrent requests.
+        if let Some(notify) = self
+            .pending_file_fetches
+            .read_sync(&ino, |_, v| Arc::clone(v))
+        {
+            debug!(ino, "read: joining existing in-flight fetch");
+            return Ok(SsfsOk::Future(Box::pin(Self::wait_for_cached_file(
+                notify,
+                ino,
+                Arc::clone(&self.file_cache),
+                Arc::clone(&self.file_cache_access_counter),
+            ))));
+        }
+
+        // Try to claim the fetch.
+        let notify = Arc::new(Notify::new());
+        if self
+            .pending_file_fetches
+            .insert_sync(ino, Arc::clone(&notify))
+            .is_err()
+        {
+            // Someone else raced us - join their fetch or check cache again.
+            if let Some(existing) = self
+                .pending_file_fetches
+                .read_sync(&ino, |_, v| Arc::clone(v))
+            {
+                return Ok(SsfsOk::Future(Box::pin(Self::wait_for_cached_file(
+                    existing,
+                    ino,
+                    Arc::clone(&self.file_cache),
+                    Arc::clone(&self.file_cache_access_counter),
+                ))));
+            }
+            // The fetch completed between our failed insert and read - check cache again.
+            if let Some(cached) = self.file_cache.read_sync(&ino, |_, entry| {
+                entry.touch(access_counter);
+                Arc::clone(&entry.data)
+            }) {
+                return Ok(SsfsOk::Resolved((*cached).clone()));
+            }
+        }
+
         let Some(path) = self.abspath(ino) else {
+            drop(self.pending_file_fetches.remove_sync(&ino));
             return Err(SsfsResolutionError::DoesNotExist);
         };
 
-        let backend = Arc::clone(&self.backend);
-        Ok(SsfsOk::Future(Box::pin(async move {
-            backend.read_file(&path).await.map_err(|e| match e {
-                SsfsBackendError::NotFound => SsfsResolutionError::DoesNotExist,
-                SsfsBackendError::Io(_) => SsfsResolutionError::IoError,
+        debug!(ino, path = %path, "read: cache miss, fetching from backend");
+
+        Ok(SsfsOk::Future(Box::pin(Self::fetch_and_cache_file(
+            ino,
+            path,
+            notify,
+            Arc::clone(&self.backend),
+            Arc::clone(&self.file_cache),
+            Arc::clone(&self.file_cache_size),
+            Arc::clone(&self.file_cache_access_counter),
+            Arc::clone(&self.pending_file_fetches),
+            self.file_cache_config,
+        ))))
+    }
+
+    /// Wait for a pending file fetch to complete and return the cached data.
+    async fn wait_for_cached_file(
+        notify: Arc<Notify>,
+        ino: INo,
+        file_cache: Arc<scc::HashMap<INo, CachedFile>>,
+        file_cache_access_counter: Arc<AtomicU64>,
+    ) -> SsfsResolvedResult<Vec<u8>> {
+        notify.notified().await;
+        let access = file_cache_access_counter.fetch_add(1, Ordering::Relaxed);
+        if let Some(cached) = file_cache
+            .read_async(&ino, |_, entry: &CachedFile| {
+                entry.touch(access);
+                Arc::clone(&entry.data)
             })
-        })))
+            .await
+        {
+            Ok((*cached).clone())
+        } else {
+            Err(SsfsResolutionError::IoError)
+        }
+    }
+
+    /// Fetch a file from the backend and optionally cache it.
+    #[expect(clippy::too_many_arguments)]
+    async fn fetch_and_cache_file(
+        ino: INo,
+        path: String,
+        notify: Arc<Notify>,
+        backend: Arc<B>,
+        file_cache: Arc<scc::HashMap<INo, CachedFile>>,
+        file_cache_size: Arc<AtomicU64>,
+        file_cache_access_counter: Arc<AtomicU64>,
+        pending_file_fetches: Arc<scc::HashMap<INo, Arc<Notify>>>,
+        config: FileCacheConfig,
+    ) -> SsfsResolvedResult<Vec<u8>> {
+        let result = backend.read_file(&path).await;
+
+        match result {
+            Ok(data) => {
+                Self::maybe_cache_file(
+                    ino,
+                    &data,
+                    &file_cache,
+                    &file_cache_size,
+                    &file_cache_access_counter,
+                    config,
+                )
+                .await;
+
+                // Notify waiters and clean up pending.
+                drop(pending_file_fetches.remove_async(&ino).await);
+                notify.notify_waiters();
+
+                Ok(data)
+            }
+            Err(e) => {
+                // Clean up pending and notify waiters of failure.
+                drop(pending_file_fetches.remove_async(&ino).await);
+                notify.notify_waiters();
+
+                Err(match e {
+                    SsfsBackendError::NotFound => SsfsResolutionError::DoesNotExist,
+                    SsfsBackendError::Io(_) => SsfsResolutionError::IoError,
+                })
+            }
+        }
+    }
+
+    /// Cache a file if it meets the size threshold.
+    async fn maybe_cache_file(
+        ino: INo,
+        data: &[u8],
+        file_cache: &scc::HashMap<INo, CachedFile>,
+        file_cache_size: &AtomicU64,
+        file_cache_access_counter: &AtomicU64,
+        config: FileCacheConfig,
+    ) {
+        let data_len = data.len() as u64;
+
+        if data_len < config.min_file_size {
+            trace!(
+                ino,
+                size = data_len,
+                min = config.min_file_size,
+                "read: file too small to cache"
+            );
+            return;
+        }
+
+        let access = file_cache_access_counter.fetch_add(1, Ordering::Relaxed);
+
+        // Check if we need to evict before inserting.
+        let current_size = file_cache_size.load(Ordering::Relaxed);
+        if current_size + data_len > config.max_cache_size {
+            Self::evict_lru_entries(file_cache, file_cache_size, config.max_cache_size, data_len)
+                .await;
+        }
+
+        // Insert into cache.
+        let cached = CachedFile::new(data.to_vec(), access);
+        if file_cache.insert_async(ino, cached).await.is_ok() {
+            file_cache_size.fetch_add(data_len, Ordering::Relaxed);
+            debug!(ino, size = data_len, "read: cached file");
+        }
+    }
+
+    /// Evict LRU entries from the file cache until there's room for `needed_space` bytes.
+    async fn evict_lru_entries(
+        file_cache: &scc::HashMap<INo, CachedFile>,
+        file_cache_size: &AtomicU64,
+        max_cache_size: u64,
+        needed_space: u64,
+    ) {
+        let target_size = max_cache_size.saturating_sub(needed_space);
+        let mut current_size = file_cache_size.load(Ordering::Relaxed);
+
+        // Collect all entries with their access times for LRU sorting.
+        let mut entries: Vec<(INo, u64, u64)> = Vec::new();
+        file_cache
+            .iter_async(|ino, entry: &CachedFile| {
+                entries.push((*ino, entry.last_access(), entry.data.len() as u64));
+                true // continue iterating
+            })
+            .await;
+
+        // Sort by last_access (oldest first = lowest counter value).
+        entries.sort_by_key(|(_, last_access, _)| *last_access);
+
+        // Evict until we're under target.
+        for (ino, _, size) in entries {
+            if current_size <= target_size {
+                break;
+            }
+
+            if file_cache.remove_async(&ino).await.is_some() {
+                current_size = file_cache_size.fetch_sub(size, Ordering::Relaxed) - size;
+                debug!(ino, size, "evicted file from cache");
+            }
+        }
+    }
+
+    /// Returns current file cache statistics (total bytes cached, entry count).
+    #[cfg_attr(not(test), expect(dead_code))] // Used in tests; available for debugging
+    pub fn file_cache_stats(&self) -> (u64, usize) {
+        let size = self.file_cache_size.load(Ordering::Relaxed);
+        let count = self.file_cache.len();
+        (size, count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A mock backend for testing.
+    struct MockBackend {
+        files: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    }
+
+    impl MockBackend {
+        fn new() -> Self {
+            Self {
+                files: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+
+        fn add_file(&self, path: &str, content: Vec<u8>) {
+            self.files.lock().unwrap().insert(path.to_owned(), content);
+        }
+    }
+
+    impl SsfsBackend for MockBackend {
+        fn readdir(
+            &self,
+            path: &str,
+        ) -> impl Future<Output = Result<Vec<SsfsDirEntry>, SsfsBackendError>> + Send {
+            let files = self.files.lock().unwrap().clone();
+            async move {
+                // Return files as if they're all in the root directory
+                if path.is_empty() {
+                    let entries: Vec<SsfsDirEntry> = files
+                        .iter()
+                        .map(|(name, content)| SsfsDirEntry {
+                            name: OsString::from(name),
+                            kind: INodeKind::File,
+                            size: content.len() as u64,
+                        })
+                        .collect();
+                    Ok(entries)
+                } else {
+                    Ok(vec![])
+                }
+            }
+        }
+
+        fn read_file(
+            &self,
+            path: &str,
+        ) -> impl Future<Output = Result<Vec<u8>, SsfsBackendError>> + Send {
+            let files = self.files.lock().unwrap().clone();
+            let path = path.to_owned();
+            async move { files.get(&path).cloned().ok_or(SsfsBackendError::NotFound) }
+        }
+    }
+
+    #[test]
+    fn test_file_cache_config_default() {
+        let config = FileCacheConfig::default();
+        assert_eq!(config.min_file_size, 4 * 1024);
+        assert_eq!(config.max_cache_size, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_file_cache_small_file_not_cached() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let backend = Arc::new(MockBackend::new());
+
+        // Add a small file (under threshold)
+        let small_content = vec![0u8; 100]; // 100 bytes < 4KB threshold
+        backend.add_file("small.txt", small_content.clone());
+
+        let config = FileCacheConfig {
+            min_file_size: 4 * 1024,
+            max_cache_size: 256 * 1024 * 1024,
+        };
+        let ssfs = SsFs::with_config(backend, rt.handle().clone(), config);
+
+        // First, populate the directory
+        rt.block_on(async {
+            if let Ok(SsfsOk::Future(fut)) = ssfs.readdir(SsFs::<MockBackend>::ROOT_INO) {
+                drop(fut.await);
+            }
+        });
+
+        // Look up the file
+        let file_ino = rt.block_on(async {
+            match ssfs.lookup(SsFs::<MockBackend>::ROOT_INO, OsStr::new("small.txt")) {
+                Ok(SsfsOk::Resolved(handle)) => Some(handle.ino),
+                Ok(SsfsOk::Future(fut)) => fut.await.ok().map(|h| h.ino),
+                Err(_) => None,
+            }
+        });
+
+        let file_ino = file_ino.expect("File should exist");
+
+        // Read the file
+        rt.block_on(async {
+            match ssfs.read(file_ino) {
+                Ok(SsfsOk::Future(fut)) => {
+                    let data = fut.await.unwrap();
+                    assert_eq!(data, small_content);
+                }
+                _ => panic!("Expected future"),
+            }
+        });
+
+        // Check cache stats - small file should NOT be cached
+        let (cache_size, cache_count) = ssfs.file_cache_stats();
+        assert_eq!(cache_size, 0, "Small file should not be cached");
+        assert_eq!(cache_count, 0, "Cache should be empty");
+    }
+
+    #[test]
+    fn test_file_cache_large_file_cached() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let backend = Arc::new(MockBackend::new());
+
+        // Add a large file (over threshold)
+        let large_content = vec![42u8; 8 * 1024]; // 8KB > 4KB threshold
+        backend.add_file("large.txt", large_content.clone());
+
+        let config = FileCacheConfig {
+            min_file_size: 4 * 1024,
+            max_cache_size: 256 * 1024 * 1024,
+        };
+        let ssfs = SsFs::with_config(backend, rt.handle().clone(), config);
+
+        // First, populate the directory
+        rt.block_on(async {
+            if let Ok(SsfsOk::Future(fut)) = ssfs.readdir(SsFs::<MockBackend>::ROOT_INO) {
+                drop(fut.await);
+            }
+        });
+
+        // Look up the file
+        let file_ino = rt.block_on(async {
+            match ssfs.lookup(SsFs::<MockBackend>::ROOT_INO, OsStr::new("large.txt")) {
+                Ok(SsfsOk::Resolved(handle)) => Some(handle.ino),
+                Ok(SsfsOk::Future(fut)) => fut.await.ok().map(|h| h.ino),
+                Err(_) => None,
+            }
+        });
+
+        let file_ino = file_ino.expect("File should exist");
+
+        // Read the file
+        rt.block_on(async {
+            match ssfs.read(file_ino) {
+                Ok(SsfsOk::Future(fut)) => {
+                    let data = fut.await.unwrap();
+                    assert_eq!(data, large_content);
+                }
+                _ => panic!("Expected future"),
+            }
+        });
+
+        // Check cache stats - large file should be cached
+        let (cache_size, cache_count) = ssfs.file_cache_stats();
+        assert_eq!(cache_size, 8 * 1024, "Large file should be cached");
+        assert_eq!(cache_count, 1, "Cache should have one entry");
+    }
+
+    #[test]
+    fn test_file_cache_eviction() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let backend = Arc::new(MockBackend::new());
+
+        // Add multiple files
+        let file1_content = vec![1u8; 5 * 1024]; // 5KB
+        let file2_content = vec![2u8; 5 * 1024]; // 5KB
+        let file3_content = vec![3u8; 5 * 1024]; // 5KB
+        backend.add_file("file1.txt", file1_content.clone());
+        backend.add_file("file2.txt", file2_content.clone());
+        backend.add_file("file3.txt", file3_content.clone());
+
+        // Configure small cache limit (10KB) so that only 2 files fit
+        let config = FileCacheConfig {
+            min_file_size: 1024,       // 1KB threshold
+            max_cache_size: 10 * 1024, // 10KB max
+        };
+        let ssfs = SsFs::with_config(backend, rt.handle().clone(), config);
+
+        // Populate directory
+        rt.block_on(async {
+            if let Ok(SsfsOk::Future(fut)) = ssfs.readdir(SsFs::<MockBackend>::ROOT_INO) {
+                drop(fut.await);
+            }
+        });
+
+        // Look up all files
+        let lookup_file = |name: &str| {
+            rt.block_on(async {
+                match ssfs.lookup(SsFs::<MockBackend>::ROOT_INO, OsStr::new(name)) {
+                    Ok(SsfsOk::Resolved(handle)) => Some(handle.ino),
+                    Ok(SsfsOk::Future(fut)) => fut.await.ok().map(|h| h.ino),
+                    Err(_) => None,
+                }
+            })
+            .expect("File should exist")
+        };
+
+        let ino1 = lookup_file("file1.txt");
+        let ino2 = lookup_file("file2.txt");
+        let ino3 = lookup_file("file3.txt");
+
+        // Read files in order
+        let read_file = |ino: INo| {
+            rt.block_on(async {
+                match ssfs.read(ino) {
+                    Ok(SsfsOk::Future(fut)) => fut.await.unwrap(),
+                    Ok(SsfsOk::Resolved(data)) => data,
+                    Err(e) => panic!("Read error: {e:?}"),
+                }
+            })
+        };
+
+        // Read file1 first (oldest)
+        assert_eq!(read_file(ino1), file1_content);
+        let (size1, count1) = ssfs.file_cache_stats();
+        assert_eq!(size1, 5 * 1024);
+        assert_eq!(count1, 1);
+
+        // Read file2 (file1 is now oldest)
+        assert_eq!(read_file(ino2), file2_content);
+        let (size2, count2) = ssfs.file_cache_stats();
+        assert_eq!(size2, 10 * 1024);
+        assert_eq!(count2, 2);
+
+        // Read file3 - should trigger eviction of file1 (oldest)
+        assert_eq!(read_file(ino3), file3_content);
+        let (size3, count3) = ssfs.file_cache_stats();
+        // Cache should have evicted file1 to make room for file3
+        assert!(
+            size3 <= 10 * 1024,
+            "Cache should not exceed max size: {size3}"
+        );
+        assert!(count3 <= 2, "Cache should have at most 2 entries: {count3}");
     }
 }

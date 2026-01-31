@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "crates/mesa-dev",
     "crates/git-fs",
 ]
 resolver = "2"
