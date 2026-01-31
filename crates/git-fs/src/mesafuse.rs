@@ -7,8 +7,8 @@ use std::{
 use crate::{
     domain::GhRepoInfo,
     ssfs::{
-        GetINodeError, INodeHandle, INodeKind, SsFs, SsfsBackend, SsfsBackendError, SsfsDirEntry,
-        SsfsOk, SsfsResolutionError,
+        CachingBackend, GetINodeError, INodeHandle, INodeKind, SsFs, SsfsBackend, SsfsBackendError,
+        SsfsDirEntry, SsfsOk, SsfsResolutionError,
     },
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -172,7 +172,7 @@ pub struct MesaFS {
     /// This is the backing memory for the filesystem. `SsFs` is responsible for managing how it
     /// serializes to disk and how it loads from disk. We are responsible for giving it the true
     /// state of reality.
-    ssfs: SsFs<MesaBackend>,
+    ssfs: SsFs<CachingBackend<MesaBackend>>,
 }
 
 /// Mesa's FUSE filesystem implementation.
@@ -185,14 +185,17 @@ impl MesaFS {
     pub fn new(api_key: &str, gh_repo: GhRepoInfo, git_ref: Option<&str>) -> Self {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
-        let backend = Arc::new(MesaBackend {
+        let mesa_backend = Arc::new(MesaBackend {
             mesa: Mesa::builder(api_key).build(),
             org: gh_repo.org,
             repo: gh_repo.repo,
             git_ref: git_ref.map(ToOwned::to_owned),
         });
 
-        let ssfs = SsFs::new(backend, rt.handle().clone());
+        // Wrap the Mesa backend with caching.
+        let caching_backend = Arc::new(CachingBackend::new(mesa_backend));
+
+        let ssfs = SsFs::new(caching_backend, rt.handle().clone());
 
         Self { rt, ssfs }
     }
