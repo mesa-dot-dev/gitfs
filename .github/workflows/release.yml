@@ -152,7 +152,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rpm-${{ matrix.arch }}
-          path: target/generate-rpm/git-fs-*.rpm
+          path: target/${{ matrix.target }}/generate-rpm/git-fs-*.rpm
 
       - name: Upload tarball
         uses: actions/upload-artifact@v4
