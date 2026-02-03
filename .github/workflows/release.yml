@@ -210,10 +210,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="main-${{ needs.version.outputs.short_sha }}"
+          TAG="canary-${{ needs.version.outputs.short_sha }}"
           gh release create "${TAG}" \
-            --title "git-fs ${{ needs.version.outputs.version }}" \
-            --notes "Automated build from main at ${{ github.sha }}" \
+            --prerelease \
+            --title "git-fs ${{ needs.version.outputs.version }} (canary)" \
+            --notes "⚠️ **Canary release** — built automatically from \`main\` at ${{ github.sha }}. Not a stable release." \
             --target "${{ github.sha }}" \
             artifacts/deb-*/*.deb \
             artifacts/rpm-*/*.rpm \
