@@ -2,6 +2,10 @@
 name = "git-fs"
 version = "0.1.0"
 edition = "2024"
+description = "Mount Mesa repositories as local filesystems via FUSE"
+license = "LICENSE.txt"
+repository = "https://github.com/mesa-dot-dev/git-fs"
+authors = ["Marko Vejnovic <marko@mesa.dev>"]
 
 [lints]
 workspace = true
@@ -18,3 +22,22 @@ rand = "0.9.2"
 rustc-hash = "2.1.1"
 scc = "3.4.16"
 base64 = "0.22"
+
+[package.metadata.deb]
+maintainer = "Mesa <marko@mesa.dev>"
+section = "utility"
+priority = "optional"
+depends = "libfuse3-3"
+assets = [
+    ["target/release/git-fs", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/git-fs/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/git-fs", dest = "/usr/bin/git-fs", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/git-fs/README.md", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+fuse3 = "*"

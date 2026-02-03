@@ -38,8 +38,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+      - uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: libfuse3-dev
+          version: 1.0
 
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -53,8 +55,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+      - uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: libfuse3-dev
+          version: 1.0
 
       - name: Build
         run: cargo build --workspace --all-targets --all-features

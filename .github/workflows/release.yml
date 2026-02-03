@@ -1,0 +1,230 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release-${{ github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Compute version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      short_sha: ${{ steps.version.outputs.short_sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute version
+        id: version
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          BASE_VERSION=$(cargo metadata --no-deps --format-version=1 \
+            | jq -r '.packages[] | select(.name == "git-fs") | .version')
+          VERSION="${BASE_VERSION}+${SHORT_SHA}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+  linux-package:
+    name: Linux (${{ matrix.arch }})
+    needs: version
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+            rpm-arch: x86_64
+            linker: gcc
+            fuse-dev: libfuse3-dev
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            rpm-arch: aarch64
+            linker: gcc-aarch64-linux-gnu
+            fuse-dev: libfuse3-dev:arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Set up aarch64 cross-compilation
+        if: matrix.arch == 'arm64'
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list.d/*.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs) main restricted universe multiverse" \
+            | sudo tee /etc/apt/sources.list.d/arm64.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs)-updates main restricted universe multiverse" \
+            | sudo tee -a /etc/apt/sources.list.d/arm64.list
+
+      - name: Install system dependencies (cached, amd64)
+        if: matrix.arch == 'amd64'
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: libfuse3-dev gcc
+          version: 1.0
+
+      - name: Install system dependencies (arm64 cross)
+        if: matrix.arch == 'arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.fuse-dev }} ${{ matrix.linker }}
+
+      - name: Configure linker for cross-compilation
+        if: matrix.arch == 'arm64'
+        run: |
+          mkdir -p .cargo
+          printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' \
+            >> .cargo/config.toml
+
+      - name: Install packaging tools
+        run: cargo install cargo-deb cargo-generate-rpm
+
+      - name: Build release binary
+        run: cargo build --release -p git-fs --target ${{ matrix.target }}
+
+      - name: Build deb package
+        run: |
+          cargo deb -p git-fs --no-build --no-strip \
+            --target ${{ matrix.target }} \
+            --deb-version "${{ needs.version.outputs.version }}"
+
+      - name: Build rpm package
+        run: |
+          cargo generate-rpm -p crates/git-fs \
+            --target ${{ matrix.target }} \
+            --set-metadata="version=${{ needs.version.outputs.version }}" \
+            --set-metadata="arch=${{ matrix.rpm-arch }}"
+
+      - name: Create tarball
+        run: |
+          TARBALL="git-fs-linux-${{ matrix.arch }}.tar.gz"
+          tar -czf "${TARBALL}" \
+            -C target/${{ matrix.target }}/release git-fs
+          echo "Created ${TARBALL}"
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/debian/git-fs_*.deb
+
+      - name: Upload rpm
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-${{ matrix.arch }}
+          path: target/generate-rpm/git-fs-*.rpm
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: git-fs-linux-${{ matrix.arch }}.tar.gz
+
+  macos-build:
+    name: macOS (${{ matrix.arch }})
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            arch: x86_64
+            runner: macos-13
+          - target: aarch64-apple-darwin
+            arch: arm64
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install macFUSE
+        run: brew install macfuse
+
+      - name: Build release binary
+        run: cargo build --release -p git-fs --target ${{ matrix.target }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/git-fs
+
+  macos-universal:
+    name: macOS universal binary
+    needs: [version, macos-build]
+    runs-on: macos-14
+    steps:
+      - name: Download x86_64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-x86_64
+          path: x86_64
+
+      - name: Download arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-arm64
+          path: arm64
+
+      - name: Create universal binary
+        run: |
+          lipo -create x86_64/git-fs arm64/git-fs -output git-fs
+          file git-fs
+          lipo -info git-fs
+
+      - name: Create tarball
+        run: tar -czf git-fs-macos-universal.tar.gz git-fs
+
+      - name: Upload universal tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: git-fs-macos-universal.tar.gz
+
+  release:
+    name: Create GitHub Release
+    needs: [version, linux-package, macos-universal]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="canary-${{ needs.version.outputs.short_sha }}"
+          gh release create "${TAG}" \
+            --prerelease \
+            --title "git-fs ${{ needs.version.outputs.version }} (canary)" \
+            --notes "⚠️ **Canary release** — built automatically from \`main\` at ${{ github.sha }}. Not a stable release." \
+            --target "${{ github.sha }}" \
+            artifacts/deb-*/*.deb \
+            artifacts/rpm-*/*.rpm \
+            artifacts/linux-*/*.tar.gz \
+            artifacts/macos-universal/*.tar.gz
