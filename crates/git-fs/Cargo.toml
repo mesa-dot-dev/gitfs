@@ -24,7 +24,7 @@ scc = "3.4.16"
 base64 = "0.22"
 
 [package.metadata.deb]
-maintainer = "Mesa <eng@mesa.dev>"
+maintainer = "Mesa <marko@mesa.dev>"
 section = "utility"
 priority = "optional"
 depends = "libfuse3-3"
