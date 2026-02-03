@@ -198,7 +198,7 @@ jobs:
 
   macos-universal:
     name: macOS universal binary
-    needs: [version, macos-build]
+    needs: [macos-build]
     runs-on: macos-14
     steps:
       - name: Download x86_64 binary
@@ -230,7 +230,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [version, linux-package, macos-universal]
+    needs: [linux-package, macos-universal]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
