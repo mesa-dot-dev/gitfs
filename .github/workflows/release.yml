@@ -188,6 +188,8 @@ jobs:
         run: brew install macfuse
 
       - name: Build release binary
+        env:
+          PKG_CONFIG_ALLOW_CROSS: "1"
         run: cargo build --release -p git-fs --target ${{ matrix.target }}
 
       - name: Upload binary
