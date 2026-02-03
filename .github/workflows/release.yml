@@ -66,16 +66,31 @@ jobs:
         if: matrix.arch == 'arm64'
         run: |
           sudo dpkg --add-architecture arm64
-          # Pin existing sources to amd64 only (skip files that already have arch qualifiers)
+
+          # Pin existing .list sources to amd64 only (skip lines that already have arch qualifiers)
           for f in /etc/apt/sources.list.d/*.list; do
             [ -f "$f" ] || continue
             sudo sed -i '/^\s*deb \[/! s/^deb /deb [arch=amd64] /' "$f"
           done
+
+          # Pin existing .sources (DEB822 format) to amd64 only
+          for f in /etc/apt/sources.list.d/*.sources; do
+            [ -f "$f" ] || continue
+            if ! grep -q '^Architectures:' "$f"; then
+              sudo sed -i '/^Types:/a Architectures: amd64' "$f"
+            fi
+          done
+
+          # Also handle /etc/apt/sources.list if it exists
+          if [ -f /etc/apt/sources.list ]; then
+            sudo sed -i '/^\s*deb \[/! s/^deb /deb [arch=amd64] /' /etc/apt/sources.list
+          fi
+
           # Add arm64 sources from ports.ubuntu.com
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs) main restricted universe multiverse" \
-            | sudo tee /etc/apt/sources.list.d/arm64.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs)-updates main restricted universe multiverse" \
-            | sudo tee -a /etc/apt/sources.list.d/arm64.list
+          CODENAME=$(lsb_release -cs)
+          printf 'deb [arch=arm64] http://ports.ubuntu.com/ %s main restricted universe multiverse\n' \
+            "${CODENAME}" "${CODENAME}-updates" "${CODENAME}-security" "${CODENAME}-backports" \
+            | sudo tee /etc/apt/sources.list.d/arm64-cross.list > /dev/null
 
       - name: Install system dependencies (cached, amd64)
         if: matrix.arch == 'amd64'
