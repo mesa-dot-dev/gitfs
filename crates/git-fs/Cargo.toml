@@ -2,10 +2,10 @@
 name = "git-fs"
 version = "0.1.0"
 edition = "2024"
-description = "Mount GitHub repositories as local filesystems via FUSE — no cloning required"
-license = "MIT"
+description = "Mount Mesa repositories as local filesystems via FUSE"
+license = "LICENSE.txt"
 repository = "https://github.com/mesa-dot-dev/git-fs"
-authors = ["Mesa <eng@mesa.dev>"]
+authors = ["Marko Vejnovic <marko@mesa.dev>"]
 
 [lints]
 workspace = true

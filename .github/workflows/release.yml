@@ -16,17 +16,52 @@ env:
 
 jobs:
   package:
-    name: Build & Package
+    name: Build & Package (${{ matrix.target }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+            linker: gcc
+            fuse-dev: libfuse3-dev
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            linker: gcc-aarch64-linux-gnu
+            fuse-dev: libfuse3-dev:arm64
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Set up aarch64 cross-compilation
+        if: matrix.arch == 'arm64'
+        run: |
+          sudo dpkg --add-architecture arm64
+          # Add arm64 package sources
+          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list.d/*.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs) main restricted universe multiverse" \
+            | sudo tee /etc/apt/sources.list.d/arm64.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs)-updates main restricted universe multiverse" \
+            | sudo tee -a /etc/apt/sources.list.d/arm64.list
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.fuse-dev }} ${{ matrix.linker }}
+
+      - name: Configure linker for cross-compilation
+        if: matrix.arch == 'arm64'
+        run: |
+          mkdir -p .cargo
+          printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' \
+            >> .cargo/config.toml
 
       - name: Install packaging tools
         run: cargo install cargo-deb cargo-generate-rpm
@@ -43,15 +78,53 @@ jobs:
           echo "Building version: ${VERSION}"
 
       - name: Build release binary
-        run: cargo build --release -p git-fs
+        run: cargo build --release -p git-fs --target ${{ matrix.target }}
 
       - name: Build deb package
-        run: cargo deb -p git-fs --no-build --deb-version "${{ steps.version.outputs.version }}"
+        run: |
+          cargo deb -p git-fs --no-build --no-strip \
+            --target ${{ matrix.target }} \
+            --deb-version "${{ steps.version.outputs.version }}"
 
       - name: Build rpm package
         run: |
           cargo generate-rpm -p crates/git-fs \
+            --target ${{ matrix.target }} \
             --set-metadata="version=${{ steps.version.outputs.version }}"
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/debian/git-fs_*.deb
+
+      - name: Upload rpm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-${{ matrix.arch }}
+          path: target/generate-rpm/git-fs-*.rpm
+
+  release:
+    name: Create GitHub Release
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set version
+        id: version
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          BASE_VERSION=$(cargo metadata --no-deps --format-version=1 \
+            | jq -r '.packages[] | select(.name == "git-fs") | .version')
+          VERSION="${BASE_VERSION}+${SHORT_SHA}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
 
       - name: Create GitHub Release
         env:
@@ -62,5 +135,5 @@ jobs:
             --title "git-fs ${{ steps.version.outputs.version }}" \
             --notes "Automated build from main at ${{ github.sha }}" \
             --target "${{ github.sha }}" \
-            target/debian/git-fs_*.deb \
-            target/generate-rpm/git-fs-*.rpm
+            artifacts/**/*.deb \
+            artifacts/**/*.rpm
