@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release-${{ github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: Build & Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+
+      - name: Install packaging tools
+        run: cargo install cargo-deb cargo-generate-rpm
+
+      - name: Set version with git SHA
+        id: version
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          BASE_VERSION=$(cargo metadata --no-deps --format-version=1 \
+            | jq -r '.packages[] | select(.name == "git-fs") | .version')
+          VERSION="${BASE_VERSION}+${SHORT_SHA}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Building version: ${VERSION}"
+
+      - name: Build release binary
+        run: cargo build --release -p git-fs
+
+      - name: Build deb package
+        run: cargo deb -p git-fs --no-build --deb-version "${{ steps.version.outputs.version }}"
+
+      - name: Build rpm package
+        run: |
+          cargo generate-rpm -p crates/git-fs \
+            --set-metadata="version=${{ steps.version.outputs.version }}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="main-${{ steps.version.outputs.short_sha }}"
+          gh release create "${TAG}" \
+            --title "git-fs ${{ steps.version.outputs.version }}" \
+            --notes "Automated build from main at ${{ github.sha }}" \
+            --target "${{ github.sha }}" \
+            target/debian/git-fs_*.deb \
+            target/generate-rpm/git-fs-*.rpm
