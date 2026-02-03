@@ -72,7 +72,15 @@ jobs:
           echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs)-updates main restricted universe multiverse" \
             | sudo tee -a /etc/apt/sources.list.d/arm64.list
 
-      - name: Install system dependencies
+      - name: Install system dependencies (cached, amd64)
+        if: matrix.arch == 'amd64'
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: libfuse3-dev gcc
+          version: 1.0
+
+      - name: Install system dependencies (arm64 cross)
+        if: matrix.arch == 'arm64'
         run: |
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.fuse-dev }} ${{ matrix.linker }}
