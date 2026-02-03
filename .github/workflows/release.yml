@@ -133,7 +133,7 @@ jobs:
           cargo generate-rpm -p crates/git-fs \
             --target ${{ matrix.target }} \
             --set-metadata='version="${{ needs.version.outputs.version }}"' \
-            --set-metadata="arch=${{ matrix.rpm-arch }}"
+            --set-metadata='arch="${{ matrix.rpm-arch }}"'
 
       - name: Create tarball
         run: |
