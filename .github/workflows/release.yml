@@ -23,10 +23,12 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             arch: amd64
+            rpm-arch: x86_64
             linker: gcc
             fuse-dev: libfuse3-dev
           - target: aarch64-unknown-linux-gnu
             arch: arm64
+            rpm-arch: aarch64
             linker: gcc-aarch64-linux-gnu
             fuse-dev: libfuse3-dev:arm64
     steps:
@@ -90,7 +92,8 @@ jobs:
         run: |
           cargo generate-rpm -p crates/git-fs \
             --target ${{ matrix.target }} \
-            --set-metadata="version=${{ steps.version.outputs.version }}"
+            --set-metadata="version=${{ steps.version.outputs.version }}" \
+            --set-metadata="arch=${{ matrix.rpm-arch }}"
 
       - name: Upload deb artifact
         uses: actions/upload-artifact@v4
