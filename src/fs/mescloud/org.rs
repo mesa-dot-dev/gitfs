@@ -4,6 +4,7 @@ use std::ffi::OsStr;
 use std::time::SystemTime;
 
 use bytes::Bytes;
+use futures::TryStreamExt as _;
 use mesa_dev::Mesa as MesaClient;
 use secrecy::SecretString;
 use tracing::{instrument, trace, warn};
@@ -35,6 +36,8 @@ struct RepoSlot {
 enum InodeRole {
     /// The org root directory.
     OrgRoot,
+    /// A virtual owner directory (github only).
+    OwnerDir,
     /// An inode owned by some repo.
     RepoOwned { idx: usize },
 }
@@ -54,6 +57,9 @@ pub struct OrgFs {
 
     /// Maps org-level repo-root inodes → index into `repos`.
     repo_inodes: HashMap<Inode, usize>,
+    /// Maps org-level owner-dir inodes → owner name.
+    /// Only populated when org name is "github".
+    owner_inodes: HashMap<Inode, String>,
     repos: Vec<RepoSlot>,
 }
 
@@ -64,6 +70,86 @@ impl OrgFs {
     /// The name of the organization.
     pub(crate) fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Whether this org uses the github two-level owner/repo hierarchy.
+    /// TODO(MES-674): Cleanup "special" casing for github.
+    fn is_github(&self) -> bool {
+        self.name == "github"
+    }
+
+    /// Decode a base64-encoded repo name from the API. Returns "owner/repo".
+    /// TODO(MES-674): Cleanup "special" casing for github.
+    #[expect(dead_code)]
+    fn decode_github_repo_name(encoded: &str) -> Option<String> {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .ok()?;
+        let decoded = String::from_utf8(bytes).ok()?;
+        decoded.contains('/').then_some(decoded)
+    }
+
+    /// Encode "owner/repo" to base64 for API calls.
+    /// TODO(MES-674): Cleanup "special" casing for github.
+    fn encode_github_repo_name(decoded: &str) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(decoded)
+    }
+
+    /// Ensure an inode exists for a virtual owner directory (github only). Does NOT bump rc.
+    /// TODO(MES-674): Cleanup "special" casing for github.
+    fn ensure_owner_inode(&mut self, owner: &str) -> (Inode, FileAttr) {
+        // Check existing
+        for (&ino, existing_owner) in &self.owner_inodes {
+            if existing_owner == owner {
+                if let Some(icb) = self.inode_table.get(&ino)
+                    && let Some(attr) = icb.attr
+                {
+                    return (ino, attr);
+                }
+                let now = SystemTime::now();
+                let attr = FileAttr::Directory {
+                    common: common::make_common_file_attr(
+                        self.fs_owner,
+                        Self::BLOCK_SIZE,
+                        ino,
+                        0o755,
+                        now,
+                        now,
+                    ),
+                };
+                common::cache_attr(&mut self.inode_table, ino, attr);
+                return (ino, attr);
+            }
+        }
+
+        // Allocate new
+        let ino = self.inode_factory.allocate();
+        let now = SystemTime::now();
+        self.inode_table.insert(
+            ino,
+            InodeControlBlock {
+                rc: 0,
+                path: owner.into(),
+                parent: Some(Self::ROOT_INO),
+                children: None,
+                attr: None,
+            },
+        );
+        self.owner_inodes.insert(ino, owner.to_owned());
+        let attr = FileAttr::Directory {
+            common: common::make_common_file_attr(
+                self.fs_owner,
+                Self::BLOCK_SIZE,
+                ino,
+                0o755,
+                now,
+                now,
+            ),
+        };
+        common::cache_attr(&mut self.inode_table, ino, attr);
+        (ino, attr)
     }
 
     /// Get the cached attr for an inode, if present.
@@ -94,6 +180,7 @@ impl OrgFs {
             inode_factory: InodeFactory::new(Self::ROOT_INO + 1),
             next_fh: 1,
             repo_inodes: HashMap::new(),
+            owner_inodes: HashMap::new(),
             repos: Vec::new(),
         };
 
@@ -115,6 +202,9 @@ impl OrgFs {
     fn inode_role(&self, ino: Inode) -> InodeRole {
         if ino == Self::ROOT_INO {
             return InodeRole::OrgRoot;
+        }
+        if self.owner_inodes.contains_key(&ino) {
+            return InodeRole::OwnerDir;
         }
         if let Some(&idx) = self.repo_inodes.get(&ino) {
             return InodeRole::RepoOwned { idx };
@@ -155,7 +245,17 @@ impl OrgFs {
 
     /// Ensure an inode + `RepoFs` exists for the given repo name.
     /// Does NOT bump rc.
-    fn ensure_repo_inode(&mut self, repo_name: &str, default_branch: &str) -> (Inode, FileAttr) {
+    ///
+    /// - `repo_name`: name used for API calls / `RepoFs` (base64-encoded for github)
+    /// - `display_name`: name shown in filesystem ("linux" for github, same as `repo_name` otherwise)
+    /// - `parent_ino`: owner-dir inode for github, `ROOT_INO` otherwise
+    fn ensure_repo_inode(
+        &mut self,
+        repo_name: &str,
+        display_name: &str,
+        default_branch: &str,
+        parent_ino: Inode,
+    ) -> (Inode, FileAttr) {
         // Check existing repos.
         for (&ino, &idx) in &self.repo_inodes {
             if self.repos[idx].repo.repo_name() == repo_name {
@@ -205,8 +305,8 @@ impl OrgFs {
             ino,
             InodeControlBlock {
                 rc: 0,
-                path: repo_name.into(),
-                parent: Some(Self::ROOT_INO),
+                path: display_name.into(),
+                parent: Some(parent_ino),
                 children: None,
                 attr: None,
             },
@@ -239,6 +339,20 @@ impl OrgFs {
         };
         common::cache_attr(&mut self.inode_table, ino, attr);
         (ino, attr)
+    }
+
+    /// Poll `repos().get()` until the repo is no longer syncing.
+    async fn wait_for_sync(
+        &self,
+        repo_name: &str,
+    ) -> Result<mesa_dev::models::Repo, mesa_dev::error::MesaError> {
+        let mut repo = self.client.repos(&self.name).get(repo_name).await?;
+        while repo.status.is_some() {
+            trace!(repo = repo_name, "repo is syncing, waiting...");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            repo = self.client.repos(&self.name).get(repo_name).await?;
+        }
+        Ok(repo)
     }
 
     /// Allocate an org-level file handle and map it through the bridge.
@@ -308,25 +422,75 @@ impl Fs for OrgFs {
 
         match self.inode_role(parent) {
             InodeRole::OrgRoot => {
-                // Children of org root are repos.
-                let repo_name = name.to_str().ok_or(LookupError::InodeNotFound)?;
-                trace!(repo = repo_name, "lookup: resolving repo");
+                // TODO(MES-674): Cleanup "special" casing for github.
+                let name_str = name.to_str().ok_or(LookupError::InodeNotFound)?;
 
-                // Validate repo exists via API.
-                let repo = self.client.repos(&self.name).get(repo_name).await?;
+                if self.is_github() {
+                    // name is an owner like "torvalds" — create lazily, no API validation.
+                    trace!(owner = name_str, "lookup: resolving github owner dir");
+                    let (ino, attr) = self.ensure_owner_inode(name_str);
+                    let icb = self
+                        .inode_table
+                        .get_mut(&ino)
+                        .unwrap_or_else(|| unreachable!("inode {ino} was just ensured"));
+                    icb.rc += 1;
+                    Ok(attr)
+                } else {
+                    // Children of org root are repos.
+                    trace!(repo = name_str, "lookup: resolving repo");
 
-                let (ino, attr) = self.ensure_repo_inode(repo_name, &repo.default_branch);
+                    // Validate repo exists via API, waiting for sync if needed.
+                    let repo = self.wait_for_sync(name_str).await?;
+
+                    let (ino, attr) = self.ensure_repo_inode(
+                        name_str,
+                        name_str,
+                        &repo.default_branch,
+                        Self::ROOT_INO,
+                    );
+                    let icb = self
+                        .inode_table
+                        .get_mut(&ino)
+                        .unwrap_or_else(|| unreachable!("inode {ino} was just ensured"));
+                    icb.rc += 1;
+                    trace!(
+                        ino,
+                        repo = name_str,
+                        rc = icb.rc,
+                        "lookup: resolved repo inode"
+                    );
+                    Ok(attr)
+                }
+            }
+            InodeRole::OwnerDir => {
+                // TODO(MES-674): Cleanup "special" casing for github.
+                // Parent is an owner dir, name is a repo like "linux".
+                let owner = self
+                    .owner_inodes
+                    .get(&parent)
+                    .ok_or(LookupError::InodeNotFound)?
+                    .clone();
+                let repo_name_str = name.to_str().ok_or(LookupError::InodeNotFound)?;
+                let full_decoded = format!("{owner}/{repo_name_str}");
+                let encoded = Self::encode_github_repo_name(&full_decoded);
+
+                trace!(
+                    owner = %owner,
+                    repo = repo_name_str,
+                    encoded = %encoded,
+                    "lookup: resolving github repo via owner dir"
+                );
+
+                // Validate via API (uses encoded name), waiting for sync if needed.
+                let repo = self.wait_for_sync(&encoded).await?;
+
+                let (ino, attr) =
+                    self.ensure_repo_inode(&encoded, repo_name_str, &repo.default_branch, parent);
                 let icb = self
                     .inode_table
                     .get_mut(&ino)
                     .unwrap_or_else(|| unreachable!("inode {ino} was just ensured"));
                 icb.rc += 1;
-                trace!(
-                    ino,
-                    repo = repo_name,
-                    rc = icb.rc,
-                    "lookup: resolved repo inode"
-                );
                 Ok(attr)
             }
             InodeRole::RepoOwned { idx } => {
@@ -388,8 +552,12 @@ impl Fs for OrgFs {
 
         match self.inode_role(ino) {
             InodeRole::OrgRoot => {
+                // TODO(MES-674): Cleanup "special" casing for github.
+                if self.is_github() {
+                    return Err(ReadDirError::NotPermitted);
+                }
+
                 // List repos via API.
-                use futures::TryStreamExt as _;
                 let repos: Vec<mesa_dev::models::Repo> = self
                     .client
                     .repos(&self.name)
@@ -399,13 +567,19 @@ impl Fs for OrgFs {
 
                 let repo_infos: Vec<(String, String)> = repos
                     .into_iter()
+                    .filter(|r| r.status.is_none()) // skip repos still syncing
                     .map(|r| (r.name, r.default_branch))
                     .collect();
                 trace!(count = repo_infos.len(), "readdir: fetched repo list");
 
                 let mut entries = Vec::with_capacity(repo_infos.len());
                 for (repo_name, default_branch) in &repo_infos {
-                    let (repo_ino, _) = self.ensure_repo_inode(repo_name, default_branch);
+                    let (repo_ino, _) = self.ensure_repo_inode(
+                        repo_name,
+                        repo_name,
+                        default_branch,
+                        Self::ROOT_INO,
+                    );
                     entries.push(DirEntry {
                         ino: repo_ino,
                         name: repo_name.clone().into(),
@@ -418,6 +592,13 @@ impl Fs for OrgFs {
                     .get_mut(&ino)
                     .ok_or(ReadDirError::InodeNotFound)?;
                 Ok(icb.children.insert(entries))
+            }
+            InodeRole::OwnerDir if self.is_github() => {
+                // TODO(MES-674): Cleanup "special" casing for github.
+                return Err(ReadDirError::NotPermitted);
+            }
+            InodeRole::OwnerDir => {
+                return Err(ReadDirError::NotADirectory);
             }
             InodeRole::RepoOwned { idx } => {
                 // Delegate to repo.
@@ -586,8 +767,9 @@ impl Fs for OrgFs {
                 if entry.get().rc <= nlookups {
                     trace!(ino, "evicting inode");
                     entry.remove();
-                    // Clean up repo_inodes mapping.
+                    // Clean up repo_inodes and owner_inodes mappings.
                     self.repo_inodes.remove(&ino);
+                    self.owner_inodes.remove(&ino);
                     // Clean up bridge mapping — find which slot, remove.
                     for slot in &mut self.repos {
                         slot.bridge.remove_inode_by_left(ino);
