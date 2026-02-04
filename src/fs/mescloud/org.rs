@@ -35,6 +35,8 @@ struct RepoSlot {
 enum InodeRole {
     /// The org root directory.
     OrgRoot,
+    /// A virtual owner directory (github only).
+    OwnerDir,
     /// An inode owned by some repo.
     RepoOwned { idx: usize },
 }
@@ -54,6 +56,9 @@ pub struct OrgFs {
 
     /// Maps org-level repo-root inodes → index into `repos`.
     repo_inodes: HashMap<Inode, usize>,
+    /// Maps org-level owner-dir inodes → owner name.
+    /// Only populated when org name is "github".
+    owner_inodes: HashMap<Inode, String>,
     repos: Vec<RepoSlot>,
 }
 
@@ -94,6 +99,7 @@ impl OrgFs {
             inode_factory: InodeFactory::new(Self::ROOT_INO + 1),
             next_fh: 1,
             repo_inodes: HashMap::new(),
+            owner_inodes: HashMap::new(),
             repos: Vec::new(),
         };
 
