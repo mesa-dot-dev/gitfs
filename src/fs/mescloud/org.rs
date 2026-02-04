@@ -77,6 +77,7 @@ impl OrgFs {
     }
 
     /// Decode a base64-encoded repo name from the API. Returns "owner/repo".
+    #[allow(dead_code)]
     fn decode_github_repo_name(encoded: &str) -> Option<String> {
         use base64::Engine as _;
         let bytes = base64::engine::general_purpose::STANDARD
