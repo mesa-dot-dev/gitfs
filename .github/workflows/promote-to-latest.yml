@@ -1,0 +1,79 @@
+name: Promote to Latest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    name: Promote canary to latest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find latest canary release
+        id: canary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Get the most recent canary release
+          CANARY_TAG=$(gh release list \
+            --exclude-drafts \
+            --json tagName,isPrerelease,createdAt \
+            --jq '[.[] | select(.tagName | startswith("canary-")) | select(.isPrerelease)] | sort_by(.createdAt) | last | .tagName')
+
+          if [ -z "${CANARY_TAG}" ] || [ "${CANARY_TAG}" = "null" ]; then
+            echo "::error::No canary release found"
+            exit 1
+          fi
+
+          echo "Found canary release: ${CANARY_TAG}"
+          echo "tag=${CANARY_TAG}" >> "$GITHUB_OUTPUT"
+
+          # Extract the version from the release title (e.g. "git-fs 0.1.0+024e288 (canary)")
+          VERSION=$(gh release view "${CANARY_TAG}" --json name --jq '.name' \
+            | sed 's/^git-fs //' | sed 's/ (canary)$//')
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+          # Get the target commit SHA
+          TARGET=$(gh release view "${CANARY_TAG}" --json targetCommitish --jq '.targetCommitish')
+          echo "target=${TARGET}" >> "$GITHUB_OUTPUT"
+
+      - name: Download canary assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p assets
+          gh release download "${{ steps.canary.outputs.tag }}" --dir assets
+          echo "Downloaded assets:"
+          ls -la assets/
+
+      - name: Delete existing latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view latest &>/dev/null; then
+            echo "Deleting existing 'latest' release..."
+            gh release delete latest --yes --cleanup-tag
+          else
+            echo "No existing 'latest' release found, skipping."
+          fi
+
+      - name: Create latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CANARY_TAG="${{ steps.canary.outputs.tag }}"
+          VERSION="${{ steps.canary.outputs.version }}"
+          TARGET="${{ steps.canary.outputs.target }}"
+
+          gh release create latest \
+            --title "git-fs ${VERSION}" \
+            --notes "Stable release of git-fs ${VERSION}.
+
+          Promoted from canary release [\`${CANARY_TAG}\`](https://github.com/${{ github.repository }}/releases/tag/${CANARY_TAG})." \
+            --target "${TARGET}" \
+            --latest \
+            assets/*
