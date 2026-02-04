@@ -34,125 +34,124 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
 
-  linux-package:
-    name: Linux (${{ matrix.arch }})
+  linux-deb:
+    name: Linux DEB (${{ matrix.arch }})
     needs: version
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: debian:12
     strategy:
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            arch: amd64
-            rpm-arch: x86_64
-            linker: gcc
-            fuse-dev: libfuse3-dev
-          - target: aarch64-unknown-linux-gnu
-            arch: arm64
-            rpm-arch: aarch64
-            linker: gcc-aarch64-linux-gnu
-            fuse-dev: libfuse3-dev:arm64
+          - arch: amd64
+            runner: blacksmith-8vcpu-ubuntu-2404
+          - arch: arm64
+            runner: blacksmith-8vcpu-ubuntu-2404-arm
     steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y \
+            build-essential \
+            pkg-config \
+            libfuse3-dev \
+            libssl-dev \
+            curl \
+            git
+
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Set up aarch64 cross-compilation
-        if: matrix.arch == 'arm64'
+      - name: Install Rust toolchain
         run: |
-          sudo dpkg --add-architecture arm64
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-          # Pin existing .list sources to amd64 only (skip lines that already have arch qualifiers)
-          for f in /etc/apt/sources.list.d/*.list; do
-            [ -f "$f" ] || continue
-            sudo sed -i '/^\s*deb \[/! s/^deb /deb [arch=amd64] /' "$f"
-          done
-
-          # Pin existing .sources (DEB822 format) to amd64 only
-          for f in /etc/apt/sources.list.d/*.sources; do
-            [ -f "$f" ] || continue
-            if ! grep -q '^Architectures:' "$f"; then
-              sudo sed -i '/^Types:/a Architectures: amd64' "$f"
-            fi
-          done
-
-          # Also handle /etc/apt/sources.list if it exists
-          if [ -f /etc/apt/sources.list ]; then
-            sudo sed -i '/^\s*deb \[/! s/^deb /deb [arch=amd64] /' /etc/apt/sources.list
-          fi
-
-          # Add arm64 sources from ports.ubuntu.com
-          CODENAME=$(lsb_release -cs)
-          printf 'deb [arch=arm64] http://ports.ubuntu.com/ %s main restricted universe multiverse\n' \
-            "${CODENAME}" "${CODENAME}-updates" "${CODENAME}-security" "${CODENAME}-backports" \
-            | sudo tee /etc/apt/sources.list.d/arm64-cross.list > /dev/null
-
-      - name: Install system dependencies (cached, amd64)
-        if: matrix.arch == 'amd64'
-        uses: awalsh128/cache-apt-pkgs-action@latest
-        with:
-          packages: libfuse3-dev gcc
-          version: 1.0
-
-      - name: Install system dependencies (arm64 cross)
-        if: matrix.arch == 'arm64'
+      - name: Install cargo-deb
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.fuse-dev }} ${{ matrix.linker }} libssl-dev:arm64
-
-      - name: Configure linker for cross-compilation
-        if: matrix.arch == 'arm64'
-        run: |
-          mkdir -p .cargo
-          printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' \
-            >> .cargo/config.toml
-
-      - name: Install packaging tools
-        run: cargo install cargo-deb cargo-generate-rpm
+          curl -L --proto '=https' --tlsv1.2 -sSf \
+            https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh \
+            | bash
+          cargo binstall --no-confirm cargo-deb
 
       - name: Build release binary
-        env:
-          PKG_CONFIG_ALLOW_CROSS: ${{ matrix.arch == 'arm64' && '1' || '' }}
-          PKG_CONFIG_PATH: ${{ matrix.arch == 'arm64' && '/usr/lib/aarch64-linux-gnu/pkgconfig' || '' }}
-          PKG_CONFIG_SYSROOT_DIR: ${{ matrix.arch == 'arm64' && '/' || '' }}
-        run: cargo build --release -p git-fs --target ${{ matrix.target }}
+        run: cargo build --release -p git-fs
 
       - name: Build deb package
         run: |
           cargo deb -p git-fs --no-build --no-strip \
-            --target ${{ matrix.target }} \
             --deb-version "${{ needs.version.outputs.version }}"
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: target/debian/git-fs_*.deb
+
+  linux-rpm:
+    name: Linux RPM (${{ matrix.arch }})
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: rockylinux:8
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: blacksmith-8vcpu-ubuntu-2404
+            rpm-arch: x86_64
+          - arch: arm64
+            runner: blacksmith-8vcpu-ubuntu-2404-arm
+            rpm-arch: aarch64
+    steps:
+      - name: Install system dependencies
+        run: |
+          dnf install -y epel-release
+          dnf config-manager --set-enabled powertools
+          dnf install -y \
+            gcc \
+            make \
+            pkg-config \
+            fuse3-devel \
+            openssl-devel \
+            curl \
+            git
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install cargo-generate-rpm
+        run: |
+          curl -L --proto '=https' --tlsv1.2 -sSf \
+            https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh \
+            | bash
+          cargo binstall --no-confirm cargo-generate-rpm
+
+      - name: Build release binary
+        run: cargo build --release -p git-fs
 
       - name: Build rpm package
         run: |
           cargo generate-rpm -p crates/git-fs \
-            --target ${{ matrix.target }} \
             --set-metadata='version="${{ needs.version.outputs.version }}"' \
             --set-metadata='arch="${{ matrix.rpm-arch }}"'
 
       - name: Create tarball
         run: |
           TARBALL="git-fs-linux-${{ matrix.arch }}.tar.gz"
-          tar -czf "${TARBALL}" \
-            -C target/${{ matrix.target }}/release git-fs
+          tar -czf "${TARBALL}" -C target/release git-fs
           echo "Created ${TARBALL}"
-
-      - name: Upload deb
-        uses: actions/upload-artifact@v4
-        with:
-          name: deb-${{ matrix.arch }}
-          path: target/${{ matrix.target }}/debian/git-fs_*.deb
 
       - name: Upload rpm
         uses: actions/upload-artifact@v4
         with:
           name: rpm-${{ matrix.arch }}
-          path: target/${{ matrix.target }}/generate-rpm/git-fs-*.rpm
+          path: target/generate-rpm/git-fs-*.rpm
 
       - name: Upload tarball
         uses: actions/upload-artifact@v4
@@ -228,7 +227,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [version, linux-package, macos-universal]
+    needs: [version, linux-deb, linux-rpm, macos-universal]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
