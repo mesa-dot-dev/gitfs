@@ -88,6 +88,8 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release
+        env:
+          GIT_SHA: ${{ github.sha }}
 
       - name: Build deb package
         run: |
@@ -184,6 +186,8 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release
+        env:
+          GIT_SHA: ${{ github.sha }}
 
       - name: Build rpm package
         run: |
@@ -241,6 +245,8 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release
+        env:
+          GIT_SHA: ${{ github.sha }}
 
       - name: Create tarball
         run: |
@@ -281,6 +287,8 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
+        env:
+          GIT_SHA: ${{ github.sha }}
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
