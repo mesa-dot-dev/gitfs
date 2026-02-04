@@ -202,6 +202,9 @@ impl OrgFs {
         if ino == Self::ROOT_INO {
             return InodeRole::OrgRoot;
         }
+        if self.owner_inodes.contains_key(&ino) {
+            return InodeRole::OwnerDir;
+        }
         if let Some(&idx) = self.repo_inodes.get(&ino) {
             return InodeRole::RepoOwned { idx };
         }
@@ -241,7 +244,17 @@ impl OrgFs {
 
     /// Ensure an inode + `RepoFs` exists for the given repo name.
     /// Does NOT bump rc.
-    fn ensure_repo_inode(&mut self, repo_name: &str, default_branch: &str) -> (Inode, FileAttr) {
+    ///
+    /// - `repo_name`: name used for API calls / RepoFs (base64-encoded for github)
+    /// - `display_name`: name shown in filesystem ("linux" for github, same as repo_name otherwise)
+    /// - `parent_ino`: owner-dir inode for github, ROOT_INO otherwise
+    fn ensure_repo_inode(
+        &mut self,
+        repo_name: &str,
+        display_name: &str,
+        default_branch: &str,
+        parent_ino: Inode,
+    ) -> (Inode, FileAttr) {
         // Check existing repos.
         for (&ino, &idx) in &self.repo_inodes {
             if self.repos[idx].repo.repo_name() == repo_name {
@@ -291,8 +304,8 @@ impl OrgFs {
             ino,
             InodeControlBlock {
                 rc: 0,
-                path: repo_name.into(),
-                parent: Some(Self::ROOT_INO),
+                path: display_name.into(),
+                parent: Some(parent_ino),
                 children: None,
                 attr: None,
             },
@@ -401,7 +414,8 @@ impl Fs for OrgFs {
                 // Validate repo exists via API.
                 let repo = self.client.repos(&self.name).get(repo_name).await?;
 
-                let (ino, attr) = self.ensure_repo_inode(repo_name, &repo.default_branch);
+                let (ino, attr) =
+                    self.ensure_repo_inode(repo_name, repo_name, &repo.default_branch, Self::ROOT_INO);
                 let icb = self
                     .inode_table
                     .get_mut(&ino)
@@ -491,7 +505,8 @@ impl Fs for OrgFs {
 
                 let mut entries = Vec::with_capacity(repo_infos.len());
                 for (repo_name, default_branch) in &repo_infos {
-                    let (repo_ino, _) = self.ensure_repo_inode(repo_name, default_branch);
+                    let (repo_ino, _) =
+                        self.ensure_repo_inode(repo_name, repo_name, default_branch, Self::ROOT_INO);
                     entries.push(DirEntry {
                         ino: repo_ino,
                         name: repo_name.clone().into(),
