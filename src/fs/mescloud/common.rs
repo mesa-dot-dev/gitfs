@@ -240,6 +240,9 @@ pub enum ReadDirError {
 
     #[error("inode is not a directory")]
     NotADirectory,
+
+    #[error("operation not permitted")]
+    NotPermitted,
 }
 
 impl From<ReadDirError> for i32 {
@@ -248,6 +251,7 @@ impl From<ReadDirError> for i32 {
             ReadDirError::InodeNotFound => libc::ENOENT,
             ReadDirError::RemoteMesaError(_) => libc::EIO,
             ReadDirError::NotADirectory => libc::ENOTDIR,
+            ReadDirError::NotPermitted => libc::EPERM,
         }
     }
 }

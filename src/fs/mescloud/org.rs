@@ -539,6 +539,10 @@ impl Fs for OrgFs {
 
         match self.inode_role(ino) {
             InodeRole::OrgRoot => {
+                if self.is_github() {
+                    return Err(ReadDirError::NotPermitted);
+                }
+
                 // List repos via API.
                 use futures::TryStreamExt as _;
                 let repos: Vec<mesa_dev::models::Repo> = self
@@ -570,6 +574,9 @@ impl Fs for OrgFs {
                     .get_mut(&ino)
                     .ok_or(ReadDirError::InodeNotFound)?;
                 Ok(icb.children.insert(entries))
+            }
+            InodeRole::OwnerDir => {
+                return Err(ReadDirError::NotPermitted);
             }
             InodeRole::RepoOwned { idx } => {
                 // Delegate to repo.
