@@ -745,8 +745,9 @@ impl Fs for OrgFs {
                 if entry.get().rc <= nlookups {
                     trace!(ino, "evicting inode");
                     entry.remove();
-                    // Clean up repo_inodes mapping.
+                    // Clean up repo_inodes and owner_inodes mappings.
                     self.repo_inodes.remove(&ino);
+                    self.owner_inodes.remove(&ino);
                     // Clean up bridge mapping — find which slot, remove.
                     for slot in &mut self.repos {
                         slot.bridge.remove_inode_by_left(ino);
