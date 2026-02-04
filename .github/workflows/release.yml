@@ -137,7 +137,7 @@ jobs:
 
       - name: Build rpm package
         run: |
-          cargo generate-rpm -p crates/git-fs \
+          cargo generate-rpm -p git-fs \
             --set-metadata='version="${{ needs.version.outputs.version }}"' \
             --set-metadata='arch="${{ matrix.rpm-arch }}"'
 
