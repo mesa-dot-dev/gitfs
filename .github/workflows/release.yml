@@ -75,11 +75,11 @@ jobs:
           cargo binstall --no-confirm cargo-deb
 
       - name: Build release binary
-        run: cargo build --release -p git-fs
+        run: cargo build --release
 
       - name: Build deb package
         run: |
-          cargo deb -p git-fs --no-build --no-strip \
+          cargo deb --no-build --no-strip \
             --deb-version "${{ needs.version.outputs.version }}"
 
       - name: Upload deb
@@ -133,11 +133,11 @@ jobs:
           cargo binstall --no-confirm cargo-generate-rpm
 
       - name: Build release binary
-        run: cargo build --release -p git-fs
+        run: cargo build --release
 
       - name: Build rpm package
         run: |
-          cargo generate-rpm -p git-fs \
+          cargo generate-rpm \
             --set-metadata='version="${{ needs.version.outputs.version }}"' \
             --set-metadata='arch="${{ matrix.rpm-arch }}"'
 
@@ -185,7 +185,7 @@ jobs:
         run: brew install macfuse
 
       - name: Build release binary
-        run: cargo build --release -p git-fs --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
