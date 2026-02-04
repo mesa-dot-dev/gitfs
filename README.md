@@ -29,11 +29,4 @@ Hit `Ctrl+C` to stop — `gitfs` cleans up after itself.
 
 ## Documentation
 
-For full documentation — installation for all platforms, configuration, Mesa
-org setup, daemon mode, and more — visit:
-
-**[docs.mesa.dev/content/guides/gitfs](https://docs.mesa.dev/content/guides/gitfs)**
-
-## License
-
-MIT
+For full documentation visit: **[docs.mesa.dev](https://docs.mesa.dev/content/guides/gitfs)**
