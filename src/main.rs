@@ -8,6 +8,7 @@ use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 mod app_config;
 mod daemon;
 mod fs;
+mod updates;
 
 use crate::app_config::{ConfigPathProvider, ConfigPathProviderTrait as _};
 
@@ -49,6 +50,8 @@ fn main() {
         .with_env_filter(EnvFilter::from_default_env())
         .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
         .init();
+
+    updates::check_for_updates();
 
     let args = Args::parse();
     let config =
