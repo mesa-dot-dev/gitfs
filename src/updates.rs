@@ -5,11 +5,15 @@ use tracing::{error, info};
 /// The git SHA baked in at compile time by `vergen-gitcl`.
 const BUILD_SHA: &str = env!("VERGEN_GIT_SHA");
 
-/// Check GitHub for the latest release and warn if this binary is outdated.
+/// The crate version from `Cargo.toml`.
+const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Check GitHub for the latest stable release and warn if this binary is outdated.
 ///
 /// This function never fails the application — it logs errors and returns.
 pub fn check_for_updates() {
     let short_sha = &BUILD_SHA[..7.min(BUILD_SHA.len())];
+    let running_version = format!("{PKG_VERSION}+{short_sha}");
 
     let releases = match self_update::backends::github::ReleaseList::configure()
         .repo_owner("mesa-dot-dev")
@@ -29,23 +33,21 @@ pub fn check_for_updates() {
         }
     };
 
-    let Some(latest) = releases.first() else {
-        info!("No releases found on GitHub.");
+    // Find the stable release (tagged "latest" on GitHub).
+    let Some(stable) = releases.iter().find(|r| r.version == "latest") else {
+        info!("No stable release found on GitHub.");
         return;
     };
 
-    // Release tags are "canary-{short_sha}". Extract the SHA suffix.
-    let latest_sha = latest
-        .version
-        .strip_prefix("canary-")
-        .unwrap_or(&latest.version);
+    // Release name format: "git-fs 0.1.1-alpha+172e35d"
+    let latest_version = stable.name.strip_prefix("git-fs ").unwrap_or(&stable.name);
 
-    if short_sha == latest_sha {
-        info!("You are running the latest version ({short_sha}).");
+    if running_version == latest_version {
+        info!("You are running the latest version ({running_version}).");
     } else {
         error!(
-            "You are running git-fs built from commit {short_sha}, \
-             but the latest release is from commit {latest_sha}. \
+            "You are running git-fs {running_version}, \
+             but the latest release is {latest_version}. \
              Please update: https://github.com/mesa-dot-dev/gitfs/releases"
         );
     }
