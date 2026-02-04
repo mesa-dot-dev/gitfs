@@ -35,18 +35,31 @@ jobs:
           echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
 
   linux-deb:
-    name: Linux DEB (${{ matrix.arch }})
+    name: Linux DEB (${{ matrix.distro.name }} ${{ matrix.arch.name }})
     needs: version
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.arch.runner }}
     container:
-      image: debian:12
+      image: ${{ matrix.distro.image }}
     strategy:
       matrix:
-        include:
-          - arch: amd64
+        arch:
+          - name: amd64
             runner: blacksmith-8vcpu-ubuntu-2404
-          - arch: arm64
+          - name: arm64
             runner: blacksmith-8vcpu-ubuntu-2404-arm
+        distro:
+          - name: debian-12
+            image: debian:12
+          - name: debian-13
+            image: debian:trixie
+          - name: ubuntu-20.04
+            image: ubuntu:20.04
+          - name: ubuntu-22.04
+            image: ubuntu:22.04
+          - name: ubuntu-24.04
+            image: ubuntu:24.04
+          - name: ubuntu-24.10
+            image: ubuntu:24.10
     steps:
       - name: Install system dependencies
         run: |
@@ -82,32 +95,70 @@ jobs:
           cargo deb --no-build --no-strip \
             --deb-version "${{ needs.version.outputs.version }}"
 
+      - name: Rename deb with distro tag
+        run: |
+          for f in target/debian/git-fs_*.deb; do
+            newname=$(echo "$f" | sed "s/git-fs_/git-fs_${{ matrix.distro.name }}_/")
+            mv "$f" "$newname"
+          done
+
       - name: Upload deb
         uses: actions/upload-artifact@v4
         with:
-          name: deb-${{ matrix.arch }}
+          name: deb-${{ matrix.distro.name }}-${{ matrix.arch.name }}
           path: target/debian/git-fs_*.deb
 
   linux-rpm:
-    name: Linux RPM (${{ matrix.arch }})
+    name: Linux RPM (${{ matrix.distro.name }} ${{ matrix.arch.name }})
     needs: version
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.arch.runner }}
     container:
-      image: rockylinux:8
+      image: ${{ matrix.distro.image }}
     strategy:
       matrix:
-        include:
-          - arch: amd64
+        arch:
+          - name: amd64
             runner: blacksmith-8vcpu-ubuntu-2404
             rpm-arch: x86_64
-          - arch: arm64
+          - name: arm64
             runner: blacksmith-8vcpu-ubuntu-2404-arm
             rpm-arch: aarch64
+        distro:
+          - name: rocky-8
+            image: rockylinux:8
+            setup: |
+              dnf install -y epel-release
+              dnf config-manager --set-enabled powertools
+          - name: rocky-9
+            image: rockylinux:9
+            setup: |
+              dnf install -y epel-release
+              dnf config-manager --set-enabled crb
+          - name: alma-8
+            image: almalinux:8
+            setup: |
+              dnf install -y epel-release
+              dnf config-manager --set-enabled powertools
+          - name: alma-9
+            image: almalinux:9
+            setup: |
+              dnf install -y epel-release
+              dnf config-manager --set-enabled crb
+          - name: fedora-40
+            image: fedora:40
+            setup: "true"
+          - name: fedora-41
+            image: fedora:41
+            setup: "true"
+          - name: fedora-42
+            image: fedora:42
+            setup: "true"
     steps:
+      - name: Setup extra repositories
+        run: ${{ matrix.distro.setup }}
+
       - name: Install system dependencies
         run: |
-          dnf install -y epel-release
-          dnf config-manager --set-enabled powertools
           dnf install -y \
             gcc \
             make \
@@ -139,19 +190,64 @@ jobs:
         run: |
           cargo generate-rpm \
             --set-metadata='version="${{ needs.version.outputs.version }}"' \
-            --set-metadata='arch="${{ matrix.rpm-arch }}"'
+            --set-metadata='arch="${{ matrix.arch.rpm-arch }}"'
+
+      - name: Rename rpm with distro tag
+        run: |
+          for f in target/generate-rpm/git-fs-*.rpm; do
+            newname=$(echo "$f" | sed "s/git-fs-/git-fs_${{ matrix.distro.name }}_/")
+            mv "$f" "$newname"
+          done
+
+      - name: Upload rpm
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-${{ matrix.distro.name }}-${{ matrix.arch.name }}
+          path: target/generate-rpm/git-fs_*.rpm
+
+  linux-tarball:
+    name: Linux tarball (${{ matrix.arch }})
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: rockylinux:8
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: blacksmith-8vcpu-ubuntu-2404
+          - arch: arm64
+            runner: blacksmith-8vcpu-ubuntu-2404-arm
+    steps:
+      - name: Install system dependencies
+        run: |
+          dnf install -y epel-release
+          dnf config-manager --set-enabled powertools
+          dnf install -y \
+            gcc \
+            make \
+            pkg-config \
+            fuse3-devel \
+            openssl-devel \
+            curl \
+            git
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build release binary
+        run: cargo build --release
 
       - name: Create tarball
         run: |
           TARBALL="git-fs-linux-${{ matrix.arch }}.tar.gz"
           tar -czf "${TARBALL}" -C target/release git-fs
           echo "Created ${TARBALL}"
-
-      - name: Upload rpm
-        uses: actions/upload-artifact@v4
-        with:
-          name: rpm-${{ matrix.arch }}
-          path: target/generate-rpm/git-fs-*.rpm
 
       - name: Upload tarball
         uses: actions/upload-artifact@v4
@@ -227,7 +323,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [version, linux-deb, linux-rpm, macos-universal]
+    needs: [version, linux-deb, linux-rpm, linux-tarball, macos-universal]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

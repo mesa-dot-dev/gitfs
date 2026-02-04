@@ -59,10 +59,16 @@ jobs:
       - name: Rename assets to stable paths
         run: |
           cd assets
-          for f in git-fs_*_amd64.deb; do [ -f "$f" ] && mv "$f" git-fs_amd64.deb; done
-          for f in git-fs_*_arm64.deb; do [ -f "$f" ] && mv "$f" git-fs_arm64.deb; done
-          for f in git-fs-*.x86_64.rpm; do [ -f "$f" ] && mv "$f" git-fs.x86_64.rpm; done
-          for f in git-fs-*.aarch64.rpm; do [ -f "$f" ] && mv "$f" git-fs.aarch64.rpm; done
+          for f in git-fs_*.deb; do
+            # e.g. git-fs_ubuntu-24.04_0.1.1-alpha+abc1234_arm64.deb → git-fs_ubuntu-24.04_arm64.deb
+            stable=$(echo "$f" | sed -E 's/git-fs_([^_]+)_[^_]+_([^.]+)\.deb/git-fs_\1_\2.deb/')
+            [ "$f" != "$stable" ] && mv "$f" "$stable"
+          done
+          for f in git-fs_*.rpm; do
+            # e.g. git-fs_rocky-8_0.1.0+abc1234-1.x86_64.rpm → git-fs_rocky-8.x86_64.rpm
+            stable=$(echo "$f" | sed -E 's/git-fs_([^_]+)_.+\.(x86_64|aarch64)\.rpm/git-fs_\1.\2.rpm/')
+            [ "$f" != "$stable" ] && mv "$f" "$stable"
+          done
           echo "Renamed assets:"
           ls -la
 
