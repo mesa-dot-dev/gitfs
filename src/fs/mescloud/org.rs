@@ -344,6 +344,20 @@ impl OrgFs {
         (ino, attr)
     }
 
+    /// Poll `repos().get()` until the repo is no longer syncing.
+    async fn wait_for_sync(
+        &self,
+        repo_name: &str,
+    ) -> Result<mesa_dev::models::Repo, mesa_dev::error::MesaError> {
+        let mut repo = self.client.repos(&self.name).get(repo_name).await?;
+        while repo.status.is_some() {
+            trace!(repo = repo_name, "repo is syncing, waiting...");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            repo = self.client.repos(&self.name).get(repo_name).await?;
+        }
+        Ok(repo)
+    }
+
     /// Allocate an org-level file handle and map it through the bridge.
     fn alloc_fh(&mut self, slot_idx: usize, repo_fh: FileHandle) -> FileHandle {
         let fh = self.next_fh;
@@ -428,8 +442,8 @@ impl Fs for OrgFs {
                     // Children of org root are repos.
                     trace!(repo = name_str, "lookup: resolving repo");
 
-                    // Validate repo exists via API.
-                    let repo = self.client.repos(&self.name).get(name_str).await?;
+                    // Validate repo exists via API, waiting for sync if needed.
+                    let repo = self.wait_for_sync(name_str).await?;
 
                     let (ino, attr) = self.ensure_repo_inode(
                         name_str,
@@ -470,8 +484,8 @@ impl Fs for OrgFs {
                     "lookup: resolving github repo via owner dir"
                 );
 
-                // Validate via API (uses encoded name).
-                let repo = self.client.repos(&self.name).get(&encoded).await?;
+                // Validate via API (uses encoded name), waiting for sync if needed.
+                let repo = self.wait_for_sync(&encoded).await?;
 
                 let (ino, attr) = self.ensure_repo_inode(
                     &encoded,
@@ -561,6 +575,7 @@ impl Fs for OrgFs {
 
                 let repo_infos: Vec<(String, String)> = repos
                     .into_iter()
+                    .filter(|r| r.status.is_none()) // skip repos still syncing
                     .map(|r| (r.name, r.default_branch))
                     .collect();
                 trace!(count = repo_infos.len(), "readdir: fetched repo list");
