@@ -228,7 +228,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [linux-package, macos-universal]
+    needs: [version, linux-package, macos-universal]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -242,7 +242,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="canary-${{ needs.version.outputs.short_sha }}"
+          SHORT_SHA="${{ needs.version.outputs.short_sha }}"
+          SHORT_SHA="${SHORT_SHA:-$(echo "${{ github.sha }}" | cut -c1-7)}"
+          TAG="canary-${SHORT_SHA}"
           gh release create "${TAG}" \
             --prerelease \
             --title "git-fs ${{ needs.version.outputs.version }} (canary)" \
