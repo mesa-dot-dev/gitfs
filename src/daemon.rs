@@ -46,7 +46,7 @@ mod managed_fuse {
             let mesa_fs = MesaFS::new(orgs, (config.uid, config.gid));
             let fuse_adapter = FuserAdapter::new(mesa_fs, handle);
             let mount_opts = [
-                fuser::MountOption::FSName("mesafs".to_owned()),
+                fuser::MountOption::FSName("gitfs".to_owned()),
                 fuser::MountOption::RO,
                 fuser::MountOption::NoDev,
                 fuser::MountOption::Exec,
@@ -166,7 +166,7 @@ pub async fn run(
     // Spawn the cache if it doesn't exist.
     tokio::fs::create_dir_all(&config.cache.path).await?;
 
-    debug!(config = ?config, "Starting mesafs daemon...");
+    debug!(config = ?config, "Starting gitfs daemon...");
 
     let fuse = managed_fuse::ManagedFuse::new(&config);
     {

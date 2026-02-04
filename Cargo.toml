@@ -1,6 +1,6 @@
 [package]
 name = "git-fs"
-version = "0.1.0"
+version = "0.1.1-alpha"
 edition = "2024"
 description = "Mount Mesa, GitHub and Gitlab repositories as local filesystems via FUSE"
 license = "MIT"
