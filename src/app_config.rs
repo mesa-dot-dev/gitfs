@@ -71,6 +71,77 @@ impl Default for CacheConfig {
     }
 }
 
+/// Well-known organizations and their default API keys.
+///
+/// Note that these are publicly exposed and we are comfortable with that, as these keys are
+/// equivalent to read-only access tokens.
+const WELL_KNOWN_ORGS: [(&str, &str); 1] = [
+    ("github", "dp_live_uAgKRbhVNcDiUZXVyTQbBIaJEerhSwQh"),
+];
+
+fn default_organizations() -> HashMap<String, OrganizationConfig> {
+    WELL_KNOWN_ORGS.iter().fold(
+        HashMap::<String, OrganizationConfig>::new(),
+        |mut acc, (name, api_key)| {
+            acc.insert(
+                name.to_string(),
+                OrganizationConfig {
+                    api_key: SecretString::from(api_key.to_string()),
+                },
+            );
+            acc
+        },
+    )
+}
+
+/// Deserializes the organizations map, then ensures the default GitHub entry
+/// is always present (without overwriting a user-provided one).
+fn deserialize_organizations_with_defaults<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, OrganizationConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(WELL_KNOWN_ORGS.iter().fold(
+        HashMap::<String, OrganizationConfig>::deserialize(deserializer)?,
+        |mut acc, (name, api_key)| {
+            acc.insert(
+                name.to_string(),
+                OrganizationConfig {
+                    api_key: SecretString::from(api_key.to_string()),
+                },
+            );
+            acc
+        },
+    ))
+}
+
+/// Serializes the organizations map, excluding well-known organizations so they
+/// don't get written to the config file.
+fn serialize_organizations_without_well_known<S>(
+    organizations: &HashMap<String, OrganizationConfig>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+
+    let well_known_names: std::collections::HashSet<&str> =
+        WELL_KNOWN_ORGS.iter().map(|(name, _)| *name).collect();
+
+    let filtered: Vec<_> = organizations
+        .iter()
+        .filter(|(key, _)| !well_known_names.contains(key.as_str()))
+        .collect();
+
+    let mut map = serializer.serialize_map(Some(filtered.len()))?;
+    for (key, value) in filtered {
+        map.serialize_entry(key, value)?;
+    }
+    map.end()
+}
+
 /// The configuration block on a per organization basis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -108,6 +179,7 @@ impl Default for DaemonConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Config {
+    #[serde(default = "default_organizations", deserialize_with = "deserialize_organizations_with_defaults", serialize_with = "serialize_organizations_without_well_known")]
     pub organizations: HashMap<String, OrganizationConfig>,
 
     #[serde(default)]
@@ -132,7 +204,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            organizations: HashMap::new(),
+            organizations: default_organizations(),
             cache: CacheConfig::default(),
             daemon: DaemonConfig::default(),
             mount_point: default_mount_point(),
