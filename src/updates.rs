@@ -42,6 +42,9 @@ pub fn check_for_updates() {
     // Release name format: "git-fs 0.1.1-alpha+172e35d"
     let latest_version = stable.name.strip_prefix("git-fs ").unwrap_or(&stable.name);
 
+    // TODO(ME-672): This check is technically wrong, since it checks for equality, but some users
+    // may be running canary/dev, which may be more recent. We should ideally parse semver and
+    // compare properly.
     if running_version == latest_version {
         info!("You are running the latest version ({running_version}).");
     } else {
