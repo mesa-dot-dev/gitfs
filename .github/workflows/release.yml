@@ -253,6 +253,7 @@ jobs:
 
       - name: Create tarball
         run: |
+          chmod +x target/release/git-fs
           TARBALL="git-fs-linux-${{ matrix.arch }}.tar.gz"
           tar -czf "${TARBALL}" -C target/release git-fs
           echo "Created ${TARBALL}"
@@ -319,6 +320,7 @@ jobs:
       - name: Create universal binary
         run: |
           lipo -create x86_64/git-fs arm64/git-fs -output git-fs
+          chmod +x git-fs
           file git-fs
           lipo -info git-fs
 
