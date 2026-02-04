@@ -6,6 +6,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: promote-to-latest
+  cancel-in-progress: false
+
 jobs:
   promote:
     name: Promote canary to latest
@@ -20,6 +24,7 @@ jobs:
         run: |
           # Get the most recent canary release
           CANARY_TAG=$(gh release list \
+            --limit 100 \
             --exclude-drafts \
             --json tagName,isPrerelease,createdAt \
             --jq '[.[] | select(.tagName | startswith("canary-")) | select(.isPrerelease)] | sort_by(.createdAt) | last | .tagName')
@@ -44,9 +49,10 @@ jobs:
       - name: Download canary assets
         env:
           GH_TOKEN: ${{ github.token }}
+          CANARY_TAG: ${{ steps.canary.outputs.tag }}
         run: |
           mkdir -p assets
-          gh release download "${{ steps.canary.outputs.tag }}" --dir assets
+          gh release download "${CANARY_TAG}" --dir assets
           echo "Downloaded assets:"
           ls -la assets/
 
@@ -64,11 +70,10 @@ jobs:
       - name: Create latest release
         env:
           GH_TOKEN: ${{ github.token }}
+          CANARY_TAG: ${{ steps.canary.outputs.tag }}
+          VERSION: ${{ steps.canary.outputs.version }}
+          TARGET: ${{ steps.canary.outputs.target }}
         run: |
-          CANARY_TAG="${{ steps.canary.outputs.tag }}"
-          VERSION="${{ steps.canary.outputs.version }}"
-          TARGET="${{ steps.canary.outputs.target }}"
-
           gh release create latest \
             --title "git-fs ${VERSION}" \
             --notes "Stable release of git-fs ${VERSION}.
