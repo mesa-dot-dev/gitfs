@@ -30,3 +30,5 @@ Hit `Ctrl+C` to stop.
 ## Documentation
 
 For full documentation visit: **[docs.mesa.dev](https://docs.mesa.dev/content/guides/gitfs)**
+
+![Mesa Brand Footer](https://mesa.dev/assets/mesa-sketchbook-man-DAeWTP2g.webp)
