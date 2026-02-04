@@ -1,31 +1,39 @@
-# git-fs
+# gitfs
 
-FUSE filesystem that mounts a GitHub repository as a read-only local directory, without cloning.
+Mount Mesa repositories as **read-only** local directories without cloning.
 
-## Usage
+`gitfs` is a FUSE-based virtual filesystem ideal for agents, CI pipelines, and
+large monorepos where a full clone is impractical. Supports macOS and Linux.
 
-```bash
-git-fs <org/repo> <mountpoint> --mesa-api-key <KEY> [--ref <REF>]
-```
+> **Alpha Software** — GitFS is early-stage. If you run into issues, please
+> [open an issue](https://github.com/mesa-dot-dev/gitfs/issues).
 
-The API key can also be provided via the `MESA_API_KEY` environment variable:
+## Quick Start
 
-```bash
-export MESA_API_KEY="your-api-key"
-git-fs rust-lang/rust /mnt/rust
-```
-
-Pin to a specific branch, tag, or commit SHA with `--ref`:
+Install from [GitHub
+Releases](https://github.com/mesa-dot-dev/gitfs/releases/latest), then:
 
 ```bash
-git-fs rust-lang/rust /mnt/rust --ref v1.80.0
+gitfs run
 ```
 
-## Requirements
+`gitfs` generates a default config and creates a mount directory automatically.
+Browse any public GitHub repo:
 
-- **macOS**: [macFUSE](https://osxfuse.github.io/)
-- **Linux**: `libfuse` (e.g. `apt install libfuse-dev` or `dnf install fuse-devel`)
+```bash
+ls /run/user/$(id -u)/gitfs/mnt/github/daytonaio/daytona   # Linux
+ls ~/Library/Application\ Support/gitfs/mnt/github/daytonaio/daytona  # macOS
+```
 
-## Architecture
+Hit `Ctrl+C` to stop — `gitfs` cleans up after itself.
 
-FUSE operations are handled by `MesaFS`, which delegates to an inode cache (`SsFs`) backed by the Mesa API via `mesa-dev`. Directory contents and file data are fetched lazily on first access, with request deduplication and speculative prefetching of subdirectories.
+## Documentation
+
+For full documentation — installation for all platforms, configuration, Mesa
+org setup, daemon mode, and more — visit:
+
+**[docs.mesa.dev/content/guides/gitfs](https://docs.mesa.dev/content/guides/gitfs)**
+
+## License
+
+MIT
