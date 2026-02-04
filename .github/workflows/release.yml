@@ -58,8 +58,6 @@ jobs:
             image: ubuntu:22.04
           - name: ubuntu-24.04
             image: ubuntu:24.04
-          - name: ubuntu-24.10
-            image: ubuntu:24.10
     steps:
       - name: Install system dependencies
         run: |
@@ -159,7 +157,7 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          dnf install -y \
+          dnf install -y --allowerasing \
             gcc \
             make \
             pkg-config \
@@ -223,7 +221,7 @@ jobs:
         run: |
           dnf install -y epel-release
           dnf config-manager --set-enabled powertools
-          dnf install -y \
+          dnf install -y --allowerasing \
             gcc \
             make \
             pkg-config \
