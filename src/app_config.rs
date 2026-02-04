@@ -232,13 +232,6 @@ impl Config {
             ));
         }
 
-        if self.mount_point.parent().is_none() {
-            errors.push(format!(
-                "Mount point path '{}' has no parent directory.",
-                self.mount_point.display()
-            ));
-        }
-
         if errors.is_empty() {
             Ok(())
         } else {
