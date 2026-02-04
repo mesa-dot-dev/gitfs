@@ -583,6 +583,7 @@ impl Fs for OrgFs {
                 Ok(icb.children.insert(entries))
             }
             InodeRole::OwnerDir if self.is_github() => {
+                // TODO(MES-674): Cleanup "special" casing for github.
                 return Err(ReadDirError::NotPermitted);
             }
             InodeRole::OwnerDir => {
