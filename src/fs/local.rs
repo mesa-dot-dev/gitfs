@@ -447,11 +447,21 @@ impl Fs for LocalFs {
                 )
             })?,
             fragment_size: stat.fragment_size(),
+            #[allow(clippy::allow_attributes)]
+            #[allow(clippy::useless_conversion)]
             total_blocks: u64::from(stat.blocks()),
+            #[allow(clippy::allow_attributes)]
+            #[allow(clippy::useless_conversion)]
             free_blocks: u64::from(stat.blocks_free()),
+            #[allow(clippy::allow_attributes)]
+            #[allow(clippy::useless_conversion)]
             available_blocks: u64::from(stat.blocks_available()),
             total_inodes: self.inode_table.len() as u64,
+            #[allow(clippy::allow_attributes)]
+            #[allow(clippy::useless_conversion)]
             free_inodes: u64::from(stat.files_free()),
+            #[allow(clippy::allow_attributes)]
+            #[allow(clippy::useless_conversion)]
             available_inodes: u64::from(stat.files_available()),
             filesystem_id: 0,
             mount_flags: 0,
