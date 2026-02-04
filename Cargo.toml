@@ -104,7 +104,7 @@ wildcard_enum_match_arm           = "warn"
 maintainer = "Marko Vejnovic <marko@mesa.dev>"
 section = "utility"
 priority = "optional"
-depends = "libfuse3-3 | libfuse3-3t64"
+depends = "$auto"
 assets = [
     ["target/release/git-fs", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/git-fs/README.md", "644"],
