@@ -407,26 +407,77 @@ impl Fs for OrgFs {
 
         match self.inode_role(parent) {
             InodeRole::OrgRoot => {
-                // Children of org root are repos.
-                let repo_name = name.to_str().ok_or(LookupError::InodeNotFound)?;
-                trace!(repo = repo_name, "lookup: resolving repo");
+                let name_str = name.to_str().ok_or(LookupError::InodeNotFound)?;
 
-                // Validate repo exists via API.
-                let repo = self.client.repos(&self.name).get(repo_name).await?;
+                if self.is_github() {
+                    // name is an owner like "torvalds" — create lazily, no API validation.
+                    trace!(owner = name_str, "lookup: resolving github owner dir");
+                    let (ino, attr) = self.ensure_owner_inode(name_str);
+                    let icb = self
+                        .inode_table
+                        .get_mut(&ino)
+                        .unwrap_or_else(|| unreachable!("inode {ino} was just ensured"));
+                    icb.rc += 1;
+                    Ok(attr)
+                } else {
+                    // Children of org root are repos.
+                    trace!(repo = name_str, "lookup: resolving repo");
 
-                let (ino, attr) =
-                    self.ensure_repo_inode(repo_name, repo_name, &repo.default_branch, Self::ROOT_INO);
+                    // Validate repo exists via API.
+                    let repo = self.client.repos(&self.name).get(name_str).await?;
+
+                    let (ino, attr) = self.ensure_repo_inode(
+                        name_str,
+                        name_str,
+                        &repo.default_branch,
+                        Self::ROOT_INO,
+                    );
+                    let icb = self
+                        .inode_table
+                        .get_mut(&ino)
+                        .unwrap_or_else(|| unreachable!("inode {ino} was just ensured"));
+                    icb.rc += 1;
+                    trace!(
+                        ino,
+                        repo = name_str,
+                        rc = icb.rc,
+                        "lookup: resolved repo inode"
+                    );
+                    Ok(attr)
+                }
+            }
+            InodeRole::OwnerDir => {
+                // Parent is an owner dir, name is a repo like "linux".
+                let owner = self
+                    .owner_inodes
+                    .get(&parent)
+                    .ok_or(LookupError::InodeNotFound)?
+                    .clone();
+                let repo_name_str = name.to_str().ok_or(LookupError::InodeNotFound)?;
+                let full_decoded = format!("{owner}/{repo_name_str}");
+                let encoded = Self::encode_github_repo_name(&full_decoded);
+
+                trace!(
+                    owner = %owner,
+                    repo = repo_name_str,
+                    encoded = %encoded,
+                    "lookup: resolving github repo via owner dir"
+                );
+
+                // Validate via API (uses encoded name).
+                let repo = self.client.repos(&self.name).get(&encoded).await?;
+
+                let (ino, attr) = self.ensure_repo_inode(
+                    &encoded,
+                    repo_name_str,
+                    &repo.default_branch,
+                    parent,
+                );
                 let icb = self
                     .inode_table
                     .get_mut(&ino)
                     .unwrap_or_else(|| unreachable!("inode {ino} was just ensured"));
                 icb.rc += 1;
-                trace!(
-                    ino,
-                    repo = repo_name,
-                    rc = icb.rc,
-                    "lookup: resolved repo inode"
-                );
                 Ok(attr)
             }
             InodeRole::RepoOwned { idx } => {
