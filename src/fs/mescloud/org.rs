@@ -4,6 +4,7 @@ use std::ffi::OsStr;
 use std::time::SystemTime;
 
 use bytes::Bytes;
+use futures::TryStreamExt as _;
 use mesa_dev::Mesa as MesaClient;
 use secrecy::SecretString;
 use tracing::{instrument, trace, warn};
@@ -79,18 +80,14 @@ impl OrgFs {
 
     /// Decode a base64-encoded repo name from the API. Returns "owner/repo".
     /// TODO(MES-674): Cleanup "special" casing for github.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn decode_github_repo_name(encoded: &str) -> Option<String> {
         use base64::Engine as _;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .ok()?;
         let decoded = String::from_utf8(bytes).ok()?;
-        if decoded.contains('/') {
-            Some(decoded)
-        } else {
-            None
-        }
+        decoded.contains('/').then_some(decoded)
     }
 
     /// Encode "owner/repo" to base64 for API calls.
@@ -249,9 +246,9 @@ impl OrgFs {
     /// Ensure an inode + `RepoFs` exists for the given repo name.
     /// Does NOT bump rc.
     ///
-    /// - `repo_name`: name used for API calls / RepoFs (base64-encoded for github)
-    /// - `display_name`: name shown in filesystem ("linux" for github, same as repo_name otherwise)
-    /// - `parent_ino`: owner-dir inode for github, ROOT_INO otherwise
+    /// - `repo_name`: name used for API calls / `RepoFs` (base64-encoded for github)
+    /// - `display_name`: name shown in filesystem ("linux" for github, same as `repo_name` otherwise)
+    /// - `parent_ino`: owner-dir inode for github, `ROOT_INO` otherwise
     fn ensure_repo_inode(
         &mut self,
         repo_name: &str,
@@ -487,12 +484,8 @@ impl Fs for OrgFs {
                 // Validate via API (uses encoded name), waiting for sync if needed.
                 let repo = self.wait_for_sync(&encoded).await?;
 
-                let (ino, attr) = self.ensure_repo_inode(
-                    &encoded,
-                    repo_name_str,
-                    &repo.default_branch,
-                    parent,
-                );
+                let (ino, attr) =
+                    self.ensure_repo_inode(&encoded, repo_name_str, &repo.default_branch, parent);
                 let icb = self
                     .inode_table
                     .get_mut(&ino)
@@ -565,7 +558,6 @@ impl Fs for OrgFs {
                 }
 
                 // List repos via API.
-                use futures::TryStreamExt as _;
                 let repos: Vec<mesa_dev::models::Repo> = self
                     .client
                     .repos(&self.name)
@@ -582,8 +574,12 @@ impl Fs for OrgFs {
 
                 let mut entries = Vec::with_capacity(repo_infos.len());
                 for (repo_name, default_branch) in &repo_infos {
-                    let (repo_ino, _) =
-                        self.ensure_repo_inode(repo_name, repo_name, default_branch, Self::ROOT_INO);
+                    let (repo_ino, _) = self.ensure_repo_inode(
+                        repo_name,
+                        repo_name,
+                        default_branch,
+                        Self::ROOT_INO,
+                    );
                     entries.push(DirEntry {
                         ino: repo_ino,
                         name: repo_name.clone().into(),

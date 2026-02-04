@@ -75,9 +75,7 @@ impl Default for CacheConfig {
 ///
 /// Note that these are publicly exposed and we are comfortable with that, as these keys are
 /// equivalent to read-only access tokens.
-const WELL_KNOWN_ORGS: [(&str, &str); 1] = [
-    ("github", "dp_live_uAgKRbhVNcDiUZXVyTQbBIaJEerhSwQh"),
-];
+const WELL_KNOWN_ORGS: [(&str, &str); 1] = [("github", "dp_live_uAgKRbhVNcDiUZXVyTQbBIaJEerhSwQh")];
 
 fn default_organizations() -> HashMap<String, OrganizationConfig> {
     WELL_KNOWN_ORGS.iter().fold(
@@ -125,7 +123,7 @@ fn serialize_organizations_without_well_known<S>(
 where
     S: serde::Serializer,
 {
-    use serde::ser::SerializeMap;
+    use serde::ser::SerializeMap as _;
 
     let well_known_names: std::collections::HashSet<&str> =
         WELL_KNOWN_ORGS.iter().map(|(name, _)| *name).collect();
@@ -179,7 +177,11 @@ impl Default for DaemonConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Config {
-    #[serde(default = "default_organizations", deserialize_with = "deserialize_organizations_with_defaults", serialize_with = "serialize_organizations_without_well_known")]
+    #[serde(
+        default = "default_organizations",
+        deserialize_with = "deserialize_organizations_with_defaults",
+        serialize_with = "serialize_organizations_without_well_known"
+    )]
     pub organizations: HashMap<String, OrganizationConfig>,
 
     #[serde(default)]
