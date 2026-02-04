@@ -2,7 +2,7 @@ use tokio::select;
 
 use crate::app_config;
 use crate::fs::mescloud::{MesaFS, OrgConfig};
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 mod managed_fuse {
     //! This module feels a little confusing, but it's designed to help you manage the lifecycle of
@@ -140,6 +140,34 @@ mod managed_fuse {
     }
 }
 
+/// Prepares the mount point directory.
+///
+/// - If the directory exists and is non-empty, returns an error.
+/// - If the directory does not exist, creates it (including parents) and logs an info message.
+/// - If the directory exists and is empty, does nothing.
+async fn prepare_mount_point(mount_point: &std::path::Path) -> Result<(), std::io::Error> {
+    match tokio::fs::read_dir(mount_point).await {
+        Ok(mut entries) => {
+            if entries.next_entry().await?.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "Mount point '{}' already exists and is not empty.",
+                        mount_point.display()
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tokio::fs::create_dir_all(mount_point).await?;
+            info!(path = %mount_point.display(), "Created mount point directory.");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 async fn wait_for_exit() -> Result<(), std::io::Error> {
     use tokio::signal;
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
@@ -165,6 +193,8 @@ pub async fn run(
 ) -> Result<(), std::io::Error> {
     // Spawn the cache if it doesn't exist.
     tokio::fs::create_dir_all(&config.cache.path).await?;
+
+    prepare_mount_point(&config.mount_point).await?;
 
     debug!(config = ?config, "Starting git-fs daemon...");
 
