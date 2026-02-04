@@ -8,6 +8,7 @@ use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 mod app_config;
 mod daemon;
 mod fs;
+mod updates;
 
 use crate::app_config::{ConfigPathProvider, ConfigPathProviderTrait as _};
 
