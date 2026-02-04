@@ -72,11 +72,13 @@ impl OrgFs {
     }
 
     /// Whether this org uses the github two-level owner/repo hierarchy.
+    /// TODO(MES-674): Cleanup "special" casing for github.
     fn is_github(&self) -> bool {
         self.name == "github"
     }
 
     /// Decode a base64-encoded repo name from the API. Returns "owner/repo".
+    /// TODO(MES-674): Cleanup "special" casing for github.
     #[allow(dead_code)]
     fn decode_github_repo_name(encoded: &str) -> Option<String> {
         use base64::Engine as _;
@@ -92,13 +94,14 @@ impl OrgFs {
     }
 
     /// Encode "owner/repo" to base64 for API calls.
+    /// TODO(MES-674): Cleanup "special" casing for github.
     fn encode_github_repo_name(decoded: &str) -> String {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD.encode(decoded)
     }
 
-    /// Ensure an inode exists for a virtual owner directory (github only).
-    /// Does NOT bump rc.
+    /// Ensure an inode exists for a virtual owner directory (github only). Does NOT bump rc.
+    /// TODO(MES-674): Cleanup "special" casing for github.
     fn ensure_owner_inode(&mut self, owner: &str) -> (Inode, FileAttr) {
         // Check existing
         for (&ino, existing_owner) in &self.owner_inodes {
@@ -408,6 +411,7 @@ impl Fs for OrgFs {
 
         match self.inode_role(parent) {
             InodeRole::OrgRoot => {
+                // TODO(MES-674): Cleanup "special" casing for github.
                 let name_str = name.to_str().ok_or(LookupError::InodeNotFound)?;
 
                 if self.is_github() {
@@ -448,6 +452,7 @@ impl Fs for OrgFs {
                 }
             }
             InodeRole::OwnerDir => {
+                // TODO(MES-674): Cleanup "special" casing for github.
                 // Parent is an owner dir, name is a repo like "linux".
                 let owner = self
                     .owner_inodes
@@ -540,6 +545,7 @@ impl Fs for OrgFs {
 
         match self.inode_role(ino) {
             InodeRole::OrgRoot => {
+                // TODO(MES-674): Cleanup "special" casing for github.
                 if self.is_github() {
                     return Err(ReadDirError::NotPermitted);
                 }
@@ -576,8 +582,11 @@ impl Fs for OrgFs {
                     .ok_or(ReadDirError::InodeNotFound)?;
                 Ok(icb.children.insert(entries))
             }
-            InodeRole::OwnerDir => {
+            InodeRole::OwnerDir if self.is_github() => {
                 return Err(ReadDirError::NotPermitted);
+            }
+            InodeRole::OwnerDir => {
+                return Err(ReadDirError::NotADirectory);
             }
             InodeRole::RepoOwned { idx } => {
                 // Delegate to repo.
