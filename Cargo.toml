@@ -34,6 +34,10 @@ bytes = "1.11.0"
 bytesize = { version = "2.3.1", features = ["serde"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
 bimap = "0.6.3"
+self_update = { version = "0.42", default-features = false, features = ["rustls"] }
+
+[build-dependencies]
+vergen-gitcl = { version = "1", features = [] }
 
 [lints.rust]
 unsafe_code                = "allow"
