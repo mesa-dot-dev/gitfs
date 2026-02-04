@@ -17,7 +17,7 @@ pub fn check_for_updates() {
 
     let releases = match self_update::backends::github::ReleaseList::configure()
         .repo_owner("mesa-dot-dev")
-        .repo_name("gitfs")
+        .repo_name("git-fs")
         .build()
     {
         Ok(list) => match list.fetch() {
@@ -51,7 +51,7 @@ pub fn check_for_updates() {
         error!(
             "You are running git-fs {running_version}, \
              but the latest release is {latest_version}. \
-             Please update: https://github.com/mesa-dot-dev/gitfs/releases"
+             Please update: https://github.com/mesa-dot-dev/git-fs/releases"
         );
     }
 }

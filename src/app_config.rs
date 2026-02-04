@@ -20,12 +20,12 @@ use serde::{Deserialize, Serialize};
 fn mesa_runtime_dir() -> Option<PathBuf> {
     let runtime_dir = dirs::runtime_dir();
     if let Some(path) = runtime_dir {
-        return Some(path.join("gitfs"));
+        return Some(path.join("git-fs"));
     }
 
     let home_dir = dirs::home_dir();
     if let Some(path) = home_dir {
-        return Some(path.join(".local").join("share").join("gitfs"));
+        return Some(path.join(".local").join("share").join("git-fs"));
     }
 
     None
@@ -33,13 +33,13 @@ fn mesa_runtime_dir() -> Option<PathBuf> {
 
 fn default_pid_file() -> PathBuf {
     mesa_runtime_dir().map_or_else(
-        || PathBuf::from("/var/run/gitfs.pid"),
-        |rd| rd.join("gitfs.pid"),
+        || PathBuf::from("/var/run/git-fs.pid"),
+        |rd| rd.join("git-fs.pid"),
     )
 }
 
 fn default_mount_point() -> PathBuf {
-    mesa_runtime_dir().map_or_else(|| PathBuf::from("/tmp/gitfs/mnt"), |rd| rd.join("mnt"))
+    mesa_runtime_dir().map_or_else(|| PathBuf::from("/tmp/git-fs/mnt"), |rd| rd.join("mnt"))
 }
 
 fn current_uid() -> u32 {
@@ -66,7 +66,7 @@ impl Default for CacheConfig {
         Self {
             max_size: None,
             path: mesa_runtime_dir()
-                .map_or_else(|| PathBuf::from("/tmp/gitfs/cache"), |rd| rd.join("cache")),
+                .map_or_else(|| PathBuf::from("/tmp/git-fs/cache"), |rd| rd.join("cache")),
         }
     }
 }
@@ -160,7 +160,7 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct DaemonConfig {
-    /// The path to the PID file for the daemon. Uses /var/run/gitfs.pid if not specified.
+    /// The path to the PID file for the daemon. Uses /var/run/git-fs.pid if not specified.
     #[serde(default = "default_pid_file")]
     pub pid_file: PathBuf,
 }
@@ -283,7 +283,7 @@ pub trait ConfigPathProviderTrait {
         }
 
         figment
-            .merge(Env::prefixed("MESAFS_"))
+            .merge(Env::prefixed("GIT_FS_"))
             .extract()
             .map_err(Box::new)
     }
@@ -354,17 +354,17 @@ pub trait ConfigPathProviderTrait {
 
 /// Searches for paths according to the following priority:
 ///
-/// - `$XDG_CONFIG_HOME/gitfs/config.toml`
-/// - `$HOME/.config/gitfs/config.toml`
-/// - `/etc/gitfs/config.toml`
+/// - `$XDG_CONFIG_HOME/git-fs/config.toml`
+/// - `$HOME/.config/git-fs/config.toml`
+/// - `/etc/git-fs/config.toml`
 pub struct ConfigPathProvider;
 
 impl ConfigPathProviderTrait for ConfigPathProvider {
     fn get_config_paths() -> impl IntoIterator<Item = impl AsRef<Path>> {
-        let xdg_config_home = dirs::config_dir().map(|p| p.join("gitfs").join("config.toml"));
+        let xdg_config_home = dirs::config_dir().map(|p| p.join("git-fs").join("config.toml"));
         let config_home =
-            dirs::home_dir().map(|p| p.join(".config").join("gitfs").join("config.toml"));
-        let etc_config = Some(PathBuf::from("/etc/gitfs/config.toml"));
+            dirs::home_dir().map(|p| p.join(".config").join("git-fs").join("config.toml"));
+        let etc_config = Some(PathBuf::from("/etc/git-fs/config.toml"));
 
         [xdg_config_home, config_home, etc_config]
             .into_iter()

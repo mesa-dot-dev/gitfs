@@ -4,7 +4,7 @@ version = "0.1.1-alpha.1"
 edition = "2024"
 description = "Mount Mesa, GitHub and Gitlab repositories as local filesystems via FUSE"
 license = "MIT"
-repository = "https://github.com/mesa-dot-dev/gitfs"
+repository = "https://github.com/mesa-dot-dev/git-fs"
 authors = ["Marko Vejnovic <marko@mesa.dev>"]
 
 [dependencies]
