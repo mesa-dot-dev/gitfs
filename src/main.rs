@@ -51,6 +51,8 @@ fn main() {
         .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
         .init();
 
+    updates::check_for_updates();
+
     let args = Args::parse();
     let config =
         ConfigPathProvider::load_or_create(args.config_path.as_deref()).unwrap_or_else(|e| {
