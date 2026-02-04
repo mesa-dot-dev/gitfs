@@ -154,6 +154,9 @@ jobs:
           - name: fedora-42
             image: fedora:42
             setup: "true"
+          - name: fedora-43
+            image: fedora:43
+            setup: "true"
     steps:
       - name: Setup extra repositories
         run: ${{ matrix.distro.setup }}
