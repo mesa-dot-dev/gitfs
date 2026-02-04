@@ -71,6 +71,86 @@ impl OrgFs {
         &self.name
     }
 
+    /// Whether this org uses the github two-level owner/repo hierarchy.
+    fn is_github(&self) -> bool {
+        self.name == "github"
+    }
+
+    /// Decode a base64-encoded repo name from the API. Returns "owner/repo".
+    fn decode_github_repo_name(encoded: &str) -> Option<String> {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .ok()?;
+        let decoded = String::from_utf8(bytes).ok()?;
+        if decoded.contains('/') {
+            Some(decoded)
+        } else {
+            None
+        }
+    }
+
+    /// Encode "owner/repo" to base64 for API calls.
+    fn encode_github_repo_name(decoded: &str) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(decoded)
+    }
+
+    /// Ensure an inode exists for a virtual owner directory (github only).
+    /// Does NOT bump rc.
+    fn ensure_owner_inode(&mut self, owner: &str) -> (Inode, FileAttr) {
+        // Check existing
+        for (&ino, existing_owner) in &self.owner_inodes {
+            if existing_owner == owner {
+                if let Some(icb) = self.inode_table.get(&ino)
+                    && let Some(attr) = icb.attr
+                {
+                    return (ino, attr);
+                }
+                let now = SystemTime::now();
+                let attr = FileAttr::Directory {
+                    common: common::make_common_file_attr(
+                        self.fs_owner,
+                        Self::BLOCK_SIZE,
+                        ino,
+                        0o755,
+                        now,
+                        now,
+                    ),
+                };
+                common::cache_attr(&mut self.inode_table, ino, attr);
+                return (ino, attr);
+            }
+        }
+
+        // Allocate new
+        let ino = self.inode_factory.allocate();
+        let now = SystemTime::now();
+        self.inode_table.insert(
+            ino,
+            InodeControlBlock {
+                rc: 0,
+                path: owner.into(),
+                parent: Some(Self::ROOT_INO),
+                children: None,
+                attr: None,
+            },
+        );
+        self.owner_inodes.insert(ino, owner.to_owned());
+        let attr = FileAttr::Directory {
+            common: common::make_common_file_attr(
+                self.fs_owner,
+                Self::BLOCK_SIZE,
+                ino,
+                0o755,
+                now,
+                now,
+            ),
+        };
+        common::cache_attr(&mut self.inode_table, ino, attr);
+        (ino, attr)
+    }
+
     /// Get the cached attr for an inode, if present.
     pub(crate) fn inode_table_get_attr(&self, ino: Inode) -> Option<FileAttr> {
         self.inode_table.get(&ino).and_then(|icb| icb.attr)
