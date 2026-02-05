@@ -67,3 +67,31 @@ check_deps() {
         error "curl is required but not found. Install it with your package manager."
     fi
 }
+
+# --- OS detection ---
+detect_os() {
+    case "$(uname -s)" in
+        Darwin)
+            printf "\n"
+            info "${BOLD}git-fs installer${RESET}"
+            printf "\n"
+            warn "macOS is not yet supported by this install script."
+            info "Download manually from:"
+            info "  ${BASE_URL}/git-fs-macos-universal.tar.gz"
+            printf "\n"
+            exit 0
+            ;;
+        Linux) OS=linux ;;
+        *) error "Unsupported operating system: $(uname -s)" ;;
+    esac
+}
+
+# --- Architecture detection ---
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64)  ARCH_DEB=amd64;  ARCH_RPM=x86_64;  ARCH_TAR=amd64 ;;
+        aarch64) ARCH_DEB=arm64;  ARCH_RPM=aarch64;  ARCH_TAR=arm64 ;;
+        arm64)   ARCH_DEB=arm64;  ARCH_RPM=aarch64;  ARCH_TAR=arm64 ;;
+        *) error "Unsupported architecture: $(uname -m)" ;;
+    esac
+}
