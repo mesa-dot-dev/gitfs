@@ -256,9 +256,7 @@ impl Config {
 
     /// Finds the first existing config file from search paths.
     fn find_config_file() -> Option<PathBuf> {
-        Self::config_search_paths()
-            .into_iter()
-            .find(|p| p.exists())
+        Self::config_search_paths().into_iter().find(|p| p.exists())
     }
 
     /// Loads config from a single TOML file.
@@ -302,14 +300,15 @@ impl Config {
                 }
 
                 // No config exists — create default at highest-priority path
-                let creation_path = Self::config_search_paths()
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| {
-                        Box::<dyn std::error::Error>::from(
-                            "No valid path available for creating config file",
-                        )
-                    })?;
+                let creation_path =
+                    Self::config_search_paths()
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            Box::<dyn std::error::Error>::from(
+                                "No valid path available for creating config file",
+                            )
+                        })?;
 
                 info!(path = ?creation_path, "Creating default config...");
                 Self::create_default_at(&creation_path)
@@ -320,9 +319,8 @@ impl Config {
     fn create_default_at(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
         let config = Config::default();
 
-        let content = toml::to_string_pretty(&config).map_err(|e| {
-            format!("Failed to serialize default config: {e}")
-        })?;
+        let content = toml::to_string_pretty(&config)
+            .map_err(|e| format!("Failed to serialize default config: {e}"))?;
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {

@@ -54,11 +54,10 @@ fn main() {
     updates::check_for_updates();
 
     let args = Args::parse();
-    let config =
-        Config::load_or_create(args.config_path.as_deref()).unwrap_or_else(|e| {
-            error!("Failed to load configuration: {e}");
-            std::process::exit(1);
-        });
+    let config = Config::load_or_create(args.config_path.as_deref()).unwrap_or_else(|e| {
+        error!("Failed to load configuration: {e}");
+        std::process::exit(1);
+    });
     if let Err(error_messages) = config.validate() {
         error!("Configuration is invalid.");
         for msg in &error_messages {
