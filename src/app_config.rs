@@ -376,25 +376,15 @@ impl Config {
                     .next()
                     .ok_or(ConfigError::NoSuitableConfigPath)?;
 
-                Self::create_default_at(&creation_path)
+                match onboarding::run_wizard() {
+                    Ok(config) => {
+                        config.dangerously_write_to_disk(&creation_path)?;
+                        info!(path = ?creation_path.display(), "Created configuration file.");
+                        Ok(config)
+                    }
+                    Err(e) => Err(ConfigError::OnboardingError(e)),
+                }
             }
-        }
-    }
-
-    fn create_default_at(path: &Path) -> Result<Self, ConfigError> {
-        use std::io::IsTerminal as _;
-
-        if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
-            return Err(ConfigError::TerminalRequired);
-        }
-
-        match onboarding::run_wizard() {
-            Ok(config) => {
-                config.dangerously_write_to_disk(path)?;
-                info!(path = ?path.display(), "Created configuration file.");
-                Ok(config)
-            }
-            Err(e) => Err(ConfigError::OnboardingError(e)),
         }
     }
 
