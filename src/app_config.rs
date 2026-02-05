@@ -3,7 +3,8 @@
 //! User configurations may be specified in a configuration file.
 
 use bytesize::ByteSize;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret as _, SecretString};
+use thiserror::Error;
 use tracing::{debug, info};
 
 use std::{
@@ -12,6 +13,8 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+
+use crate::onboarding::{self, OnboardingError};
 
 fn mesa_runtime_dir() -> Option<PathBuf> {
     let runtime_dir = dirs::runtime_dir();
@@ -67,6 +70,16 @@ impl Default for CacheConfig {
     }
 }
 
+trait WithApiKey {
+    fn with_api_key(key: SecretString) -> Self;
+}
+
+impl WithApiKey for OrganizationConfig {
+    fn with_api_key(key: SecretString) -> Self {
+        Self { api_key: key }
+    }
+}
+
 /// Well-known organizations and their default API keys.
 ///
 /// Note that these are publicly exposed and we are comfortable with that, as these keys are
@@ -90,34 +103,32 @@ fn default_organizations() -> HashMap<String, OrganizationConfig> {
 
 /// Deserializes the organizations map, then ensures the default GitHub entry
 /// is always present (without overwriting a user-provided one).
-fn deserialize_organizations_with_defaults<'de, D>(
+fn deserialize_organizations_with_defaults<'de, D, K, V>(
     deserializer: D,
-) -> Result<HashMap<String, OrganizationConfig>, D::Error>
+) -> Result<HashMap<K, V>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    K: Deserialize<'de> + Eq + std::hash::Hash + From<String>,
+    V: Deserialize<'de> + WithApiKey,
 {
-    Ok(WELL_KNOWN_ORGS.iter().fold(
-        HashMap::<String, OrganizationConfig>::deserialize(deserializer)?,
-        |mut acc, (name, api_key)| {
-            acc.insert(
-                name.to_string(),
-                OrganizationConfig {
-                    api_key: SecretString::from(api_key.to_string()),
-                },
-            );
-            acc
-        },
-    ))
+    let mut map = HashMap::<K, V>::deserialize(deserializer)?;
+    for (name, api_key) in &WELL_KNOWN_ORGS {
+        map.entry(K::from((*name).to_owned()))
+            .or_insert_with(|| V::with_api_key(SecretString::from((*api_key).to_owned())));
+    }
+    Ok(map)
 }
 
 /// Serializes the organizations map, excluding well-known organizations so they
 /// don't get written to the config file.
-fn serialize_organizations_without_well_known<S>(
-    organizations: &HashMap<String, OrganizationConfig>,
+fn serialize_organizations_without_well_known<S, K, V>(
+    organizations: &HashMap<K, V>,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
+    K: AsRef<str> + Serialize + Eq + std::hash::Hash,
+    V: Serialize,
 {
     use serde::ser::SerializeMap as _;
 
@@ -126,7 +137,7 @@ where
 
     let filtered: Vec<_> = organizations
         .iter()
-        .filter(|(key, _)| !well_known_names.contains(key.as_str()))
+        .filter(|(key, _)| !well_known_names.contains(key.as_ref()))
         .collect();
 
     let mut map = serializer.serialize_map(Some(filtered.len()))?;
@@ -150,6 +161,21 @@ where
     S: serde::Serializer,
 {
     serializer.serialize_str("****")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct DangerousOrganizationConfig<'a> {
+    /// The API key to use for this organization.
+    pub api_key: &'a str,
+}
+
+impl<'a> From<&'a OrganizationConfig> for DangerousOrganizationConfig<'a> {
+    fn from(org: &'a OrganizationConfig) -> Self {
+        Self {
+            api_key: org.api_key.expose_secret(),
+        }
+    }
 }
 
 /// Daemon configuration.
@@ -199,6 +225,38 @@ pub struct Config {
     pub gid: u32,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct DangerousConfig<'a> {
+    pub organizations: HashMap<&'a str, DangerousOrganizationConfig<'a>>,
+    pub cache: &'a CacheConfig,
+    pub daemon: &'a DaemonConfig,
+    pub mount_point: &'a Path,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl<'a> From<&'a Config> for DangerousConfig<'a> {
+    fn from(config: &'a Config) -> Self {
+        let well_known_names: std::collections::HashSet<&str> =
+            WELL_KNOWN_ORGS.iter().map(|(name, _)| *name).collect();
+
+        Self {
+            organizations: config
+                .organizations
+                .iter()
+                .filter(|(k, _)| !well_known_names.contains(k.as_str()))
+                .map(|(k, v)| (k.as_str(), DangerousOrganizationConfig::from(v)))
+                .collect(),
+            cache: &config.cache,
+            daemon: &config.daemon,
+            mount_point: &config.mount_point,
+            uid: config.uid,
+            gid: config.gid,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -210,6 +268,30 @@ impl Default for Config {
             gid: current_gid(),
         }
     }
+}
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("Configuration validation errors: {0:?}")]
+    ValidationErrors(Vec<String>),
+
+    #[error("Failed to onboard: {0}")]
+    OnboardingError(OnboardingError),
+
+    #[error("Serialization error: {0}")]
+    SerializationError(#[from] toml::ser::Error),
+
+    #[error("Deserialization error: {0}")]
+    DeserializationError(#[from] toml::de::Error),
+
+    #[error("I/O error: {0}")]
+    IoError(#[from] std::io::Error),
+
+    #[error("Config parent directory does not exist.")]
+    NoParentDir,
+
+    #[error("No suitable configuration path found.")]
+    NoSuitableConfigPath,
 }
 
 impl Config {
@@ -254,13 +336,8 @@ impl Config {
         paths
     }
 
-    /// Finds the first existing config file from search paths.
-    fn find_config_file() -> Option<PathBuf> {
-        Self::config_search_paths().into_iter().find(|p| p.exists())
-    }
-
     /// Loads config from a single TOML file.
-    fn load_from_file(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+    fn load_from_file(path: &Path) -> Result<Self, ConfigError> {
         debug!(path = ?path, "Loading configuration file.");
         let content = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&content)?;
@@ -268,76 +345,51 @@ impl Config {
     }
 
     /// Loads configuration from the first found config file, or the external path if given.
-    pub fn load(external_config_path: Option<&Path>) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load(
+        external_config_path: Option<&Path>,
+    ) -> Option<Result<(Self, PathBuf), ConfigError>> {
         if let Some(path) = external_config_path {
-            return Self::load_from_file(path);
+            return Some(Self::load_from_file(path).map(|cfg| (cfg, path.to_path_buf())));
         }
 
-        match Self::find_config_file() {
-            Some(path) => Self::load_from_file(&path),
-            None => Err("No configuration file found in any search path".into()),
+        let search_paths = Self::config_search_paths();
+        if let Some(path) = search_paths.iter().find(|p| p.exists()) {
+            Some(Self::load_from_file(path).map(|cfg| (cfg, path.clone())))
+        } else {
+            info!(tried = ?search_paths, "No configuration file found.");
+            None
         }
     }
 
     /// Loads config or creates a default if none exists.
     /// Errors if a config file exists but is malformed.
-    pub fn load_or_create(
-        external_config_path: Option<&Path>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        match Self::load(external_config_path) {
-            Ok(config) => {
-                debug!("Loaded configuration successfully.");
-                Ok(config)
+    pub fn load_or_create(external_config_path: Option<&Path>) -> Result<Self, ConfigError> {
+        if let Some(res) = Self::load(external_config_path) {
+            let (config, path) = res?;
+            if let Err(validation_errors) = config.validate() {
+                return Err(ConfigError::ValidationErrors(validation_errors));
             }
-            Err(e) => {
-                if external_config_path.is_some() {
-                    return Err(e);
-                }
-
-                // If a file exists, it's malformed — return the parse error
-                if Self::find_config_file().is_some() {
-                    return Err(e);
-                }
-
-                // No config exists — create default at highest-priority path
-                let creation_path =
-                    Self::config_search_paths()
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| {
-                            Box::<dyn std::error::Error>::from(
-                                "No valid path available for creating config file",
-                            )
-                        })?;
-
-                info!(path = ?creation_path, "Creating default config...");
-                Self::create_default_at(&creation_path)
-            }
+            info!(path = %path.display(), "Loaded config file.");
+            return Ok(config);
         }
+
+        // No config exists — create default at highest-priority path
+        let creation_path = Self::config_search_paths()
+            .into_iter()
+            .next()
+            .ok_or(ConfigError::NoSuitableConfigPath)?;
+
+        let config = onboarding::run_wizard().map_err(ConfigError::OnboardingError)?;
+        config.dangerously_write_to_disk(&creation_path)?;
+        info!(path = ?creation_path.display(), "Created configuration file.");
+        Ok(config)
     }
 
-    fn create_default_at(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let config = Self::default();
-
-        let content = toml::to_string_pretty(&config)
-            .map_err(|e| format!("Failed to serialize default config: {e}"))?;
-
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                format!(
-                    "Failed to create config directory '{}': {e}",
-                    parent.display()
-                )
-            })?;
-        }
-
-        std::fs::write(path, &content).map_err(|e| {
-            format!(
-                "Failed to write default config file to '{}': {e}",
-                path.display()
-            )
-        })?;
-
-        Ok(config)
+    fn dangerously_write_to_disk(&self, path: &Path) -> Result<(), ConfigError> {
+        let dangerous_config = DangerousConfig::from(self);
+        let toml_str = toml::to_string_pretty(&dangerous_config)?;
+        std::fs::create_dir_all(path.parent().ok_or(ConfigError::NoParentDir)?)?;
+        std::fs::write(path, toml_str)?;
+        Ok(())
     }
 }
