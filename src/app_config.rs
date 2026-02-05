@@ -332,11 +332,6 @@ impl Config {
         paths
     }
 
-    /// Finds the first existing config file from search paths.
-    fn find_config_file() -> Option<PathBuf> {
-        Self::config_search_paths().into_iter().find(|p| p.exists())
-    }
-
     /// Loads config from a single TOML file.
     fn load_from_file(path: &Path) -> Result<Self, ConfigError> {
         debug!(path = ?path, "Loading configuration file.");
@@ -346,23 +341,31 @@ impl Config {
     }
 
     /// Loads configuration from the first found config file, or the external path if given.
-    pub fn load(external_config_path: Option<&Path>) -> Option<Result<Self, ConfigError>> {
+    pub fn load<'a>(
+        external_config_path: Option<Path>,
+    ) -> Option<Result<(Self, PathBuf), ConfigError>> {
         if let Some(path) = external_config_path {
-            return Some(Self::load_from_file(path));
+            return Some(Self::load_from_file(path).map(|cfg| (cfg, PathBuf::from(path))));
         }
 
-        Self::find_config_file().map(|path| Self::load_from_file(&path))
+        let search_paths = Self::config_search_paths();
+        if let Some(path) = search_paths.iter().find(|p| p.exists()) {
+            Some(Self::load_from_file(&path).map(|cfg| (cfg, path)))
+        } else {
+            info!(tried = ?search_paths, "No configuration file found.");
+            None
+        }
     }
 
     /// Loads config or creates a default if none exists.
     /// Errors if a config file exists but is malformed.
     pub fn load_or_create(external_config_path: Option<&Path>) -> Result<Self, ConfigError> {
-        if let Some(res) = Self::load(external_config_path) {
+        if let Some((res, path)) = Self::load(external_config_path) {
             let config = res?;
             if let Err(validation_errors) = config.validate() {
                 return Err(ConfigError::ValidationErrors(validation_errors));
             }
-            debug!("Loaded configuration successfully.");
+            info!(path = path.display(), "Loaded config file.");
             return Ok(config);
         }
 

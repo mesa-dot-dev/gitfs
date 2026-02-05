@@ -1,11 +1,23 @@
 //! Interactive onboarding wizard for first-time configuration.
 
-use std::path::PathBuf;
+use std::{io::IsTerminal, path::PathBuf};
 
 use inquire::{Confirm, Password, Text, validator::Validation};
 use secrecy::SecretString;
 
 use crate::app_config::{Config, OrganizationConfig};
+
+const WELCOME_MESSAGE: &str = "
+    \x1b[32m@@@@\x1b[0m      Welcome to \x1b[1mgit-fs\x1b[0m! Let's get you started!
+    \x1b[32m@@@@ @@@\x1b[0m
+    \x1b[32m@@@@ @@@\x1b[0m  \x1b[1mgit-fs\x1b[0m allows you to mount all of GitHub on your local filesystem.
+\x1b[32m@@@ @@@@@@@@\x1b[0m  It works by mirroring GitHub repositories to fast caches hosted on \x1b]8;;https://mesa.dev\x1b\\\x1b[1mmesa.dev\x1b[0m\x1b]8;;\x1b\\.
+ \x1b[32m@@@@@@@@@@\x1b[0m
+  \x1b[32m@@@@@@@@\x1b[0m
+    \x1b[32m@@@@\x1b[0m      Mesa ships a fast on-demand VCS, optimized for agentic AI.
+    \x1b[32m@@@@\x1b[0m      You do not need to use Mesa products to use \x1b[1mgit-fs\x1b[0m, but if you
+    \x1b[32m@@@@\x1b[0m      like \x1b[1mgit-fs\x1b[0m, we're sure you're going to love \x1b]8;;https://mesa.dev\x1b\\\x1b[1mmesa.dev\x1b[0m\x1b]8;;\x1b\\.
+";
 
 /// Error type for onboarding wizard failures.
 #[derive(Debug, thiserror::Error)]
@@ -13,6 +25,9 @@ pub enum OnboardingError {
     /// An error occurred while prompting the user.
     #[error("Prompt error: {0}")]
     Prompt(#[from] inquire::InquireError),
+
+    #[error("Terminal is not interactive")]
+    NonInteractive,
 }
 
 /// Runs the interactive onboarding wizard.
@@ -23,23 +38,26 @@ pub enum OnboardingError {
 ///
 /// Returns `OnboardingError::Prompt` on inquire errors.
 pub fn run_wizard() -> Result<Config, OnboardingError> {
-    println!("Welcome to git-fs! Let's set up your configuration.\n");
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        return Err(OnboardingError::NonInteractive);
+    }
+
+    println!("{}", WELCOME_MESSAGE);
 
     let defaults = Config::default();
 
-    // 1. Mount point
     let mount_point_str = Text::new("Where should git-fs mount the filesystem?")
         .with_default(&defaults.mount_point.display().to_string())
         .prompt()?;
     let mount_point = PathBuf::from(mount_point_str);
 
-    // 2. Organizations (loop)
     let mut org_keys: Vec<(String, SecretString)> = Vec::new();
-
     loop {
-        let add_org = Confirm::new("Would you like to add an organization?")
+        let add_org = Confirm::new("Would you like to add Mesa organizations?")
             .with_default(false)
-            .with_help_message("Organizations connect git-fs to Mesa, GitLab, or other providers.")
+            .with_help_message(
+                "If all you're trying to do is mount public GitHub repos, you can skip this step.",
+            )
             .prompt()?;
 
         if !add_org {
@@ -47,13 +65,14 @@ pub fn run_wizard() -> Result<Config, OnboardingError> {
         }
 
         let org_name = Text::new("Organization name:")
-            .with_help_message("e.g. 'mesa', 'my-gitlab'")
+            .with_help_message("e.g. 'tyrell-corp', 'globex'")
             .with_validator(|input: &str| {
                 if input.is_empty() {
                     return Ok(Validation::Invalid(
                         "Organization name cannot be empty.".into(),
                     ));
                 }
+                // TODO(markovejnovic): I don't know if this is correct.
                 if input.contains(['.', '[', ']', '"', '\'', ' ']) {
                     return Ok(Validation::Invalid(
                         "Organization name cannot contain '.', '[', ']', '\"', '\\'', or spaces."
