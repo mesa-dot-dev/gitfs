@@ -260,15 +260,15 @@ impl Config {
     }
 
     /// Loads config from a single TOML file.
-    fn load_from_file(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
+    fn load_from_file(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         debug!(path = ?path, "Loading configuration file.");
         let content = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)?;
+        let config: Self = toml::from_str(&content)?;
         Ok(config)
     }
 
     /// Loads configuration from the first found config file, or the external path if given.
-    pub fn load(external_config_path: Option<&Path>) -> Result<Config, Box<dyn std::error::Error>> {
+    pub fn load(external_config_path: Option<&Path>) -> Result<Self, Box<dyn std::error::Error>> {
         if let Some(path) = external_config_path {
             return Self::load_from_file(path);
         }
@@ -283,7 +283,7 @@ impl Config {
     /// Errors if a config file exists but is malformed.
     pub fn load_or_create(
         external_config_path: Option<&Path>,
-    ) -> Result<Config, Box<dyn std::error::Error>> {
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         match Self::load(external_config_path) {
             Ok(config) => {
                 debug!("Loaded configuration successfully.");
@@ -316,8 +316,8 @@ impl Config {
         }
     }
 
-    fn create_default_at(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
-        let config = Config::default();
+    fn create_default_at(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let config = Self::default();
 
         let content = toml::to_string_pretty(&config)
             .map_err(|e| format!("Failed to serialize default config: {e}"))?;
