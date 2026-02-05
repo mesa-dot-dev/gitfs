@@ -52,6 +52,7 @@ mod managed_fuse {
                 fuser::MountOption::Exec,
                 fuser::MountOption::AutoUnmount,
                 fuser::MountOption::DefaultPermissions,
+                fuser::MountOption::AllowOther,
             ];
 
             fuser::spawn_mount2(fuse_adapter, config.mount_point, &mount_opts)
