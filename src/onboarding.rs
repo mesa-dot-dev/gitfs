@@ -1,6 +1,6 @@
 //! Interactive onboarding wizard for first-time configuration.
 
-use std::{io::IsTerminal, path::PathBuf};
+use std::{io::IsTerminal as _, path::PathBuf};
 
 use inquire::{Confirm, Password, Text, validator::Validation};
 use secrecy::SecretString;
@@ -42,7 +42,7 @@ pub fn run_wizard() -> Result<Config, OnboardingError> {
         return Err(OnboardingError::NonInteractive);
     }
 
-    println!("{}", WELCOME_MESSAGE);
+    println!("{WELCOME_MESSAGE}");
 
     let defaults = Config::default();
 

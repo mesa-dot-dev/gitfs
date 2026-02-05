@@ -341,16 +341,16 @@ impl Config {
     }
 
     /// Loads configuration from the first found config file, or the external path if given.
-    pub fn load<'a>(
-        external_config_path: Option<Path>,
+    pub fn load(
+        external_config_path: Option<&Path>,
     ) -> Option<Result<(Self, PathBuf), ConfigError>> {
         if let Some(path) = external_config_path {
-            return Some(Self::load_from_file(path).map(|cfg| (cfg, PathBuf::from(path))));
+            return Some(Self::load_from_file(path).map(|cfg| (cfg, path.to_path_buf())));
         }
 
         let search_paths = Self::config_search_paths();
         if let Some(path) = search_paths.iter().find(|p| p.exists()) {
-            Some(Self::load_from_file(&path).map(|cfg| (cfg, path)))
+            Some(Self::load_from_file(path).map(|cfg| (cfg, path.clone())))
         } else {
             info!(tried = ?search_paths, "No configuration file found.");
             None
@@ -360,12 +360,12 @@ impl Config {
     /// Loads config or creates a default if none exists.
     /// Errors if a config file exists but is malformed.
     pub fn load_or_create(external_config_path: Option<&Path>) -> Result<Self, ConfigError> {
-        if let Some((res, path)) = Self::load(external_config_path) {
-            let config = res?;
+        if let Some(res) = Self::load(external_config_path) {
+            let (config, path) = res?;
             if let Err(validation_errors) = config.validate() {
                 return Err(ConfigError::ValidationErrors(validation_errors));
             }
-            info!(path = path.display(), "Loaded config file.");
+            info!(path = %path.display(), "Loaded config file.");
             return Ok(config);
         }
 
