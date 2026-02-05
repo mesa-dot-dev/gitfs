@@ -1,6 +1,6 @@
 //! Checks whether the running binary is the latest released version.
 
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 /// The git SHA baked in at compile time by `vergen-gitcl`.
 const BUILD_SHA: &str = env!("VERGEN_GIT_SHA");
@@ -39,19 +39,51 @@ pub fn check_for_updates() {
         return;
     };
 
-    // Release name format: "git-fs 0.1.1-alpha+172e35d"
-    let latest_version = stable.name.strip_prefix("git-fs ").unwrap_or(&stable.name);
+    let latest_version = extract_version_from_release_name(&stable.name);
 
-    // TODO(ME-672): This check is technically wrong, since it checks for equality, but some users
-    // may be running canary/dev, which may be more recent. We should ideally parse semver and
-    // compare properly.
-    if running_version == latest_version {
-        info!("You are running the latest version ({running_version}).");
-    } else {
+    let (Some(running_ver), Some(latest_ver)) = (
+        semver::Version::parse(&running_version).ok(),
+        semver::Version::parse(latest_version).ok(),
+    ) else {
         error!(
-            "You are running git-fs {running_version}, \
-             but the latest release is {latest_version}. \
-             Please update: https://github.com/mesa-dot-dev/git-fs/releases"
+            version = running_version,
+            latest_version = latest_version,
+            "Could not parse version strings for comparison. If you are seeing this, it's a \
+                bug. Please report it on https://github.com/mesa-dot-dev/git-fs/issues."
         );
+        return;
+    };
+
+    match running_ver.cmp_precedence(&latest_ver) {
+        std::cmp::Ordering::Equal => {
+            debug!(version = running_version, "Using latest version.");
+        }
+        std::cmp::Ordering::Greater => {
+            warn!(
+                version = running_version,
+                "git-fs is ahead of the latest stable release. \
+                 This version is considered unstable."
+            );
+        }
+        std::cmp::Ordering::Less => {
+            error!(
+                version = running_version,
+                latest_version = latest_version,
+                "You are running git-fs {running_version}, \
+                 but the latest release is {latest_version}. \
+                 Please update: https://github.com/mesa-dot-dev/git-fs/releases"
+            );
+        }
     }
+}
+
+/// Extract the semver version string from a GitHub release name.
+///
+/// Strips the `"git-fs "` prefix and optional `" (canary)"` suffix.
+/// If the prefix is not present, returns the full name unchanged.
+fn extract_version_from_release_name(name: &str) -> &str {
+    let without_prefix = name.strip_prefix("git-fs ").unwrap_or(name);
+    without_prefix
+        .strip_suffix(" (canary)")
+        .unwrap_or(without_prefix)
 }

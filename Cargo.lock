@@ -695,6 +695,7 @@ dependencies = [
  "scc",
  "secrecy",
  "self_update",
+ "semver",
  "serde",
  "serde_json",
  "thiserror",
