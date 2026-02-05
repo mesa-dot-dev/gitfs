@@ -2,13 +2,11 @@
 # shellcheck disable=SC1091  # /etc/os-release is not available at lint time
 set -eu
 
-# --- Constants ---
 BASE_URL="https://github.com/mesa-dot-dev/git-fs/releases/latest/download"
 DEFAULT_INSTALL_DIR="/usr/local/bin"
 AUTO_YES=false
 TMPDIR=""
 
-# --- Colors (only when stdout is a terminal) ---
 if [ -t 1 ]; then
     RED='\033[0;31m'
     GREEN='\033[0;32m'
@@ -20,13 +18,11 @@ else
     RED='' GREEN='' CYAN='' YELLOW='' BOLD='' RESET=''
 fi
 
-# --- Output helpers ---
 info()    { printf "%b-->%b %b\n" "${CYAN}" "${RESET}" "$1"; }
 success() { printf "%b-->%b %b\n" "${GREEN}" "${RESET}" "$1"; }
 warn()    { printf "%b-->%b %b\n" "${YELLOW}" "${RESET}" "$1" >&2; }
 error()   { printf "%b-->%b %b\n" "${RED}" "${RESET}" "$1" >&2; exit 1; }
 
-# --- Cleanup ---
 cleanup() {
     if [ -n "${TMPDIR}" ] && [ -d "${TMPDIR}" ]; then
         rm -rf "${TMPDIR}"
@@ -34,7 +30,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- Sudo wrapper ---
 sudo_cmd() {
     _uid=$(id -u)
     if [ "${_uid}" -eq 0 ]; then
@@ -44,7 +39,6 @@ sudo_cmd() {
     fi
 }
 
-# --- Argument parsing ---
 parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -63,14 +57,12 @@ parse_args() {
     done
 }
 
-# --- Dependency checks ---
 check_deps() {
     if ! command -v curl >/dev/null 2>&1; then
         error "curl is required but not found. Install it with your package manager."
     fi
 }
 
-# --- OS detection ---
 detect_os() {
     _os=$(uname -s)
     case "${_os}" in
@@ -86,7 +78,6 @@ detect_os() {
     esac
 }
 
-# --- Architecture detection (prints: deb_arch rpm_arch tar_arch) ---
 detect_arch() {
     _machine=$(uname -m)
     case "${_machine}" in
@@ -97,7 +88,6 @@ detect_arch() {
     esac
 }
 
-# --- Distro detection (prints: pkg_type distro_name distro_id distro_version) ---
 detect_distro() {
     if [ ! -f /etc/os-release ]; then
         echo "tarball"
@@ -147,7 +137,6 @@ detect_distro() {
     esac
 }
 
-# --- Tarball fallback prompting (prints: install_dir) ---
 prompt_tarball_install() {
     _auto_yes="$1" _distro_id="$2" _distro_ver="$3"
     _install_dir="${DEFAULT_INSTALL_DIR}"
@@ -190,7 +179,6 @@ prompt_tarball_install() {
     echo "${_install_dir}"
 }
 
-# --- Build filename (prints: filename) ---
 build_filename() {
     _pkg_type="$1" _distro="$2" _arch_deb="$3" _arch_rpm="$4" _arch_tar="$5"
     case "${_pkg_type}" in
@@ -201,7 +189,6 @@ build_filename() {
     esac
 }
 
-# --- Download (sets global TMPDIR for cleanup trap) ---
 download() {
     _filename="$1" _url="$2"
     TMPDIR=$(mktemp -d)
@@ -210,7 +197,6 @@ download() {
         || error "Download failed. Check your internet connection and try again."
 }
 
-# --- Install (takes: pkg_type filepath [install_dir]) ---
 install_package() {
     _pkg_type="$1" _filepath="$2" _install_dir="${3:-}"
     case "${_pkg_type}" in
@@ -240,7 +226,6 @@ install_package() {
     esac
 }
 
-# --- Verify ---
 verify_install() {
     if command -v git-fs >/dev/null 2>&1; then
         _version=$(git-fs --version 2>/dev/null || echo "unknown")
@@ -250,7 +235,6 @@ verify_install() {
     fi
 }
 
-# --- Main ---
 main() {
     parse_args "$@"
     check_deps
@@ -261,7 +245,6 @@ main() {
 
     detect_os
 
-    # -- Detect environment --
     arch=$(detect_arch)
     arch_deb=$(echo "${arch}" | cut -d' ' -f1)
     arch_rpm=$(echo "${arch}" | cut -d' ' -f2)
@@ -273,19 +256,16 @@ main() {
     distro_id=$(echo "${distro_info}" | cut -d' ' -f3)
     distro_ver=$(echo "${distro_info}" | cut -d' ' -f4)
 
-    # -- Tarball fallback --
     install_dir="${DEFAULT_INSTALL_DIR}"
     if [ "${pkg_type}" = "tarball" ]; then
         install_dir=$(prompt_tarball_install "${AUTO_YES}" "${distro_id:-_}" "${distro_ver:-}")
     fi
 
-    # -- Require root in non-interactive mode --
     _uid=$(id -u)
     if [ "${AUTO_YES}" = true ] && [ "${_uid}" -ne 0 ]; then
         error "Non-interactive mode requires root. Re-run with: sudo $0 -y"
     fi
 
-    # -- Build URL, download, install --
     filename=$(build_filename "${pkg_type}" "${distro}" "${arch_deb}" "${arch_rpm}" "${arch_tar}")
     url="${BASE_URL}/${filename}"
 
