@@ -47,10 +47,26 @@ enum Command {
 
 /// Main entry point for the application.
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
-        .init();
+    let is_debug = std::env::var("RUST_LOG").is_ok();
+
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
+    if is_debug {
+        // Verbose format for developers: timestamps, targets, span events
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
+            .init();
+    } else {
+        // Clean format for users: no timestamps, no targets, no span noise
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(false)
+            .with_level(false)
+            .without_time()
+            .init();
+    }
 
     updates::check_for_updates();
 
