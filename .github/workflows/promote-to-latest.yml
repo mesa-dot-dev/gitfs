@@ -153,14 +153,7 @@ jobs:
 
           # Compute Homebrew class name for versioned formula
           # git-fs@0.1.1-alpha.1 → GitFsAT011Alpha1
-          CLASS_NAME=$(ruby -e "
-            name = 'git-fs@${VERSION}'
-            class_name = name.capitalize
-            class_name.gsub!(/[-_.\s]([a-zA-Z0-9])/) { \$1.upcase }
-            class_name.tr!('+', 'x')
-            class_name.sub!(/(.)@(\d)/, '\1AT\2')
-            puts class_name
-          ")
+          CLASS_NAME=$(brew ruby -e "puts Formulary.class_s('git-fs@${VERSION}')")
           export CLASS_NAME VERSION SHA256
 
           # Latest formula (class name is always GitFs)
@@ -169,8 +162,8 @@ jobs:
           # Versioned formula (e.g., Formula/git-fs@0.1.1-alpha.1.rb)
           envsubst '${CLASS_NAME} ${VERSION} ${SHA256}' < "$GITHUB_WORKSPACE/formula.rb" > "Formula/git-fs@${VERSION}.rb"
 
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "mesa-ci[bot]"
+          git config user.email "ci-bot@mesa.dev"
           git add Formula/
           git diff --cached --quiet && echo "No changes to commit" && exit 0
           git commit -m "git-fs ${VERSION}"
