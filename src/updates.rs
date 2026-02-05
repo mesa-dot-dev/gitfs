@@ -1,6 +1,6 @@
 //! Checks whether the running binary is the latest released version.
 
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 /// The git SHA baked in at compile time by `vergen-gitcl`.
 const BUILD_SHA: &str = env!("VERGEN_GIT_SHA");
