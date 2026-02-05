@@ -5,8 +5,8 @@ on:
     branches: [main]
 
 concurrency:
-  group: release-${{ github.sha }}
-  cancel-in-progress: true
+  group: release-pipeline
+  cancel-in-progress: false
 
 permissions:
   contents: write

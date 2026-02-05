@@ -7,7 +7,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: promote-to-latest
+  group: release-pipeline
   cancel-in-progress: false
 
 jobs:
