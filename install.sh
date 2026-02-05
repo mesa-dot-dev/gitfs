@@ -185,3 +185,93 @@ prompt_tarball_install() {
         sudo_cmd mkdir -p "$INSTALL_DIR"
     fi
 }
+
+# --- Build download URL ---
+build_url() {
+    case "$PKG_TYPE" in
+        deb)
+            FILENAME="git-fs_${DISTRO}_${ARCH_DEB}.deb"
+            ;;
+        rpm)
+            FILENAME="git-fs_${DISTRO}.${ARCH_RPM}.rpm"
+            ;;
+        tarball)
+            FILENAME="git-fs-linux-${ARCH_TAR}.tar.gz"
+            ;;
+    esac
+    URL="${BASE_URL}/${FILENAME}"
+}
+
+# --- Download ---
+download() {
+    TMPDIR=$(mktemp -d)
+    info "Downloading ${FILENAME}..."
+    curl -fSL -o "${TMPDIR}/${FILENAME}" "$URL" || error "Download failed. Check your internet connection and try again."
+}
+
+# --- Install ---
+install_package() {
+    case "$PKG_TYPE" in
+        deb)
+            info "Installing deb package..."
+            sudo_cmd apt install -y "${TMPDIR}/${FILENAME}"
+            ;;
+        rpm)
+            info "Installing rpm package..."
+            if command -v dnf >/dev/null 2>&1; then
+                sudo_cmd dnf install -y "${TMPDIR}/${FILENAME}"
+            elif command -v yum >/dev/null 2>&1; then
+                sudo_cmd yum install -y "${TMPDIR}/${FILENAME}"
+            else
+                error "Neither dnf nor yum found. Cannot install rpm package."
+            fi
+            ;;
+        tarball)
+            info "Installing binary to ${INSTALL_DIR}..."
+            tar -xzf "${TMPDIR}/${FILENAME}" -C "$TMPDIR"
+            sudo_cmd install -m 755 "${TMPDIR}/git-fs" "${INSTALL_DIR}/git-fs"
+            warn "Note: git-fs requires FUSE3. Install it with your package manager if not already present."
+            ;;
+    esac
+}
+
+# --- Verify ---
+verify_install() {
+    if command -v git-fs >/dev/null 2>&1; then
+        VERSION=$(git-fs --version 2>/dev/null || echo "unknown")
+        success "git-fs installed successfully! (${VERSION})"
+    else
+        success "git-fs installed successfully!"
+    fi
+}
+
+# --- Main ---
+main() {
+    parse_args "$@"
+    check_deps
+
+    printf "\n"
+    info "${BOLD}git-fs installer${RESET}"
+    printf "\n"
+
+    detect_os
+    detect_arch
+    detect_distro
+
+    if [ "$PKG_TYPE" = "tarball" ]; then
+        prompt_tarball_install
+    fi
+
+    # In non-interactive mode, require root
+    if [ "$AUTO_YES" = true ] && [ "$(id -u)" -ne 0 ]; then
+        error "Non-interactive mode requires root. Re-run with: sudo $0 -y"
+    fi
+
+    build_url
+    download
+    install_package
+    verify_install
+    printf "\n"
+}
+
+main "$@"
