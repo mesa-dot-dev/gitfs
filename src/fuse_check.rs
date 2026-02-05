@@ -12,8 +12,7 @@ mod paths {
     pub const OSXFUSE_MOUNT_HELPER: &str =
         "/Library/Filesystems/osxfuse.fs/Contents/Resources/mount_osxfuse";
     pub const LIBFUSE_DYLIB: &str = "/usr/local/lib/libfuse.2.dylib";
-    pub const MACFUSE_FSKIT_APPEX: &str =
-        "/Library/Filesystems/macfuse.fs/Contents/Resources/\
+    pub const MACFUSE_FSKIT_APPEX: &str = "/Library/Filesystems/macfuse.fs/Contents/Resources/\
          macfuse.app/Contents/Extensions/\
          io.macfuse.app.fsmodule.macfuse.appex";
 }
@@ -73,7 +72,10 @@ fn macos_major_version() -> Option<u32> {
 
 /// Errors that can occur when verifying FUSE availability.
 #[derive(Debug, thiserror::Error)]
-#[expect(variant_size_differences, reason = "largest variant holds a &str — boxing would add indirection for no benefit")]
+#[expect(
+    variant_size_differences,
+    reason = "largest variant holds a &str — boxing would add indirection for no benefit"
+)]
 pub enum FuseCheckError {
     /// macFUSE is not installed at all.
     #[error(
@@ -135,12 +137,9 @@ pub fn ensure_fuse() -> Result<(), FuseCheckError> {
     if provider == FuseProvider::MacFuse
         && let Some(major) = macos_major_version()
     {
-        let kext_path = format!(
-            "/Library/Filesystems/macfuse.fs/Contents/Extensions/{major}/macfuse.kext"
-        );
-        if !Path::new(&kext_path).is_dir()
-            && !Path::new(paths::MACFUSE_FSKIT_APPEX).is_dir()
-        {
+        let kext_path =
+            format!("/Library/Filesystems/macfuse.fs/Contents/Extensions/{major}/macfuse.kext");
+        if !Path::new(&kext_path).is_dir() && !Path::new(paths::MACFUSE_FSKIT_APPEX).is_dir() {
             return Err(FuseCheckError::KextMissing {
                 macos_version: major,
             });
