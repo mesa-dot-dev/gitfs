@@ -14,6 +14,11 @@ jobs:
   promote:
     name: Promote canary to latest
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.canary.outputs.version }}
+      base_version: ${{ steps.canary.outputs.base_version }}
+      tag: ${{ steps.canary.outputs.tag }}
+      target: ${{ steps.canary.outputs.target }}
     steps:
       - uses: actions/checkout@v4
 
@@ -41,6 +46,9 @@ jobs:
           VERSION=$(gh release view "${CANARY_TAG}" --json name --jq '.name' \
             | sed 's/^git-fs //' | sed 's/ (canary)$//')
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+          BASE_VERSION=$(echo "${VERSION}" | sed 's/+.*//')
+          echo "base_version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
 
           # Get the target commit SHA
           TARGET=$(gh release view "${CANARY_TAG}" --json targetCommitish --jq '.targetCommitish')
@@ -98,3 +106,72 @@ jobs:
             --target "${TARGET}" \
             --latest \
             assets/*
+
+      - name: Create versioned release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_VERSION: ${{ steps.canary.outputs.base_version }}
+          TARGET: ${{ steps.canary.outputs.target }}
+        run: |
+          TAG="v${BASE_VERSION}"
+          if gh release view "${TAG}" &>/dev/null; then
+            echo "Release ${TAG} already exists, skipping."
+            exit 0
+          fi
+          gh release create "${TAG}" \
+            --title "git-fs ${BASE_VERSION}" \
+            --notes "Stable release of git-fs ${BASE_VERSION}." \
+            --target "${TARGET}" \
+            assets/*
+
+  update-homebrew:
+    name: Update Homebrew formula
+    needs: [promote]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download macOS universal tarball and compute SHA256
+        id: sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ needs.promote.outputs.base_version }}"
+          curl -fSL -o git-fs-macos-universal.tar.gz \
+            "https://github.com/${{ github.repository }}/releases/download/${TAG}/git-fs-macos-universal.tar.gz"
+          SHA=$(sha256sum git-fs-macos-universal.tar.gz | cut -d' ' -f1)
+          echo "sha256=${SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Update tap formulae
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.promote.outputs.base_version }}
+          SHA256: ${{ steps.sha.outputs.sha256 }}
+        run: |
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/mesa-dot-dev/homebrew-tap.git" tap
+          cd tap
+
+          # Compute Homebrew class name for versioned formula
+          # git-fs@0.1.1-alpha.1 → GitFsAT011Alpha1
+          CLASS_NAME=$(ruby -e "
+            name = 'git-fs@${VERSION}'
+            class_name = name.capitalize
+            class_name.gsub!(/[-_.\s]([a-zA-Z0-9])/) { \$1.upcase }
+            class_name.tr!('+', 'x')
+            class_name.sub!(/(.)@(\d)/, '\1AT\2')
+            puts class_name
+          ")
+          export CLASS_NAME VERSION SHA256
+
+          # Latest formula (class name is always GitFs)
+          CLASS_NAME=GitFs envsubst '${CLASS_NAME} ${VERSION} ${SHA256}' < "$GITHUB_WORKSPACE/formula.rb" > Formula/git-fs.rb
+
+          # Versioned formula (e.g., Formula/git-fs@0.1.1-alpha.1.rb)
+          envsubst '${CLASS_NAME} ${VERSION} ${SHA256}' < "$GITHUB_WORKSPACE/formula.rb" > "Formula/git-fs@${VERSION}.rb"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "git-fs ${VERSION}"
+          git push
