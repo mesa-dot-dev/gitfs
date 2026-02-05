@@ -7,6 +7,7 @@ use tracing::{debug, error};
 mod app_config;
 mod daemon;
 mod fs;
+mod fuse_check;
 mod onboarding;
 mod trc;
 mod updates;
@@ -74,6 +75,11 @@ fn main() {
 
     match args.command {
         Command::Run { daemonize } => {
+            if let Err(e) = fuse_check::ensure_fuse() {
+                error!("{e}");
+                std::process::exit(1);
+            }
+
             if daemonize {
                 debug!(config = ?config, "Initializing daemon with configuration...");
                 // It is safe to unwrap this Config.validate() guarantees that pid_file's parent
