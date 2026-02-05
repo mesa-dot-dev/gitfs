@@ -131,6 +131,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Homebrew
+        uses: Homebrew/actions/setup-homebrew@master
+
       - name: Download macOS universal tarball and compute SHA256
         id: sha
         env:
