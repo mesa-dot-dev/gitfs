@@ -45,7 +45,7 @@ pub fn check_for_updates() {
         semver::Version::parse(&running_version).ok(),
         semver::Version::parse(latest_version).ok(),
     ) else {
-        warn!(
+        error!(
             version = running_version,
             latest_version = latest_version,
             "Could not parse version strings for comparison. If you are seeing this, it's a \
