@@ -95,3 +95,54 @@ detect_arch() {
         *) error "Unsupported architecture: $(uname -m)" ;;
     esac
 }
+
+# --- Distro detection ---
+detect_distro() {
+    PKG_TYPE=""
+    DISTRO=""
+
+    if [ ! -f /etc/os-release ]; then
+        PKG_TYPE=tarball
+        return
+    fi
+
+    . /etc/os-release
+
+    case "$ID" in
+        debian)
+            case "$VERSION_ID" in
+                12|13) DISTRO="debian-${VERSION_ID}"; PKG_TYPE=deb ;;
+                *) PKG_TYPE=tarball ;;
+            esac
+            ;;
+        ubuntu)
+            case "$VERSION_ID" in
+                20.04|22.04|24.04) DISTRO="ubuntu-${VERSION_ID}"; PKG_TYPE=deb ;;
+                *) PKG_TYPE=tarball ;;
+            esac
+            ;;
+        rocky)
+            MAJOR=$(echo "$VERSION_ID" | cut -d. -f1)
+            case "$MAJOR" in
+                8|9) DISTRO="rocky-${MAJOR}"; PKG_TYPE=rpm ;;
+                *) PKG_TYPE=tarball ;;
+            esac
+            ;;
+        almalinux)
+            MAJOR=$(echo "$VERSION_ID" | cut -d. -f1)
+            case "$MAJOR" in
+                8|9) DISTRO="alma-${MAJOR}"; PKG_TYPE=rpm ;;
+                *) PKG_TYPE=tarball ;;
+            esac
+            ;;
+        fedora)
+            case "$VERSION_ID" in
+                40|41|42|43) DISTRO="fedora-${VERSION_ID}"; PKG_TYPE=rpm ;;
+                *) PKG_TYPE=tarball ;;
+            esac
+            ;;
+        *)
+            PKG_TYPE=tarball
+            ;;
+    esac
+}
