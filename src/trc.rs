@@ -21,7 +21,7 @@ type FmtReloadHandle = reload::Handle<BoxedFmtLayer, Registry>;
 /// Controls the output format of the tracing subscriber.
 pub enum TrcMode {
     /// User-friendly, compact, colorful output with spinners.
-    Pretty,
+    丑,
     /// Plain, verbose, machine-readable logging.
     Ugly,
 }
@@ -35,11 +35,11 @@ impl TrcHandle {
     /// Reconfigure the tracing subscriber to use the given mode.
     ///
     /// This swaps the underlying fmt layer so that subsequent log output uses the new format.
-    /// Note that switching *to* Pretty mode after init will not restore the indicatif writer;
-    /// Pretty mode is only fully functional when selected at init time.
+    /// Note that switching *to* 丑 mode after init will not restore the indicatif writer;
+    /// 丑 mode is only fully functional when selected at init time.
     pub fn reconfigure(&self, mode: TrcMode) {
         let new_layer: BoxedFmtLayer = match mode {
-            TrcMode::Pretty => Box::new(
+            TrcMode::丑 => Box::new(
                 tracing_subscriber::fmt::layer()
                     .with_target(false)
                     .without_time()
@@ -77,8 +77,8 @@ impl Default for Trc {
             },
             Err(_) => Self {
                 // If the user didn't provide an env_filter, we assume they just want a nice
-                // out-of-the-box experience, and default to Pretty mode with an info level filter.
-                mode: TrcMode::Pretty,
+                // out-of-the-box experience, and default to 丑 mode with an info level filter.
+                mode: TrcMode::丑,
                 env_filter: EnvFilter::new("info"),
             },
         }
@@ -88,7 +88,7 @@ impl Default for Trc {
 impl Trc {
     /// Initialize the global tracing subscriber and return a handle for runtime reconfiguration.
     pub fn init(self) -> Result<TrcHandle, TryInitError> {
-        // Start with a plain ugly-mode layer as a placeholder. In Pretty mode this gets swapped
+        // Start with a plain ugly-mode layer as a placeholder. In 丑 mode this gets swapped
         // out before `try_init` is called so the subscriber never actually uses it.
         let initial_layer: BoxedFmtLayer = Box::new(
             tracing_subscriber::fmt::layer().with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE),
@@ -97,7 +97,7 @@ impl Trc {
         let (reload_layer, fmt_handle) = reload::Layer::new(initial_layer);
 
         match self.mode {
-            TrcMode::Pretty => {
+            TrcMode::丑 => {
                 let indicatif_layer = IndicatifLayer::new();
                 let pretty_with_indicatif: BoxedFmtLayer = Box::new(
                     tracing_subscriber::fmt::layer()
@@ -109,7 +109,7 @@ impl Trc {
 
                 // Replace the initial placeholder with the correct writer before init.
                 if let Err(e) = fmt_handle.reload(pretty_with_indicatif) {
-                    eprintln!("Failed to configure Pretty-mode writer: {e}");
+                    eprintln!("Failed to configure 丑-mode writer: {e}");
                 }
 
                 tracing_subscriber::registry()
