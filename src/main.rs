@@ -10,7 +10,7 @@ mod daemon;
 mod fs;
 mod updates;
 
-use crate::app_config::{ConfigPathProvider, ConfigPathProviderTrait as _};
+use crate::app_config::Config;
 
 #[derive(Parser)]
 #[command(
@@ -55,7 +55,7 @@ fn main() {
 
     let args = Args::parse();
     let config =
-        ConfigPathProvider::load_or_create(args.config_path.as_deref()).unwrap_or_else(|e| {
+        Config::load_or_create(args.config_path.as_deref()).unwrap_or_else(|e| {
             error!("Failed to load configuration: {e}");
             std::process::exit(1);
         });
