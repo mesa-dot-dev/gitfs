@@ -7,10 +7,19 @@ class ${CLASS_NAME} < Formula
   license "MIT"
 
   depends_on :macos
-  depends_on cask: "macfuse"
 
   def install
     bin.install "git-fs"
+  end
+
+  def caveats
+    <<~EOS
+      git-fs requires macFUSE. Install it from:
+        https://macfuse.github.io/
+
+      The Homebrew cask version of macFUSE is outdated.
+      We recommend downloading directly from the official site.
+    EOS
   end
 
   test do
