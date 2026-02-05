@@ -1,0 +1,120 @@
+name: Test install.sh
+
+on:
+  push:
+    branches: [main]
+    paths: [install.sh]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --- Syntax check and macOS early-exit ---
+  basic:
+    name: Basic checks
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: sh -n install.sh
+
+      - name: macOS early exit
+        run: |
+          output=$(sh install.sh 2>&1)
+          echo "$output"
+          echo "$output" | grep -q "macOS is not yet supported"
+
+      - name: Help flag
+        run: |
+          output=$(sh install.sh -h 2>&1)
+          echo "$output"
+          echo "$output" | grep -q "Usage:"
+
+      - name: Unknown flag
+        run: |
+          if sh install.sh --bogus 2>&1; then
+            echo "Expected non-zero exit"; exit 1
+          fi
+
+  # --- DEB distros ---
+  deb:
+    name: DEB · ${{ matrix.distro.name }}
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.distro.image }}
+      options: --user root
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - { name: debian-12,    image: "debian:12" }
+          - { name: debian-13,    image: "debian:trixie" }
+          - { name: ubuntu-20.04, image: "ubuntu:20.04" }
+          - { name: ubuntu-22.04, image: "ubuntu:22.04" }
+          - { name: ubuntu-24.04, image: "ubuntu:24.04" }
+    steps:
+      - name: Install curl
+        run: |
+          apt-get update
+          apt-get install -y curl
+
+      - uses: actions/checkout@v4
+
+      - name: Run install.sh -y
+        run: sh install.sh -y
+
+      - name: Verify git-fs is on PATH
+        run: git-fs --version
+
+  # --- RPM distros ---
+  rpm:
+    name: RPM · ${{ matrix.distro.name }}
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.distro.image }}
+      options: --user root
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - { name: rocky-8,   image: "rockylinux:8" }
+          - { name: rocky-9,   image: "rockylinux:9" }
+          - { name: alma-8,    image: "almalinux:8" }
+          - { name: alma-9,    image: "almalinux:9" }
+          - { name: fedora-40, image: "fedora:40" }
+          - { name: fedora-41, image: "fedora:41" }
+          - { name: fedora-42, image: "fedora:42" }
+          - { name: fedora-43, image: "fedora:43" }
+    steps:
+      - name: Install curl and git
+        run: dnf install -y curl git
+
+      - uses: actions/checkout@v4
+
+      - name: Run install.sh -y
+        run: sh install.sh -y
+
+      - name: Verify git-fs is on PATH
+        run: git-fs --version
+
+  # --- Tarball fallback (unsupported distro) ---
+  tarball:
+    name: Tarball · archlinux
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+      options: --user root
+    steps:
+      - name: Install dependencies
+        run: pacman -Sy --noconfirm curl git
+
+      - uses: actions/checkout@v4
+
+      - name: Run install.sh -y
+        run: sh install.sh -y
+
+      - name: Verify git-fs is on PATH
+        run: git-fs --version

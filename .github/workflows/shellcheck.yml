@@ -1,0 +1,31 @@
+name: ShellCheck
+
+on:
+  push:
+    branches: [main]
+    paths: ["**.sh"]
+  pull_request:
+    branches: [main]
+    paths: ["**.sh"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run ShellCheck (strictest settings)
+        run: |
+          shellcheck --version
+          shellcheck \
+            --shell=sh \
+            --severity=style \
+            --enable=all \
+            --external-sources \
+            --format=gcc \
+            ./install.sh
