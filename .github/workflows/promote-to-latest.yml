@@ -148,7 +148,7 @@ jobs:
           VERSION: ${{ needs.promote.outputs.base_version }}
           SHA256: ${{ steps.sha.outputs.sha256 }}
         run: |
-          git clone "https://x-access-token:${TAP_TOKEN}@github.com/mesa-dot-dev/homebrew-tap.git" tap
+          git clone --branch staged "https://x-access-token:${TAP_TOKEN}@github.com/mesa-dot-dev/homebrew-tap.git" tap
           cd tap
 
           # Compute Homebrew class name for versioned formula
@@ -167,4 +167,4 @@ jobs:
           git add Formula/
           git diff --cached --quiet && echo "No changes to commit" && exit 0
           git commit -m "git-fs ${VERSION}"
-          git push
+          git push origin staged
