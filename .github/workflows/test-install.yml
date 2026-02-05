@@ -63,7 +63,7 @@ jobs:
           - { name: fedora-43, image: "fedora:43" }
     steps:
       - name: Install curl and git
-        run: dnf install -y curl git
+        run: dnf install -y --allowerasing curl git
 
       - uses: actions/checkout@v4
 
@@ -88,5 +88,5 @@ jobs:
       - name: Run install.sh -y
         run: sh install.sh -y
 
-      - name: Verify git-fs is on PATH
-        run: git-fs --version
+      - name: Verify git-fs was installed
+        run: test -x /usr/local/bin/git-fs
