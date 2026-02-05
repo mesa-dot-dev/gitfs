@@ -3,15 +3,16 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use tracing::{debug, error};
-use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 
 mod app_config;
 mod daemon;
 mod fs;
 mod onboarding;
+mod trc;
 mod updates;
 
 use crate::app_config::Config;
+use crate::trc::Trc;
 
 #[derive(Parser)]
 #[command(
@@ -47,10 +48,13 @@ enum Command {
 
 /// Main entry point for the application.
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
-        .init();
+    let trc_handle = Trc::default().init().unwrap_or_else(|e| {
+        eprintln!(
+            "Failed to initialize logging. Without logging, we can't provide any useful error \
+             messages, so we have to exit: {e}"
+        );
+        std::process::exit(1);
+    });
 
     updates::check_for_updates();
 
@@ -91,7 +95,10 @@ fn main() {
 
                 // TODO(markovejnovic): Handle stdout, stderr
                 match daemonize.start() {
-                    Ok(()) => daemon::spawn(config),
+                    Ok(()) => {
+                        trc_handle.reconfigure_for_daemon();
+                        daemon::spawn(config);
+                    }
                     Err(e) => {
                         error!("Failed to spawn the daemon: {e}");
                     }

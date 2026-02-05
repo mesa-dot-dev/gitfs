@@ -1,6 +1,6 @@
 //! Checks whether the running binary is the latest released version.
 
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 /// The git SHA baked in at compile time by `vergen-gitcl`.
 const BUILD_SHA: &str = env!("VERGEN_GIT_SHA");
@@ -23,19 +23,19 @@ pub fn check_for_updates() {
         Ok(list) => match list.fetch() {
             Ok(releases) => releases,
             Err(e) => {
-                info!("Could not check for updates: {e}");
+                error!("Could not check for updates: {e}");
                 return;
             }
         },
         Err(e) => {
-            info!("Could not configure update check: {e}");
+            error!("Could not configure update check: {e}");
             return;
         }
     };
 
     // Find the stable release (tagged "latest" on GitHub).
     let Some(stable) = releases.iter().find(|r| r.version == "latest") else {
-        info!("No stable release found on GitHub.");
+        error!("No stable release found on GitHub.");
         return;
     };
 
