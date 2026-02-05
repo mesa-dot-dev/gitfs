@@ -9,10 +9,10 @@ mod managed_fuse {
     //! fuse slightly better. fuser will not attempt to fuse unmount the filesystem when the
     //! `BackgroundSession` is dropped, and will only do a regular unmount, but we want to be
     //! aggressive and force an unmount if possible.
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt as _;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    use nix::errno::Errno;
 
     use super::{MesaFS, OrgConfig, app_config, debug, error};
     use crate::fs::fuser::FuserAdapter;
@@ -86,55 +86,47 @@ mod managed_fuse {
 
             debug!(mount_point = ?self.mount_point, "Confirming unmount of FUSE filesystem...");
 
-            let c_path = match CString::new(self.mount_point.as_os_str().as_bytes()) {
-                Ok(p) => p,
-                Err(e) => {
-                    error!("mount point contains null byte: {e}");
-                    return;
-                }
-            };
             for i in 0..UMOUNT_ATTEMPT_COUNT {
-                // TODO(markovejnovic): Migrate to using `nix`
-                let umount_errc = {
+                let result = {
                     #[cfg(target_os = "macos")]
-                    // SAFETY: c_path is a valid CString pointing to the mount path.
-                    unsafe {
-                        libc::unmount(c_path.as_ptr(), libc::MNT_FORCE)
+                    {
+                        nix::mount::unmount(&self.mount_point, nix::mount::MntFlags::MNT_FORCE)
                     }
 
                     #[cfg(target_os = "linux")]
-                    // SAFETY: c_path is a valid CString pointing to the mount path.
-                    unsafe {
-                        libc::umount2(c_path.as_ptr(), libc::MNT_DETACH)
+                    {
+                        nix::mount::umount2(&self.mount_point, nix::mount::MntFlags::MNT_DETACH)
                     }
                 };
 
-                // TODO(markovejnovic): This error code handling needs to be tested on linux.
-                match umount_errc {
-                    libc::EBUSY => {
+                match result {
+                    Ok(()) => {
+                        debug!(
+                            "Successfully unmounted FUSE filesystem on attempt {}",
+                            i + 1
+                        );
+                        break;
+                    }
+                    Err(Errno::EBUSY) => {
                         debug!(
                             "FUSE filesystem still busy on attempt {}. Retrying...",
                             i + 1
                         );
                         std::thread::sleep(UMOUNT_ATTEMPT_DELAY);
-                        continue;
                     }
-                    0 | libc::EINVAL => {
-                        debug!(
-                            "Successfully unmounted FUSE filesystem on attempt {}",
-                            i + 1
-                        );
+                    Err(Errno::EINVAL | Errno::ENOENT) => {
+                        debug!("FUSE filesystem already unmounted (attempt {})", i + 1);
+                        break;
                     }
-                    _ => {
+                    Err(e) => {
                         error!(
                             "Failed to unmount FUSE filesystem on attempt {}: {}",
                             i + 1,
-                            std::io::Error::last_os_error()
+                            e
                         );
+                        break;
                     }
                 }
-
-                break;
             }
         }
     }
