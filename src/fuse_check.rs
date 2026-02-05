@@ -71,7 +71,7 @@ fn macos_major_version() -> Option<u32> {
 }
 
 /// Errors that can occur when verifying FUSE availability.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), expect(dead_code))]
 #[derive(Debug, thiserror::Error)]
 #[expect(
     variant_size_differences,
@@ -164,7 +164,7 @@ pub fn ensure_fuse() -> Result<(), FuseCheckError> {
 ///
 /// On non-macOS platforms this is a no-op.
 #[cfg(not(target_os = "macos"))]
-#[allow(clippy::unnecessary_wraps)]
+#[expect(clippy::unnecessary_wraps)]
 pub fn ensure_fuse() -> Result<(), FuseCheckError> {
     Ok(())
 }
