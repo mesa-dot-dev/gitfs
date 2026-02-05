@@ -11,10 +11,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use figment::{
-    Figment,
-    providers::{Env, Format as _, Toml},
-};
 use serde::{Deserialize, Serialize};
 
 fn mesa_runtime_dir() -> Option<PathBuf> {
@@ -238,131 +234,110 @@ impl Config {
             Err(errors)
         }
     }
-}
 
-// Defines a trait for providing configuration paths.
-pub trait ConfigPathProviderTrait {
-    /// Returns a vector of OS strings representing configuration file paths.
-    ///
-    /// This method should return all relevant configuration file paths for the specific OS. The
-    /// order should be of ascending priority.
-    ///
-    /// The most-specific configuration file should be last in the returned vector.
-    ///
-    /// Configurations will be merged, with later configurations overriding earlier ones.
-    fn get_config_paths() -> impl IntoIterator<Item = impl AsRef<Path>>;
+    /// Returns config file paths in descending priority order.
+    /// On macOS, skips `dirs::config_dir()` (resolves to ~/Library/Application Support/).
+    fn config_search_paths() -> Vec<PathBuf> {
+        let mut paths = Vec::new();
 
-    /// Returns the path to be used for creating a new configuration file.
-    fn get_creation_config_path<P: AsRef<Path>>(all_paths: impl Iterator<Item = P>) -> Option<P> {
-        all_paths.last()
-    }
-
-    /// Loads the configuration from the available configuration files.
-    fn load_config(external_config_path: Option<&Path>) -> Result<Config, Box<figment::Error>> {
-        let figment = Figment::new();
-
-        let paths: Vec<_> = Self::get_config_paths().into_iter().collect();
-        let mut figment = paths.iter().fold(figment, |figment: Figment, path| {
-            if path.as_ref().exists() {
-                debug!(path = ?path.as_ref(), "Found configuration file.");
-                figment.merge(Toml::file(path))
-            } else {
-                figment
-            }
-        });
-
-        if let Some(path) = external_config_path {
-            figment = figment.merge(Toml::file(path));
+        #[cfg(not(target_os = "macos"))]
+        if let Some(xdg) = dirs::config_dir() {
+            paths.push(xdg.join("git-fs").join("config.toml"));
         }
 
-        figment
-            .merge(Env::prefixed("GIT_FS_"))
-            .extract()
-            .map_err(Box::new)
+        if let Some(home) = dirs::home_dir() {
+            paths.push(home.join(".config").join("git-fs").join("config.toml"));
+        }
+
+        paths.push(PathBuf::from("/etc/git-fs/config.toml"));
+
+        paths
     }
 
-    /// Loads the configuration or creates a default one if none exists.
-    fn load_or_create(external_config_path: Option<&Path>) -> Result<Config, Box<figment::Error>> {
-        // Figment doesn't have a way to tell us whether a file existed or not, so the best we can
-        // do is try to load the config (hot-path), and if that fails, check exactly why it failed.
-        // We manually have to go through the paths to see if any of them exist. If none do, we can
-        // safely create a new config.
-        match Self::load_config(external_config_path) {
+    /// Finds the first existing config file from search paths.
+    fn find_config_file() -> Option<PathBuf> {
+        Self::config_search_paths().into_iter().find(|p| p.exists())
+    }
+
+    /// Loads config from a single TOML file.
+    fn load_from_file(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        debug!(path = ?path, "Loading configuration file.");
+        let content = std::fs::read_to_string(path)?;
+        let config: Self = toml::from_str(&content)?;
+        Ok(config)
+    }
+
+    /// Loads configuration from the first found config file, or the external path if given.
+    pub fn load(external_config_path: Option<&Path>) -> Result<Self, Box<dyn std::error::Error>> {
+        if let Some(path) = external_config_path {
+            return Self::load_from_file(path);
+        }
+
+        match Self::find_config_file() {
+            Some(path) => Self::load_from_file(&path),
+            None => Err("No configuration file found in any search path".into()),
+        }
+    }
+
+    /// Loads config or creates a default if none exists.
+    /// Errors if a config file exists but is malformed.
+    pub fn load_or_create(
+        external_config_path: Option<&Path>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        match Self::load(external_config_path) {
             Ok(config) => {
                 debug!("Loaded configuration successfully.");
                 Ok(config)
             }
             Err(e) => {
-                let config_paths: Vec<_> = Self::get_config_paths().into_iter().collect();
-                let any_path_exists = config_paths.iter().any(|path| path.as_ref().exists());
-
-                if any_path_exists {
-                    // We found SOME config file, it just seems malformed.
-                    Err(e)
-                } else {
-                    // We now need to find a place to write the default config to.
-                    match Self::get_creation_config_path(config_paths.iter()) {
-                        None => {
-                            // The user doesn't have some of the directories where we could write the
-                            // config. That just means we can't create a config file.
-                            Err(e)
-                        }
-                        Some(path) => {
-                            // The path is valid and we can create a default config file there.
-                            info!(path = ?path.as_ref(), "Creating default config...");
-                            Self::create_default_in_path(path.as_ref())
-                        }
-                    }
+                if external_config_path.is_some() {
+                    return Err(e);
                 }
+
+                // If a file exists, it's malformed — return the parse error
+                if Self::find_config_file().is_some() {
+                    return Err(e);
+                }
+
+                // No config exists — create default at highest-priority path
+                let creation_path =
+                    Self::config_search_paths()
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            Box::<dyn std::error::Error>::from(
+                                "No valid path available for creating config file",
+                            )
+                        })?;
+
+                info!(path = ?creation_path, "Creating default config...");
+                Self::create_default_at(&creation_path)
             }
         }
     }
 
-    fn create_default_in_path(path: &Path) -> Result<Config, Box<figment::Error>> {
-        let config = Config::default();
+    fn create_default_at(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let config = Self::default();
 
-        // TODO(markovejnovic): This currently doesn't write out potentially useful comments to the
-        // toml file. There's a `documented` crate thay may be useful for this.
-        let content = toml::to_string_pretty(&config).map_err(|e| {
-            Box::new(figment::Error::from(format!(
-                "Failed to serialize default config: {e}"
-            )))
-        })?;
+        let content = toml::to_string_pretty(&config)
+            .map_err(|e| format!("Failed to serialize default config: {e}"))?;
 
-        std::fs::create_dir_all(path.parent().unwrap_or(path)).map_err(|e| {
-            Box::new(figment::Error::from(format!(
-                "Failed to create config directory '{}': {e}",
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "Failed to create config directory '{}': {e}",
+                    parent.display()
+                )
+            })?;
+        }
+
+        std::fs::write(path, &content).map_err(|e| {
+            format!(
+                "Failed to write default config file to '{}': {e}",
                 path.display()
-            )))
-        })?;
-        std::fs::write(path, content).map_err(|e| {
-            Box::new(figment::Error::from(format!(
-                "Failed to write default config file: {e}"
-            )))
+            )
         })?;
 
         Ok(config)
-    }
-}
-
-/// Searches for paths according to the following priority:
-///
-/// - `$XDG_CONFIG_HOME/git-fs/config.toml`
-/// - `$HOME/.config/git-fs/config.toml`
-/// - `/etc/git-fs/config.toml`
-pub struct ConfigPathProvider;
-
-impl ConfigPathProviderTrait for ConfigPathProvider {
-    fn get_config_paths() -> impl IntoIterator<Item = impl AsRef<Path>> {
-        let xdg_config_home = dirs::config_dir().map(|p| p.join("git-fs").join("config.toml"));
-        let config_home =
-            dirs::home_dir().map(|p| p.join(".config").join("git-fs").join("config.toml"));
-        let etc_config = Some(PathBuf::from("/etc/git-fs/config.toml"));
-
-        [xdg_config_home, config_home, etc_config]
-            .into_iter()
-            .rev()
-            .flatten()
-            .collect::<Vec<_>>()
     }
 }
