@@ -90,3 +90,15 @@ jobs:
 
       - name: Verify git-fs was installed
         run: test -x /usr/local/bin/git-fs
+
+  macos:
+    name: macOS · homebrew
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run install.sh
+        run: sh install.sh
+
+      - name: Verify git-fs is on PATH
+        run: git-fs --version

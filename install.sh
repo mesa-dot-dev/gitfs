@@ -66,14 +66,8 @@ check_deps() {
 detect_os() {
     _os=$(uname -s)
     case "${_os}" in
-        Darwin)
-            warn "macOS is not yet supported by this install script."
-            info "Download manually from:"
-            info "  ${BASE_URL}/git-fs-macos-universal.tar.gz"
-            printf "\n"
-            exit 0
-            ;;
-        Linux) ;;
+        Darwin) OS="macos" ;;
+        Linux)  OS="linux" ;;
         *) error "Unsupported operating system: ${_os}" ;;
     esac
 }
@@ -235,15 +229,47 @@ verify_install() {
     fi
 }
 
+install_macos() {
+    if ! command -v brew >/dev/null 2>&1; then
+        error "Homebrew is required but not found. Install it from https://brew.sh"
+    fi
+
+    _tap="mesa-dot-dev/tap"
+
+    # Add tap if not already present
+    if ! brew tap | grep -q "^${_tap}$"; then
+        info "Adding Homebrew tap ${_tap}..."
+        brew tap "${_tap}"
+    fi
+
+    # Install or upgrade
+    if brew list --formula git-fs >/dev/null 2>&1; then
+        info "git-fs is already installed. Upgrading..."
+        brew upgrade "${_tap}/git-fs" || info "git-fs is already up to date."
+    else
+        info "Installing git-fs..."
+        brew install "${_tap}/git-fs"
+    fi
+}
+
 main() {
     parse_args "$@"
-    check_deps
 
     printf "\n"
     info "${BOLD}git-fs installer${RESET}"
     printf "\n"
 
     detect_os
+
+    if [ "${OS}" = "macos" ]; then
+        install_macos
+        verify_install
+        printf "\n"
+        return
+    fi
+
+    # --- Linux flow ---
+    check_deps
 
     arch=$(detect_arch)
     arch_deb=$(echo "${arch}" | cut -d' ' -f1)
