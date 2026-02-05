@@ -238,10 +238,14 @@ struct DangerousConfig<'a> {
 
 impl<'a> From<&'a Config> for DangerousConfig<'a> {
     fn from(config: &'a Config) -> Self {
+        let well_known_names: std::collections::HashSet<&str> =
+            WELL_KNOWN_ORGS.iter().map(|(name, _)| *name).collect();
+
         Self {
             organizations: config
                 .organizations
                 .iter()
+                .filter(|(k, _)| !well_known_names.contains(k.as_str()))
                 .map(|(k, v)| (k.as_str(), DangerousOrganizationConfig::from(v)))
                 .collect(),
             cache: &config.cache,
