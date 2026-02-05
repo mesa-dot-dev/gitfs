@@ -96,7 +96,7 @@ fn main() {
                 // TODO(markovejnovic): Handle stdout, stderr
                 match daemonize.start() {
                     Ok(()) => {
-                        trc_handle.reconfigure(&TrcMode::Ugly);
+                        trc_handle.reconfigure(TrcMode::Ugly);
                         daemon::spawn(config);
                     }
                     Err(e) => {
