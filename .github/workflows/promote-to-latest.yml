@@ -145,29 +145,38 @@ jobs:
           SHA=$(sha256sum git-fs-macos-universal.tar.gz | cut -d' ' -f1)
           echo "sha256=${SHA}" >> "$GITHUB_OUTPUT"
 
-      - name: Update tap formulae
+      - name: Clone Homebrew tap
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          VERSION: ${{ needs.promote.outputs.base_version }}
-          SHA256: ${{ steps.sha.outputs.sha256 }}
         run: |
           git clone --branch staged "https://x-access-token:${TAP_TOKEN}@github.com/mesa-dot-dev/homebrew-tap.git" tap
-          cd tap
 
-          # Compute Homebrew class name for versioned formula
-          # git-fs@0.1.1-alpha.1 → GitFsAT011Alpha1
+      - name: Compute Homebrew class name
+        id: class
+        env:
+          VERSION: ${{ needs.promote.outputs.base_version }}
+        run: |
           CLASS_NAME=$(brew ruby -e "puts Formulary.class_s('git-fs@${VERSION}')")
-          export CLASS_NAME VERSION SHA256
+          echo "class_name=${CLASS_NAME}" >> "$GITHUB_OUTPUT"
 
+      - name: Generate formulae
+        env:
+          VERSION: ${{ needs.promote.outputs.base_version }}
+          SHA256: ${{ steps.sha.outputs.sha256 }}
+          CLASS_NAME: ${{ steps.class.outputs.class_name }}
+        run: |
           # Latest formula (class name is always GitFs)
-          CLASS_NAME=GitFs envsubst '${CLASS_NAME} ${VERSION} ${SHA256}' < "$GITHUB_WORKSPACE/formula.rb" > Formula/git-fs.rb
+          CLASS_NAME=GitFs envsubst '${CLASS_NAME} ${VERSION} ${SHA256}' < formula.rb > tap/Formula/git-fs.rb
 
           # Versioned formula (e.g., Formula/git-fs@0.1.1-alpha.1.rb)
-          envsubst '${CLASS_NAME} ${VERSION} ${SHA256}' < "$GITHUB_WORKSPACE/formula.rb" > "Formula/git-fs@${VERSION}.rb"
+          envsubst '${CLASS_NAME} ${VERSION} ${SHA256}' < formula.rb > "tap/Formula/git-fs@${VERSION}.rb"
 
+      - name: Commit and push formulae
+        working-directory: tap
+        run: |
           git config user.name "mesa-ci[bot]"
           git config user.email "ci-bot@mesa.dev"
           git add Formula/
           git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "git-fs ${VERSION}"
+          git commit -m "git-fs ${{ needs.promote.outputs.base_version }}"
           git push origin staged
