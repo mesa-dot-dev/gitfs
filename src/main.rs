@@ -3,15 +3,20 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use tracing::{debug, error};
+use tracing_indicatif::IndicatifLayer;
+use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 
 mod app_config;
 mod daemon;
 mod fs;
 mod onboarding;
+mod trc;
 mod updates;
 
 use crate::app_config::Config;
+use crate::trc::Trc;
 
 #[derive(Parser)]
 #[command(
@@ -47,26 +52,10 @@ enum Command {
 
 /// Main entry point for the application.
 fn main() {
-    let is_debug = std::env::var("RUST_LOG").is_ok();
-
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
-
-    if is_debug {
-        // Verbose format for developers: timestamps, targets, span events
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
-            .init();
-    } else {
-        // Clean format for users: no timestamps, no targets, no span noise
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .with_target(false)
-            .with_level(false)
-            .without_time()
-            .init();
-    }
+    Trc::default().init().expect(
+        "Failed to initialize logging. Without logging, we can't provide any useful error \
+                messages, so we have to exit.",
+    );
 
     updates::check_for_updates();
 
