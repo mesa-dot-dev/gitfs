@@ -238,6 +238,120 @@ impl Config {
             Err(errors)
         }
     }
+
+    /// Returns config file paths in descending priority order.
+    /// On macOS, skips `dirs::config_dir()` (resolves to ~/Library/Application Support/).
+    fn config_search_paths() -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+
+        #[cfg(not(target_os = "macos"))]
+        if let Some(xdg) = dirs::config_dir() {
+            paths.push(xdg.join("git-fs").join("config.toml"));
+        }
+
+        if let Some(home) = dirs::home_dir() {
+            paths.push(home.join(".config").join("git-fs").join("config.toml"));
+        }
+
+        paths.push(PathBuf::from("/etc/git-fs/config.toml"));
+
+        paths
+    }
+
+    /// Finds the first existing config file from search paths.
+    fn find_config_file() -> Option<PathBuf> {
+        Self::config_search_paths()
+            .into_iter()
+            .find(|p| p.exists())
+    }
+
+    /// Loads config from a single file, applying `GIT_FS_` env var overrides.
+    fn load_from_file(path: &Path) -> Result<Config, Box<figment::Error>> {
+        debug!(path = ?path, "Loading configuration file.");
+        Figment::new()
+            .merge(Toml::file(path))
+            .merge(Env::prefixed("GIT_FS_"))
+            .extract()
+            .map_err(Box::new)
+    }
+
+    /// Loads configuration from the first found config file, or the external path if given.
+    pub fn load(external_config_path: Option<&Path>) -> Result<Config, Box<figment::Error>> {
+        if let Some(path) = external_config_path {
+            return Self::load_from_file(path);
+        }
+
+        match Self::find_config_file() {
+            Some(path) => Self::load_from_file(&path),
+            None => Err(Box::new(figment::Error::from(
+                "No configuration file found in any search path",
+            ))),
+        }
+    }
+
+    /// Loads config or creates a default if none exists.
+    /// Errors if a config file exists but is malformed.
+    pub fn load_or_create(
+        external_config_path: Option<&Path>,
+    ) -> Result<Config, Box<figment::Error>> {
+        match Self::load(external_config_path) {
+            Ok(config) => {
+                debug!("Loaded configuration successfully.");
+                Ok(config)
+            }
+            Err(e) => {
+                if external_config_path.is_some() {
+                    return Err(e);
+                }
+
+                // If a file exists, it's malformed — return the parse error
+                if Self::find_config_file().is_some() {
+                    return Err(e);
+                }
+
+                // No config exists — create default at highest-priority path
+                let creation_path = Self::config_search_paths()
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        Box::new(figment::Error::from(
+                            "No valid path available for creating config file",
+                        ))
+                    })?;
+
+                info!(path = ?creation_path, "Creating default config...");
+                Self::create_default_at(&creation_path)
+            }
+        }
+    }
+
+    fn create_default_at(path: &Path) -> Result<Config, Box<figment::Error>> {
+        let config = Config::default();
+
+        let content = toml::to_string_pretty(&config).map_err(|e| {
+            Box::new(figment::Error::from(format!(
+                "Failed to serialize default config: {e}"
+            )))
+        })?;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                Box::new(figment::Error::from(format!(
+                    "Failed to create config directory '{}': {e}",
+                    parent.display()
+                )))
+            })?;
+        }
+
+        std::fs::write(path, &content).map_err(|e| {
+            Box::new(figment::Error::from(format!(
+                "Failed to write default config file to '{}': {e}",
+                path.display()
+            )))
+        })?;
+
+        Ok(config)
+    }
 }
 
 // Defines a trait for providing configuration paths.
