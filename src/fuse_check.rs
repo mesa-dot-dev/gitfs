@@ -102,7 +102,7 @@ pub enum FuseCheckError {
     )]
     LibfuseMissing,
 
-    /// No kernel extension or `FSKit` appex found for the running macOS version.
+    /// No kernel extension found for the running macOS version.
     #[error(
         "No macFUSE kernel extension found for macOS {macos_version}. \
          You may need to update macFUSE or reboot.\n\
@@ -114,13 +114,20 @@ pub enum FuseCheckError {
         /// The major macOS version number (e.g. 15 for Sequoia).
         macos_version: u32,
     },
+
+    /// macFUSE is installed with the `FSKit` backend, which is not supported.
+    #[error(
+        "macFUSE is installed with the FSKit backend, which git-fs does not support.\n\
+         Please install the kernel extension (kext) version of macFUSE instead.\n\
+         Download from: https://macfuse.github.io/"
+    )]
+    FskitOnly,
 }
 
 /// Verify that FUSE is installed and usable on the current platform.
 ///
 /// On macOS this checks for macFUSE or osxfuse, including the mount helper,
-/// libfuse dylib, and kernel extension / `FSKit` appex. On other platforms this
-/// is a no-op.
+/// libfuse dylib, and kernel extension. On other platforms this is a no-op.
 #[cfg(target_os = "macos")]
 pub fn ensure_fuse() -> Result<(), FuseCheckError> {
     let provider = FuseProvider::detect().ok_or(FuseCheckError::NotInstalled)?;
@@ -139,7 +146,10 @@ pub fn ensure_fuse() -> Result<(), FuseCheckError> {
     {
         let kext_path =
             format!("/Library/Filesystems/macfuse.fs/Contents/Extensions/{major}/macfuse.kext");
-        if !Path::new(&kext_path).is_dir() && !Path::new(paths::MACFUSE_FSKIT_APPEX).is_dir() {
+        if !Path::new(&kext_path).is_dir() {
+            if Path::new(paths::MACFUSE_FSKIT_APPEX).is_dir() {
+                return Err(FuseCheckError::FskitOnly);
+            }
             return Err(FuseCheckError::KextMissing {
                 macos_version: major,
             });
