@@ -41,3 +41,29 @@ sudo_cmd() {
         sudo "$@"
     fi
 }
+
+# --- Argument parsing ---
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -y|--yes) AUTO_YES=true ;;
+            -h|--help)
+                printf "Usage: install.sh [OPTIONS]\n\n"
+                printf "Install or update git-fs.\n\n"
+                printf "Options:\n"
+                printf "  -y, --yes    Non-interactive mode (use defaults, requires root)\n"
+                printf "  -h, --help   Show this help message\n"
+                exit 0
+                ;;
+            *) error "Unknown option: $1 (use -h for help)" ;;
+        esac
+        shift
+    done
+}
+
+# --- Dependency checks ---
+check_deps() {
+    if ! command -v curl >/dev/null 2>&1; then
+        error "curl is required but not found. Install it with your package manager."
+    fi
+}
