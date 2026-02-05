@@ -20,10 +20,10 @@ else
 fi
 
 # --- Output helpers ---
-info()    { printf "${CYAN}-->${RESET} %s\n" "$1"; }
-success() { printf "${GREEN}-->${RESET} %s\n" "$1"; }
-warn()    { printf "${YELLOW}-->${RESET} %s\n" "$1" >&2; }
-error()   { printf "${RED}-->${RESET} %s\n" "$1" >&2; exit 1; }
+info()    { printf "%b-->%b %b\n" "$CYAN" "$RESET" "$1"; }
+success() { printf "%b-->%b %b\n" "$GREEN" "$RESET" "$1"; }
+warn()    { printf "%b-->%b %b\n" "$YELLOW" "$RESET" "$1" >&2; }
+error()   { printf "%b-->%b %b\n" "$RED" "$RESET" "$1" >&2; exit 1; }
 
 # --- Cleanup ---
 cleanup() {
