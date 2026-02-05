@@ -12,7 +12,7 @@ mod trc;
 mod updates;
 
 use crate::app_config::Config;
-use crate::trc::{Trc, TrcMode};
+use crate::trc::Trc;
 
 #[derive(Parser)]
 #[command(
@@ -96,7 +96,7 @@ fn main() {
                 // TODO(markovejnovic): Handle stdout, stderr
                 match daemonize.start() {
                     Ok(()) => {
-                        trc_handle.reconfigure(TrcMode::Ugly);
+                        trc_handle.reconfigure_for_daemon();
                         daemon::spawn(config);
                     }
                     Err(e) => {

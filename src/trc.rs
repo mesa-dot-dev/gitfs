@@ -19,7 +19,7 @@ type BoxedFmtLayer = Box<dyn tracing_subscriber::Layer<Registry> + Send + Sync>;
 type FmtReloadHandle = reload::Handle<BoxedFmtLayer, Registry>;
 
 /// Controls the output format of the tracing subscriber.
-pub enum TrcMode {
+enum TrcMode {
     /// User-friendly, compact, colorful output with spinners.
     丑,
     /// Plain, verbose, machine-readable logging.
@@ -37,7 +37,7 @@ impl TrcHandle {
     /// This swaps the underlying fmt layer so that subsequent log output uses the new format.
     /// Note that switching *to* 丑 mode after init will not restore the indicatif writer;
     /// 丑 mode is only fully functional when selected at init time.
-    pub fn reconfigure(&self, mode: TrcMode) {
+    fn reconfigure(&self, mode: &TrcMode) {
         let new_layer: BoxedFmtLayer = match mode {
             TrcMode::丑 => Box::new(
                 tracing_subscriber::fmt::layer()
@@ -53,6 +53,10 @@ impl TrcHandle {
         if let Err(e) = self.fmt_handle.reload(new_layer) {
             eprintln!("Failed to reconfigure tracing: {e}");
         }
+    }
+
+    pub fn reconfigure_for_daemon(&self) {
+        self.reconfigure(&TrcMode::Ugly);
     }
 }
 
