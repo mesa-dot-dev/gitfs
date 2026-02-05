@@ -11,10 +11,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use figment::{
-    Figment,
-    providers::{Env, Format as _, Toml},
-};
 use serde::{Deserialize, Serialize};
 
 fn mesa_runtime_dir() -> Option<PathBuf> {
@@ -265,27 +261,23 @@ impl Config {
             .find(|p| p.exists())
     }
 
-    /// Loads config from a single file, applying `GIT_FS_` env var overrides.
-    fn load_from_file(path: &Path) -> Result<Config, Box<figment::Error>> {
+    /// Loads config from a single TOML file.
+    fn load_from_file(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
         debug!(path = ?path, "Loading configuration file.");
-        Figment::new()
-            .merge(Toml::file(path))
-            .merge(Env::prefixed("GIT_FS_"))
-            .extract()
-            .map_err(Box::new)
+        let content = std::fs::read_to_string(path)?;
+        let config: Config = toml::from_str(&content)?;
+        Ok(config)
     }
 
     /// Loads configuration from the first found config file, or the external path if given.
-    pub fn load(external_config_path: Option<&Path>) -> Result<Config, Box<figment::Error>> {
+    pub fn load(external_config_path: Option<&Path>) -> Result<Config, Box<dyn std::error::Error>> {
         if let Some(path) = external_config_path {
             return Self::load_from_file(path);
         }
 
         match Self::find_config_file() {
             Some(path) => Self::load_from_file(&path),
-            None => Err(Box::new(figment::Error::from(
-                "No configuration file found in any search path",
-            ))),
+            None => Err("No configuration file found in any search path".into()),
         }
     }
 
@@ -293,7 +285,7 @@ impl Config {
     /// Errors if a config file exists but is malformed.
     pub fn load_or_create(
         external_config_path: Option<&Path>,
-    ) -> Result<Config, Box<figment::Error>> {
+    ) -> Result<Config, Box<dyn std::error::Error>> {
         match Self::load(external_config_path) {
             Ok(config) => {
                 debug!("Loaded configuration successfully.");
@@ -314,9 +306,9 @@ impl Config {
                     .into_iter()
                     .next()
                     .ok_or_else(|| {
-                        Box::new(figment::Error::from(
+                        Box::<dyn std::error::Error>::from(
                             "No valid path available for creating config file",
-                        ))
+                        )
                     })?;
 
                 info!(path = ?creation_path, "Creating default config...");
@@ -325,29 +317,27 @@ impl Config {
         }
     }
 
-    fn create_default_at(path: &Path) -> Result<Config, Box<figment::Error>> {
+    fn create_default_at(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
         let config = Config::default();
 
         let content = toml::to_string_pretty(&config).map_err(|e| {
-            Box::new(figment::Error::from(format!(
-                "Failed to serialize default config: {e}"
-            )))
+            format!("Failed to serialize default config: {e}")
         })?;
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                Box::new(figment::Error::from(format!(
+                format!(
                     "Failed to create config directory '{}': {e}",
                     parent.display()
-                )))
+                )
             })?;
         }
 
         std::fs::write(path, &content).map_err(|e| {
-            Box::new(figment::Error::from(format!(
+            format!(
                 "Failed to write default config file to '{}': {e}",
                 path.display()
-            )))
+            )
         })?;
 
         Ok(config)
