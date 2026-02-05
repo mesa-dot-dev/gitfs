@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeSubmitPrompt": [
+      {
+        "command": "agentblame capture --provider cursor --event beforeSubmitPrompt"
+      }
+    ],
+    "afterFileEdit": [
+      {
+        "command": "agentblame capture --provider cursor --event afterFileEdit"
+      }
+    ]
+  }
+}
