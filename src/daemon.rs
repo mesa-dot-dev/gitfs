@@ -188,11 +188,12 @@ pub async fn run(
 
     prepare_mount_point(&config.mount_point).await?;
 
-    debug!(config = ?config, "Starting git-fs daemon...");
+    info!("Mounting filesystem at {}.", config.mount_point.display());
 
     let fuse = managed_fuse::ManagedFuse::new(&config);
     {
         let _session = fuse.spawn(config, handle.clone())?;
+        info!("git-fs is running. Press Ctrl+C to stop.");
 
         wait_for_exit().await?;
     }
