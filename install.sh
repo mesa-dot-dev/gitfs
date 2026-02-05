@@ -146,3 +146,42 @@ detect_distro() {
             ;;
     esac
 }
+
+# --- Tarball fallback prompting ---
+prompt_tarball_install() {
+    INSTALL_DIR="$DEFAULT_INSTALL_DIR"
+
+    if [ "$AUTO_YES" = true ]; then
+        info "No native package for this distro. Installing generic Linux binary to ${INSTALL_DIR}."
+        return
+    fi
+
+    printf "\n"
+    if [ -n "${ID:-}" ]; then
+        warn "No native package available for ${ID} ${VERSION_ID:-}."
+    else
+        warn "Could not detect your Linux distribution."
+    fi
+    printf "    Would you like to install the generic Linux binary instead? [Y/n] "
+    read -r answer </dev/tty || true
+
+    case "$answer" in
+        [nN]*) info "Installation cancelled."; exit 0 ;;
+    esac
+
+    printf "    Install location [${DEFAULT_INSTALL_DIR}]: "
+    read -r custom_dir </dev/tty || true
+
+    if [ -n "$custom_dir" ]; then
+        INSTALL_DIR="$custom_dir"
+    fi
+
+    if [ ! -d "$INSTALL_DIR" ]; then
+        printf "    ${INSTALL_DIR} does not exist. Create it? [Y/n] "
+        read -r create_answer </dev/tty || true
+        case "$create_answer" in
+            [nN]*) error "Installation cancelled." ;;
+        esac
+        sudo_cmd mkdir -p "$INSTALL_DIR"
+    fi
+}
