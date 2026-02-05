@@ -30,8 +30,7 @@ pub fn run_wizard() -> Result<Config, OnboardingError> {
     // 1. Mount point
     let mount_point_str = Text::new("Where should git-fs mount the filesystem?")
         .with_default(&defaults.mount_point.display().to_string())
-        .prompt()
-        ?;
+        .prompt()?;
     let mount_point = PathBuf::from(mount_point_str);
 
     // 2. Organizations (loop)
@@ -41,8 +40,7 @@ pub fn run_wizard() -> Result<Config, OnboardingError> {
         let add_org = Confirm::new("Would you like to add an organization?")
             .with_default(false)
             .with_help_message("Organizations connect git-fs to Mesa, GitLab, or other providers.")
-            .prompt()
-            ?;
+            .prompt()?;
 
         if !add_org {
             break;
@@ -64,13 +62,9 @@ pub fn run_wizard() -> Result<Config, OnboardingError> {
                 }
                 Ok(Validation::Valid)
             })
-            .prompt()
-            ?;
+            .prompt()?;
 
-        let api_key = Password::new("API key:")
-            .without_confirmation()
-            .prompt()
-            ?;
+        let api_key = Password::new("API key:").without_confirmation().prompt()?;
 
         org_keys.push((org_name, SecretString::from(api_key)));
     }

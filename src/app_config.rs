@@ -70,6 +70,16 @@ impl Default for CacheConfig {
     }
 }
 
+trait WithApiKey {
+    fn with_api_key(key: SecretString) -> Self;
+}
+
+impl WithApiKey for OrganizationConfig {
+    fn with_api_key(key: SecretString) -> Self {
+        Self { api_key: key }
+    }
+}
+
 /// Well-known organizations and their default API keys.
 ///
 /// Note that these are publicly exposed and we are comfortable with that, as these keys are
@@ -93,35 +103,32 @@ fn default_organizations() -> HashMap<String, OrganizationConfig> {
 
 /// Deserializes the organizations map, then ensures the default GitHub entry
 /// is always present (without overwriting a user-provided one).
-fn deserialize_organizations_with_defaults<'de, D, Str, OrgConf>(
+fn deserialize_organizations_with_defaults<'de, D, K, V>(
     deserializer: D,
-) -> Result<HashMap<S, OrgConf>, D::Error>
+) -> Result<HashMap<K, V>, D::Error>
 where
-    Str: Into<String>,
     D: serde::Deserializer<'de>,
+    K: Deserialize<'de> + Eq + std::hash::Hash + From<String>,
+    V: Deserialize<'de> + WithApiKey,
 {
-    Ok(WELL_KNOWN_ORGS.iter().fold(
-        HashMap::<S, OrgConf>::deserialize(deserializer)?,
-        |mut acc, (name, api_key)| {
-            acc.insert(
-                name.to_string(),
-                OrgConf {
-                    api_key: SecretString::from(api_key.to_string()),
-                },
-            );
-            acc
-        },
-    ))
+    let mut map = HashMap::<K, V>::deserialize(deserializer)?;
+    for (name, api_key) in &WELL_KNOWN_ORGS {
+        map.entry(K::from((*name).to_owned()))
+            .or_insert_with(|| V::with_api_key(SecretString::from((*api_key).to_owned())));
+    }
+    Ok(map)
 }
 
 /// Serializes the organizations map, excluding well-known organizations so they
 /// don't get written to the config file.
-fn serialize_organizations_without_well_known<S, Str, OrgConf>(
-    organizations: &HashMap<Str, OrgConf>,
+fn serialize_organizations_without_well_known<S, K, V>(
+    organizations: &HashMap<K, V>,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
+    K: AsRef<str> + Serialize + Eq + std::hash::Hash,
+    V: Serialize,
 {
     use serde::ser::SerializeMap as _;
 
@@ -130,7 +137,7 @@ where
 
     let filtered: Vec<_> = organizations
         .iter()
-        .filter(|(key, _)| !well_known_names.contains(key.as_str()))
+        .filter(|(key, _)| !well_known_names.contains(key.as_ref()))
         .collect();
 
     let mut map = serializer.serialize_map(Some(filtered.len()))?;
@@ -163,8 +170,8 @@ struct DangerousOrganizationConfig<'a> {
     pub api_key: &'a str,
 }
 
-impl<'a> From<&OrganizationConfig> for DangerousOrganizationConfig<'a> {
-    fn from(org: &'a OrganizationConfig) -> Self<'a> {
+impl<'a> From<&'a OrganizationConfig> for DangerousOrganizationConfig<'a> {
+    fn from(org: &'a OrganizationConfig) -> Self {
         Self {
             api_key: org.api_key.expose_secret(),
         }
@@ -218,33 +225,28 @@ pub struct Config {
     pub gid: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "kebab-case")]
 struct DangerousConfig<'a> {
-    #[serde(
-        deserialize_with = "deserialize_organizations_with_defaults",
-        serialize_with = "serialize_organizations_without_well_known"
-    )]
     pub organizations: HashMap<&'a str, DangerousOrganizationConfig<'a>>,
-
     pub cache: &'a CacheConfig,
     pub daemon: &'a DaemonConfig,
-    pub mount_point: PathBuf,
+    pub mount_point: &'a Path,
     pub uid: u32,
     pub gid: u32,
 }
 
-impl From<&Config> for DangerousConfig<'_> {
-    fn from(config: &Config) -> Self {
+impl<'a> From<&'a Config> for DangerousConfig<'a> {
+    fn from(config: &'a Config) -> Self {
         Self {
             organizations: config
                 .organizations
                 .iter()
-                .map(|(k, v)| (k.clone(), DangerousOrganizationConfig::from(v)))
+                .map(|(k, v)| (k.as_str(), DangerousOrganizationConfig::from(v)))
                 .collect(),
             cache: &config.cache,
             daemon: &config.daemon,
-            mount_point: config.mount_point.clone(),
+            mount_point: &config.mount_point,
             uid: config.uid,
             gid: config.gid,
         }
@@ -268,9 +270,6 @@ impl Default for Config {
 pub enum ConfigError {
     #[error("Configuration validation errors: {0:?}")]
     ValidationErrors(Vec<String>),
-
-    #[error("A terminal is required for this operation.")]
-    TerminalRequired,
 
     #[error("Failed to onboard: {0}")]
     OnboardingError(OnboardingError),
@@ -358,34 +357,25 @@ impl Config {
     /// Loads config or creates a default if none exists.
     /// Errors if a config file exists but is malformed.
     pub fn load_or_create(external_config_path: Option<&Path>) -> Result<Self, ConfigError> {
-        match Self::load(external_config_path) {
-            Some(res) => match res {
-                Ok(config) => {
-                    if let Err(validation_errors) = config.validate() {
-                        return Err(ConfigError::ValidationErrors(validation_errors));
-                    }
-                    debug!("Loaded configuration successfully.");
-                    Ok(config)
-                }
-                Err(e) => return Err(e),
-            },
-            None => {
-                // No config exists — create default at highest-priority path
-                let creation_path = Self::config_search_paths()
-                    .into_iter()
-                    .next()
-                    .ok_or(ConfigError::NoSuitableConfigPath)?;
-
-                match onboarding::run_wizard() {
-                    Ok(config) => {
-                        config.dangerously_write_to_disk(&creation_path)?;
-                        info!(path = ?creation_path.display(), "Created configuration file.");
-                        Ok(config)
-                    }
-                    Err(e) => Err(ConfigError::OnboardingError(e)),
-                }
+        if let Some(res) = Self::load(external_config_path) {
+            let config = res?;
+            if let Err(validation_errors) = config.validate() {
+                return Err(ConfigError::ValidationErrors(validation_errors));
             }
+            debug!("Loaded configuration successfully.");
+            return Ok(config);
         }
+
+        // No config exists — create default at highest-priority path
+        let creation_path = Self::config_search_paths()
+            .into_iter()
+            .next()
+            .ok_or(ConfigError::NoSuitableConfigPath)?;
+
+        let config = onboarding::run_wizard().map_err(ConfigError::OnboardingError)?;
+        config.dangerously_write_to_disk(&creation_path)?;
+        info!(path = ?creation_path.display(), "Created configuration file.");
+        Ok(config)
     }
 
     fn dangerously_write_to_disk(&self, path: &Path) -> Result<(), ConfigError> {
