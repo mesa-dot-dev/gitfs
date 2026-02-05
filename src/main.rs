@@ -3,10 +3,6 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use tracing::{debug, error};
-use tracing_indicatif::IndicatifLayer;
-use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 
 mod app_config;
 mod daemon;
@@ -16,7 +12,7 @@ mod trc;
 mod updates;
 
 use crate::app_config::Config;
-use crate::trc::Trc;
+use crate::trc::{Trc, TrcMode};
 
 #[derive(Parser)]
 #[command(
@@ -52,10 +48,13 @@ enum Command {
 
 /// Main entry point for the application.
 fn main() {
-    Trc::default().init().expect(
-        "Failed to initialize logging. Without logging, we can't provide any useful error \
-                messages, so we have to exit.",
-    );
+    let trc_handle = Trc::default().init().unwrap_or_else(|e| {
+        eprintln!(
+            "Failed to initialize logging. Without logging, we can't provide any useful error \
+             messages, so we have to exit: {e}"
+        );
+        std::process::exit(1);
+    });
 
     updates::check_for_updates();
 
@@ -96,7 +95,10 @@ fn main() {
 
                 // TODO(markovejnovic): Handle stdout, stderr
                 match daemonize.start() {
-                    Ok(()) => daemon::spawn(config),
+                    Ok(()) => {
+                        trc_handle.reconfigure(&TrcMode::Ugly);
+                        daemon::spawn(config);
+                    }
                     Err(e) => {
                         error!("Failed to spawn the daemon: {e}");
                     }

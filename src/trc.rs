@@ -1,42 +1,65 @@
 //! Tracing configuration and initialization.
+//!
+//! The tracing subscriber is built with a [`reload::Layer`] wrapping the fmt layer so that the
+//! output format can be switched at runtime (e.g. from pretty mode to ugly mode when
+//! daemonizing).
 
 use tracing_indicatif::IndicatifLayer;
 use tracing_subscriber::{
     EnvFilter,
+    Registry,
     fmt::format::FmtSpan,
-    layer::SubscriberExt,
-    util::{SubscriberInitExt, TryInitError},
+    layer::SubscriberExt as _,
+    reload,
+    util::{SubscriberInitExt as _, TryInitError},
 };
 
-struct FgConfig {
-    no_spin: bool,
+/// The type-erased fmt layer that lives inside the reload handle.
+type BoxedFmtLayer = Box<dyn tracing_subscriber::Layer<Registry> + Send + Sync>;
+
+/// The reload handle type used to swap the fmt layer at runtime.
+type FmtReloadHandle = reload::Handle<BoxedFmtLayer, Registry>;
+
+/// Controls the output format of the tracing subscriber.
+pub enum TrcMode {
+    /// User-friendly, compact, colorful output with spinners.
+    Pretty,
+    /// Plain, verbose, machine-readable logging.
+    Ugly,
 }
 
-impl FgConfig {
-    fn is_ugly(&self) -> bool {
-        self.no_spin
-    }
+/// A handle that allows reconfiguring the tracing subscriber at runtime.
+pub struct TrcHandle {
+    fmt_handle: FmtReloadHandle,
+}
 
-    pub fn pretty() -> Self {
-        Self { no_spin: false }
-    }
+impl TrcHandle {
+    /// Reconfigure the tracing subscriber to use the given mode.
+    ///
+    /// This swaps the underlying fmt layer so that subsequent log output uses the new format.
+    /// Note that switching *to* pretty mode after init will not restore the indicatif writer;
+    /// pretty mode is only fully functional when selected at init time.
+    pub fn reconfigure(&self, mode: &TrcMode) {
+        let new_layer: BoxedFmtLayer = match mode {
+            TrcMode::Pretty => Box::new(
+                tracing_subscriber::fmt::layer()
+                    .with_target(false)
+                    .without_time()
+                    .compact(),
+            ),
+            TrcMode::Ugly => Box::new(
+                tracing_subscriber::fmt::layer()
+                    .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE),
+            ),
+        };
 
-    pub fn ugly() -> Self {
-        Self { no_spin: true }
+        if let Err(e) = self.fmt_handle.reload(new_layer) {
+            eprintln!("Failed to reconfigure tracing: {e}");
+        }
     }
 }
 
-impl Default for FgConfig {
-    fn default() -> Self {
-        Self { no_spin: false }
-    }
-}
-
-enum TrcMode {
-    Foreground(FgConfig),
-    Daemon,
-}
-
+/// Builder for the tracing subscriber.
 pub struct Trc {
     mode: TrcMode,
     env_filter: EnvFilter,
@@ -49,16 +72,16 @@ impl Default for Trc {
 
         match maybe_env_filter {
             Ok(env_filter) => Self {
-                // If the user provided an env_filter, they probably not what they're doing and
+                // If the user provided an env_filter, they probably know what they're doing and
                 // don't want any fancy formatting, spinners or bullshit like that. So we default
                 // to the ugly mode.
-                mode: TrcMode::Foreground(FgConfig::ugly()),
+                mode: TrcMode::Ugly,
                 env_filter,
             },
             Err(_) => Self {
                 // If the user didn't provide an env_filter, we assume they just want a nice
                 // out-of-the-box experience, and default to pretty mode with an info level filter.
-                mode: TrcMode::Foreground(FgConfig::pretty()),
+                mode: TrcMode::Pretty,
                 env_filter: EnvFilter::new("info"),
             },
         }
@@ -66,45 +89,48 @@ impl Default for Trc {
 }
 
 impl Trc {
-    pub fn init(self) -> Result<(), TryInitError> {
-        match &self.mode {
-            TrcMode::Daemon => self.init_ugly_mode(),
-            TrcMode::Foreground(fg_config) => {
-                if fg_config.is_ugly() {
-                    self.init_ugly_mode()
-                } else {
-                    self.init_pretty_mode()
+    /// Initialize the global tracing subscriber and return a handle for runtime reconfiguration.
+    pub fn init(self) -> Result<TrcHandle, TryInitError> {
+        // Start with a plain ugly-mode layer as a placeholder. In pretty mode this gets swapped
+        // out before `try_init` is called so the subscriber never actually uses it.
+        let initial_layer: BoxedFmtLayer = Box::new(
+            tracing_subscriber::fmt::layer()
+                .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE),
+        );
+
+        let (reload_layer, fmt_handle) = reload::Layer::new(initial_layer);
+
+        match self.mode {
+            TrcMode::Pretty => {
+                let indicatif_layer = IndicatifLayer::new();
+                let pretty_with_indicatif: BoxedFmtLayer = Box::new(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(indicatif_layer.get_stderr_writer())
+                        .with_target(false)
+                        .without_time()
+                        .compact(),
+                );
+
+                // Replace the initial placeholder with the correct writer before init.
+                if let Err(e) = fmt_handle.reload(pretty_with_indicatif) {
+                    eprintln!("Failed to configure pretty-mode writer: {e}");
                 }
+
+                tracing_subscriber::registry()
+                    .with(reload_layer)
+                    .with(self.env_filter)
+                    .with(indicatif_layer)
+                    .try_init()?;
+            }
+            TrcMode::Ugly => {
+                // The initial layer is already configured for ugly mode, so just init directly.
+                tracing_subscriber::registry()
+                    .with(reload_layer)
+                    .with(self.env_filter)
+                    .try_init()?;
             }
         }
-    }
 
-    fn init_ugly_mode(self) -> Result<(), TryInitError> {
-        // "Ugly mode" is the plain, verbose, rust logging mode.
-        tracing_subscriber::fmt()
-            .with_env_filter(self.env_filter)
-            .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
-            .init();
-
-        Ok(())
-    }
-
-    fn init_pretty_mode(self) -> Result<(), TryInitError> {
-        // "Pretty mode" is the more user-friendly, compact, and colorful mode. We add a bunch of
-        // spinners and interactive elements to keep the user entertained.
-        let indicatif_layer = IndicatifLayer::new();
-        tracing_subscriber::registry()
-            .with(self.env_filter)
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_writer(indicatif_layer.get_stderr_writer())
-                    .with_target(false)
-                    .without_time()
-                    .compact(),
-            )
-            .with(indicatif_layer)
-            .try_init()?;
-
-        Ok(())
+        Ok(TrcHandle { fmt_handle })
     }
 }
