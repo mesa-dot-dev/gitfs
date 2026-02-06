@@ -39,6 +39,10 @@ shellexpand = "3.1"
 inquire = "0.9.2"
 tracing-indicatif = "0.3.14"
 
+[features]
+default = []
+staging = []
+
 [build-dependencies]
 vergen-gitcl = { version = "1", features = [] }
 
