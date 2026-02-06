@@ -13,6 +13,11 @@ use crate::fs::r#trait::{
     OpenFlags,
 };
 
+#[cfg(feature = "staging")]
+const MESA_API_BASE_URL: &str = "https://depot.staging.mesa.dev/api/v1";
+#[cfg(not(feature = "staging"))]
+const MESA_API_BASE_URL: &str = "https://depot.mesa.dev/api/v1";
+
 mod common;
 pub use common::{GetAttrError, LookupError, OpenError, ReadDirError, ReadError, ReleaseError};
 use common::{InodeControlBlock, InodeFactory};
@@ -78,7 +83,9 @@ impl MesaFS {
             org_inodes: HashMap::new(),
             org_slots: orgs
                 .map(|org_conf| {
-                    let client = MesaClient::new(org_conf.api_key.expose_secret());
+                    let client = MesaClient::builder(org_conf.api_key.expose_secret())
+                        .base_url(MESA_API_BASE_URL)
+                        .build();
                     let org = OrgFs::new(org_conf.name, client, fs_owner);
                     OrgSlot {
                         org,
