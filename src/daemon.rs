@@ -201,13 +201,10 @@ pub async fn run(
     Ok(())
 }
 
-pub fn spawn(config: app_config::Config) {
+pub fn spawn(config: app_config::Config) -> Result<(), std::io::Error> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap_or_else(|e| panic!("Failed to create Tokio runtime: {e}"));
-    if let Err(e) = runtime.block_on(run(config, runtime.handle().clone())) {
-        error!("Daemon failed: {e}");
-        panic!("Daemon failed: {e}");
-    }
+    runtime.block_on(run(config, runtime.handle().clone()))
 }

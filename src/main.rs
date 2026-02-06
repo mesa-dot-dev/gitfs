@@ -103,14 +103,18 @@ fn main() {
                 match daemonize.start() {
                     Ok(()) => {
                         trc_handle.reconfigure_for_daemon();
-                        daemon::spawn(config);
+                        if let Err(e) = daemon::spawn(config) {
+                            error!("Daemon failed: {e}");
+                            std::process::exit(1);
+                        }
                     }
                     Err(e) => {
                         error!("Failed to spawn the daemon: {e}");
                     }
                 }
-            } else {
-                daemon::spawn(config);
+            } else if let Err(e) = daemon::spawn(config) {
+                error!("Daemon failed: {e}");
+                std::process::exit(1);
             }
         }
         Command::Reload => {}
