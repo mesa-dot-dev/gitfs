@@ -23,6 +23,7 @@ pub use org::OrgConfig;
 use org::OrgFs;
 
 pub mod repo;
+pub mod dcache;
 
 /// Per-org wrapper with inode and file handle translation.
 struct OrgSlot {
