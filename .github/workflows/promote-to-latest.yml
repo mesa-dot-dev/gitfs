@@ -193,4 +193,5 @@ jobs:
           git add Formula/
           git diff --cached --quiet && echo "No changes to commit" && exit 0
           git commit -m "git-fs ${{ needs.promote.outputs.base_version }}"
-          git push "https://x-access-token:${TAP_TOKEN}@github.com/mesa-dot-dev/homebrew-tap.git" staged
+          git -c "http.https://github.com/.extraheader=" -c credential.helper= \
+            push "https://x-access-token:${TAP_TOKEN}@github.com/mesa-dot-dev/homebrew-tap.git" staged
