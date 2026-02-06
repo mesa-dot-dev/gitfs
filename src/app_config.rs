@@ -112,8 +112,10 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             max_size: None,
-            path: ExpandedPathBuf::new(mesa_runtime_dir()
-                .map_or_else(|| PathBuf::from("/tmp/git-fs/cache"), |rd| rd.join("cache"))),
+            path: ExpandedPathBuf::new(
+                mesa_runtime_dir()
+                    .map_or_else(|| PathBuf::from("/tmp/git-fs/cache"), |rd| rd.join("cache")),
+            ),
         }
     }
 }
