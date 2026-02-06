@@ -1,0 +1,54 @@
+[project]
+name = "git-fs-tests"
+version = "0.0.0"
+description = "Integration tests for git-fs (Rust/FUSE). Not a Python package."
+requires-python = ">=3.14"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-timeout>=2.4.0",
+    "pytest-in-docker>=0.2.0",
+    "ruff>=0.9.0",
+    "pyright>=1.1.390",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 300
+markers = [
+    "integration: marks tests as integration tests",
+]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "COM812", # Conflicts with formatter
+    "D203", # Conflicts with D211 which is better
+    "D213", # Conflicts with D212 which is better
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "S", # It's tests, no need for security
+    "PLC0415", # RPyC teleport requires imports inside function body
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pyright]
+pythonVersion = "3.14"
+typeCheckingMode = "strict"
+include = ["tests"]
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+reportUnknownArgumentType = false
+reportUnknownParameterType = false

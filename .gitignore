@@ -3,6 +3,10 @@
 # Agent Blame local database (legacy)
 .agentblame/
 
-# OpenCode local plugin (installed by agentblame init)
-.opencode/
 !.opencode/
+
+# Python
+__pycache__/
+.pytest_cache/
+*.pyc
+.venv/
