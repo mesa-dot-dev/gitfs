@@ -66,7 +66,7 @@ mod managed_fuse {
     impl ManagedFuse {
         pub fn new(config: &app_config::Config) -> Self {
             Self {
-                mount_point: config.mount_point.clone(),
+                mount_point: config.mount_point.to_path_buf(),
             }
         }
 
