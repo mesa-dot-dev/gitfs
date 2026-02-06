@@ -5,3 +5,9 @@
 
 # OpenCode local plugin (installed by agentblame init)
 .opencode/
+
+# Python
+__pycache__/
+.pytest_cache/
+*.pyc
+.venv/
