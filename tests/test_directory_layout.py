@@ -1,3 +1,5 @@
+# Review: The manual tree walking feels incredibly janky. Can't we just run the `tree`
+# command to confirm correctness?
 """Compare directory layout of git-fs mounted repos vs git clone --depth 1."""
 
 from __future__ import annotations
