@@ -16,6 +16,52 @@ use serde::{Deserialize, Serialize};
 
 use crate::onboarding::{self, OnboardingError};
 
+/// A `PathBuf` that automatically expands `~` to the user's home directory
+/// during deserialization. This ensures that any path loaded from configuration
+/// is already resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ExpandedPathBuf(PathBuf);
+
+impl<'de> Deserialize<'de> for ExpandedPathBuf {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        let expanded = shellexpand::tilde(&raw);
+        Ok(Self(PathBuf::from(expanded.into_owned())))
+    }
+}
+
+impl ExpandedPathBuf {
+    /// Creates a new `ExpandedPathBuf` from any path, without expansion.
+    /// Use this for programmatically-constructed paths that are already absolute.
+    pub fn new(path: PathBuf) -> Self {
+        Self(path)
+    }
+}
+
+impl std::ops::Deref for ExpandedPathBuf {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for ExpandedPathBuf {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ExpandedPathBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.display().fmt(f)
+    }
+}
+
 fn mesa_runtime_dir() -> Option<PathBuf> {
     let runtime_dir = dirs::runtime_dir();
     if let Some(path) = runtime_dir {
@@ -30,15 +76,17 @@ fn mesa_runtime_dir() -> Option<PathBuf> {
     None
 }
 
-fn default_pid_file() -> PathBuf {
-    mesa_runtime_dir().map_or_else(
+fn default_pid_file() -> ExpandedPathBuf {
+    ExpandedPathBuf::new(mesa_runtime_dir().map_or_else(
         || PathBuf::from("/var/run/git-fs.pid"),
         |rd| rd.join("git-fs.pid"),
-    )
+    ))
 }
 
-fn default_mount_point() -> PathBuf {
-    mesa_runtime_dir().map_or_else(|| PathBuf::from("/tmp/git-fs/mnt"), |rd| rd.join("mnt"))
+fn default_mount_point() -> ExpandedPathBuf {
+    ExpandedPathBuf::new(
+        mesa_runtime_dir().map_or_else(|| PathBuf::from("/tmp/git-fs/mnt"), |rd| rd.join("mnt")),
+    )
 }
 
 fn current_uid() -> u32 {
@@ -57,15 +105,17 @@ pub struct CacheConfig {
     pub max_size: Option<ByteSize>,
 
     /// The path to the cache directory.
-    pub path: PathBuf,
+    pub path: ExpandedPathBuf,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             max_size: None,
-            path: mesa_runtime_dir()
-                .map_or_else(|| PathBuf::from("/tmp/git-fs/cache"), |rd| rd.join("cache")),
+            path: ExpandedPathBuf::new(
+                mesa_runtime_dir()
+                    .map_or_else(|| PathBuf::from("/tmp/git-fs/cache"), |rd| rd.join("cache")),
+            ),
         }
     }
 }
@@ -184,7 +234,7 @@ impl<'a> From<&'a OrganizationConfig> for DangerousOrganizationConfig<'a> {
 pub struct DaemonConfig {
     /// The path to the PID file for the daemon. Uses /var/run/git-fs.pid if not specified.
     #[serde(default = "default_pid_file")]
-    pub pid_file: PathBuf,
+    pub pid_file: ExpandedPathBuf,
 }
 
 impl Default for DaemonConfig {
@@ -214,7 +264,7 @@ pub struct Config {
 
     /// The mount point for the filesystem.
     #[serde(default = "default_mount_point")]
-    pub mount_point: PathBuf,
+    pub mount_point: ExpandedPathBuf,
 
     /// The user to mount the filesystem as. If not specified, runs as the current user.
     #[serde(default = "current_uid")]

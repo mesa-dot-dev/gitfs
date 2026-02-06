@@ -94,7 +94,7 @@ fn main() {
                 }
 
                 let daemonize = daemonize::Daemonize::new()
-                    .pid_file(config.daemon.pid_file.clone())
+                    .pid_file(&config.daemon.pid_file)
                     .chown_pid_file(true)
                     .user(config.uid)
                     .group(config.gid);

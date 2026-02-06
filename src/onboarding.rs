@@ -1,11 +1,12 @@
 //! Interactive onboarding wizard for first-time configuration.
 
-use std::{io::IsTerminal as _, path::PathBuf};
+use std::io::IsTerminal as _;
+use std::path::PathBuf;
 
 use inquire::{Confirm, Password, Text, validator::Validation};
 use secrecy::SecretString;
 
-use crate::app_config::{Config, OrganizationConfig};
+use crate::app_config::{Config, ExpandedPathBuf, OrganizationConfig};
 
 const WELCOME_MESSAGE: &str = "
     \x1b[32m@@@@\x1b[0m      Welcome to \x1b[1mgit-fs\x1b[0m! Let's get you started!
@@ -49,7 +50,9 @@ pub fn run_wizard() -> Result<Config, OnboardingError> {
     let mount_point_str = Text::new("Where should git-fs mount the filesystem?")
         .with_default(&defaults.mount_point.display().to_string())
         .prompt()?;
-    let mount_point = PathBuf::from(mount_point_str);
+    let mount_point = ExpandedPathBuf::new(PathBuf::from(
+        shellexpand::tilde(&mount_point_str).into_owned(),
+    ));
 
     let mut org_keys: Vec<(String, SecretString)> = Vec::new();
     loop {
