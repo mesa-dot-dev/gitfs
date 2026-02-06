@@ -42,7 +42,7 @@ pub(super) struct DCache {
 }
 
 impl DCache {
-    /// Create a new DCache. Initializes root ICB (rc=1), caches root dir attr.
+    /// Create a new `DCache`. Initializes root ICB (rc=1), caches root dir attr.
     pub fn new(root_ino: Inode, fs_owner: (u32, u32), block_size: u32) -> Self {
         let now = SystemTime::now();
 
@@ -101,12 +101,12 @@ impl DCache {
         self.inode_table.contains_key(&ino)
     }
 
-    /// Insert an ICB directly (for ensure_org_inode / ensure_repo_inode patterns).
+    /// Insert an ICB directly (for `ensure_org_inode` / `ensure_repo_inode` patterns).
     pub fn insert_icb(&mut self, ino: Inode, icb: InodeControlBlock) {
         self.inode_table.insert(ino, icb);
     }
 
-    /// Insert an ICB only if absent (for translate_*_ino_to_* patterns).
+    /// Insert an ICB only if absent (for `translate_*_ino_to_*` patterns).
     /// Returns a mutable reference to the (possibly pre-existing) ICB.
     pub fn entry_or_insert_icb(
         &mut self,
@@ -114,10 +114,6 @@ impl DCache {
         icb: impl FnOnce() -> InodeControlBlock,
     ) -> &mut InodeControlBlock {
         self.inode_table.entry(ino).or_insert_with(icb)
-    }
-
-    pub fn inode_count(&self) -> usize {
-        self.inode_table.len()
     }
 
     // ── Attr caching ────────────────────────────────────────────────────
