@@ -6,7 +6,7 @@ use mesa_dev::Mesa as MesaClient;
 use secrecy::ExposeSecret as _;
 use tracing::{instrument, trace, warn};
 
-use crate::fs::inode_bridge::HashMapBridge;
+use crate::fs::dcache::bridge::HashMapBridge;
 use crate::fs::r#trait::{
     DirEntry, DirEntryType, FileAttr, FileHandle, FilesystemStats, Fs, Inode, LockOwner, OpenFile,
     OpenFlags,
@@ -16,8 +16,7 @@ mod common;
 pub use common::{GetAttrError, LookupError, OpenError, ReadDirError, ReadError, ReleaseError};
 use common::InodeControlBlock;
 
-mod dcache;
-use dcache::DCache;
+use crate::fs::dcache::MescloudDCache;
 
 mod org;
 pub use org::OrgConfig;
@@ -44,7 +43,7 @@ enum InodeRole {
 /// Composes multiple [`OrgFs`] instances, each with its own inode namespace,
 /// using [`HashMapBridge`] for bidirectional inode/fh translation at each boundary.
 pub struct MesaFS {
-    dcache: DCache,
+    dcache: MescloudDCache,
 
     /// Maps mesa-level org-root inodes → index into `org_slots`.
     org_inodes: HashMap<Inode, usize>,
@@ -58,7 +57,7 @@ impl MesaFS {
     /// Create a new `MesaFS` instance.
     pub fn new(orgs: impl Iterator<Item = OrgConfig>, fs_owner: (u32, u32)) -> Self {
         Self {
-            dcache: DCache::new(Self::ROOT_NODE_INO, fs_owner, Self::BLOCK_SIZE),
+            dcache: MescloudDCache::new(Self::ROOT_NODE_INO, fs_owner, Self::BLOCK_SIZE),
             org_inodes: HashMap::new(),
             org_slots: orgs
                 .map(|org_conf| {

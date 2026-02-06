@@ -1,19 +1,56 @@
-//! Reusable directory cache for mescloud filesystem implementations.
+//! Mescloud-specific directory cache wrapper.
+//!
+//! Composes [`DCache<InodeControlBlock>`] with inode allocation, attribute
+//! caching, and filesystem-owner metadata.
 
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::time::SystemTime;
 
-use tracing::{trace, warn};
+use tracing::warn;
 
 use crate::fs::r#trait::{
-    CommonFileAttr, DirEntryType, FileAttr, FileHandle, FilesystemStats, Inode, Permissions,
+    CommonFileAttr, DirEntry, DirEntryType, FileAttr, FilesystemStats, Inode, Permissions,
 };
 
-use super::common::InodeControlBlock;
+use super::{DCache, IcbLike};
+
+// ── InodeControlBlock ────────────────────────────────────────────────────
+
+pub struct InodeControlBlock {
+    /// The root inode doesn't have a parent.
+    pub parent: Option<Inode>,
+    pub rc: u64,
+    pub path: std::path::PathBuf,
+    pub children: Option<Vec<DirEntry>>,
+    /// Cached file attributes from the last lookup.
+    pub attr: Option<FileAttr>,
+}
+
+impl IcbLike for InodeControlBlock {
+    fn new_root(path: std::path::PathBuf) -> Self {
+        Self {
+            rc: 1,
+            parent: None,
+            path,
+            children: None,
+            attr: None,
+        }
+    }
+
+    fn rc(&self) -> u64 {
+        self.rc
+    }
+
+    fn rc_mut(&mut self) -> &mut u64 {
+        &mut self.rc
+    }
+
+}
+
+// ── InodeFactory ────────────────────────────────────────────────────────
 
 /// Monotonically increasing inode allocator.
-pub(super) struct InodeFactory {
+struct InodeFactory {
     next_inode: Inode,
 }
 
@@ -29,43 +66,43 @@ impl InodeFactory {
     }
 }
 
-/// Shared directory cache state.
+// ── MescloudDCache ──────────────────────────────────────────────────────
+
+/// Mescloud-specific directory cache.
 ///
-/// Owns inode allocation, reference counting, attribute caching, and file handle allocation.
-/// Designed for composition — each filesystem struct embeds a `DCache` field.
-pub(super) struct DCache {
-    inode_table: HashMap<Inode, InodeControlBlock>,
+/// Wraps [`DCache<InodeControlBlock>`] and adds inode allocation, attribute
+/// caching, `ensure_child_inode`, and filesystem metadata.
+pub struct MescloudDCache {
+    inner: DCache<InodeControlBlock>,
     inode_factory: InodeFactory,
-    next_fh: FileHandle,
     fs_owner: (u32, u32),
     block_size: u32,
 }
 
-impl DCache {
-    /// Create a new `DCache`. Initializes root ICB (rc=1), caches root dir attr.
+impl std::ops::Deref for MescloudDCache {
+    type Target = DCache<InodeControlBlock>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for MescloudDCache {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl MescloudDCache {
+    /// Create a new `MescloudDCache`. Initializes root ICB (rc=1), caches root dir attr.
     pub fn new(root_ino: Inode, fs_owner: (u32, u32), block_size: u32) -> Self {
-        let now = SystemTime::now();
-
-        let mut inode_table = HashMap::new();
-        inode_table.insert(
-            root_ino,
-            InodeControlBlock {
-                rc: 1,
-                parent: None,
-                path: "/".into(),
-                children: None,
-                attr: None,
-            },
-        );
-
         let mut dcache = Self {
-            inode_table,
+            inner: DCache::new(root_ino, "/"),
             inode_factory: InodeFactory::new(root_ino + 1),
-            next_fh: 1,
             fs_owner,
             block_size,
         };
 
+        let now = SystemTime::now();
         let root_attr = FileAttr::Directory {
             common: dcache.make_common_file_attr(root_ino, 0o755, now, now),
         };
@@ -80,83 +117,15 @@ impl DCache {
         self.inode_factory.allocate()
     }
 
-    /// Allocate a file handle (increments `next_fh` and returns the old value).
-    pub fn allocate_fh(&mut self) -> FileHandle {
-        let fh = self.next_fh;
-        self.next_fh += 1;
-        fh
-    }
-
-    // ── ICB access ──────────────────────────────────────────────────────
-
-    pub fn get_icb(&self, ino: Inode) -> Option<&InodeControlBlock> {
-        self.inode_table.get(&ino)
-    }
-
-    pub fn get_icb_mut(&mut self, ino: Inode) -> Option<&mut InodeControlBlock> {
-        self.inode_table.get_mut(&ino)
-    }
-
-    pub fn contains(&self, ino: Inode) -> bool {
-        self.inode_table.contains_key(&ino)
-    }
-
-    /// Insert an ICB directly (for `ensure_org_inode` / `ensure_repo_inode` patterns).
-    pub fn insert_icb(&mut self, ino: Inode, icb: InodeControlBlock) {
-        self.inode_table.insert(ino, icb);
-    }
-
-    /// Insert an ICB only if absent (for `translate_*_ino_to_*` patterns).
-    /// Returns a mutable reference to the (possibly pre-existing) ICB.
-    pub fn entry_or_insert_icb(
-        &mut self,
-        ino: Inode,
-        icb: impl FnOnce() -> InodeControlBlock,
-    ) -> &mut InodeControlBlock {
-        self.inode_table.entry(ino).or_insert_with(icb)
-    }
-
     // ── Attr caching ────────────────────────────────────────────────────
 
     pub fn get_attr(&self, ino: Inode) -> Option<FileAttr> {
-        self.inode_table.get(&ino).and_then(|icb| icb.attr)
+        self.inner.get_icb(ino).and_then(|icb| icb.attr)
     }
 
     pub fn cache_attr(&mut self, ino: Inode, attr: FileAttr) {
-        if let Some(icb) = self.inode_table.get_mut(&ino) {
+        if let Some(icb) = self.inner.get_icb_mut(ino) {
             icb.attr = Some(attr);
-        }
-    }
-
-    // ── Reference counting ──────────────────────────────────────────────
-
-    /// Increment rc. Panics (via unwrap) if inode doesn't exist.
-    pub fn inc_rc(&mut self, ino: Inode) -> u64 {
-        let icb = self
-            .inode_table
-            .get_mut(&ino)
-            .unwrap_or_else(|| unreachable!("inc_rc: inode {ino} not in table"));
-        icb.rc += 1;
-        icb.rc
-    }
-
-    /// Decrement rc by `nlookups`. Returns `Some(evicted_icb)` if the inode was evicted.
-    pub fn forget(&mut self, ino: Inode, nlookups: u64) -> Option<InodeControlBlock> {
-        match self.inode_table.entry(ino) {
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                if entry.get().rc <= nlookups {
-                    trace!(ino, "evicting inode");
-                    Some(entry.remove())
-                } else {
-                    entry.get_mut().rc -= nlookups;
-                    trace!(ino, new_rc = entry.get().rc, "decremented rc");
-                    None
-                }
-            }
-            std::collections::hash_map::Entry::Vacant(_) => {
-                warn!(ino, "forget on unknown inode");
-                None
-            }
         }
     }
 
@@ -171,12 +140,14 @@ impl DCache {
         kind: DirEntryType,
     ) -> (Inode, FileAttr) {
         // Check existing child by parent + name.
-        if let Some((&existing_ino, _)) = self
-            .inode_table
+        let existing = self
+            .inner
             .iter()
             .find(|&(&_ino, icb)| icb.parent == Some(parent) && icb.path.as_os_str() == name)
-        {
-            if let Some(attr) = self.inode_table.get(&existing_ino).and_then(|icb| icb.attr) {
+            .map(|(&ino, _)| ino);
+
+        if let Some(existing_ino) = existing {
+            if let Some(attr) = self.inner.get_icb(existing_ino).and_then(|icb| icb.attr) {
                 return (existing_ino, attr);
             }
 
@@ -188,7 +159,7 @@ impl DCache {
         }
 
         let ino = self.inode_factory.allocate();
-        self.inode_table.insert(
+        self.inner.insert_icb(
             ino,
             InodeControlBlock {
                 rc: 0,
@@ -259,7 +230,7 @@ impl DCache {
             total_blocks: 0,
             free_blocks: 0,
             available_blocks: 0,
-            total_inodes: self.inode_table.len() as u64,
+            total_inodes: self.inner.inode_count() as u64,
             free_inodes: 0,
             available_inodes: 0,
             filesystem_id: 0,

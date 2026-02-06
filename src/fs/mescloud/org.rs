@@ -9,12 +9,12 @@ use secrecy::SecretString;
 use tracing::{instrument, trace, warn};
 
 use super::common::InodeControlBlock;
-use super::dcache::DCache;
 pub use super::common::{
     GetAttrError, LookupError, OpenError, ReadDirError, ReadError, ReleaseError,
 };
 use super::repo::RepoFs;
-use crate::fs::inode_bridge::HashMapBridge;
+use crate::fs::dcache::bridge::HashMapBridge;
+use crate::fs::dcache::MescloudDCache;
 use crate::fs::r#trait::{
     DirEntry, DirEntryType, FileAttr, FileHandle, FilesystemStats, Fs, Inode, LockOwner, OpenFile,
     OpenFlags,
@@ -50,7 +50,7 @@ pub struct OrgFs {
     name: String,
     client: MesaClient,
 
-    dcache: DCache,
+    dcache: MescloudDCache,
 
     /// Maps org-level repo-root inodes → index into `repos`.
     repo_inodes: HashMap<Inode, usize>,
@@ -142,7 +142,7 @@ impl OrgFs {
         Self {
             name,
             client,
-            dcache: DCache::new(Self::ROOT_INO, fs_owner, Self::BLOCK_SIZE),
+            dcache: MescloudDCache::new(Self::ROOT_INO, fs_owner, Self::BLOCK_SIZE),
             repo_inodes: HashMap::new(),
             owner_inodes: HashMap::new(),
             repos: Vec::new(),

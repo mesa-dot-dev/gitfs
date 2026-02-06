@@ -2,17 +2,7 @@
 
 use thiserror::Error;
 
-use crate::fs::r#trait::{DirEntry, FileAttr, Inode};
-
-pub(super) struct InodeControlBlock {
-    /// The root inode doesn't have a parent.
-    pub parent: Option<Inode>,
-    pub rc: u64,
-    pub path: std::path::PathBuf,
-    pub children: Option<Vec<DirEntry>>,
-    /// Cached file attributes from the last lookup.
-    pub attr: Option<FileAttr>,
-}
+pub(super) use crate::fs::dcache::mescloud::InodeControlBlock;
 
 // ── Error types ──────────────────────────────────────────────────────────────
 

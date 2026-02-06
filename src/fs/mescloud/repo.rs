@@ -14,7 +14,7 @@ use crate::fs::r#trait::{
     LockOwner, OpenFile, OpenFlags,
 };
 
-use super::dcache::{self, DCache};
+use crate::fs::dcache::mescloud::{self as mescloud_dcache, MescloudDCache};
 pub use super::common::{
     GetAttrError, LookupError, OpenError, ReadDirError, ReadError, ReleaseError,
 };
@@ -29,7 +29,7 @@ pub struct RepoFs {
     repo_name: String,
     ref_: String,
 
-    dcache: DCache,
+    dcache: MescloudDCache,
     open_files: HashMap<FileHandle, Inode>,
 }
 
@@ -50,7 +50,7 @@ impl RepoFs {
             org_name,
             repo_name,
             ref_,
-            dcache: DCache::new(Self::ROOT_INO, fs_owner, Self::BLOCK_SIZE),
+            dcache: MescloudDCache::new(Self::ROOT_INO, fs_owner, Self::BLOCK_SIZE),
             open_files: HashMap::new(),
         }
     }
@@ -135,7 +135,7 @@ impl Fs for RepoFs {
             mesa_dev::models::Content::File { size, .. } => FileAttr::RegularFile {
                 common: self.dcache.make_common_file_attr(ino, 0o644, now, now),
                 size,
-                blocks: dcache::blocks_of_size(Self::BLOCK_SIZE, size),
+                blocks: mescloud_dcache::blocks_of_size(Self::BLOCK_SIZE, size),
             },
             mesa_dev::models::Content::Dir { .. } => FileAttr::Directory {
                 common: self.dcache.make_common_file_attr(ino, 0o755, now, now),
