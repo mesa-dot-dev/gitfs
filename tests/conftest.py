@@ -62,12 +62,7 @@ def _generate_config_toml() -> str:
 
 
 def _wait_for_mount(container: DockerContainer, timeout: int = GITFS_READY_TIMEOUT) -> None:
-    """Wait until the FUSE mount is up by checking that 'github' appears in ls /mnt/git-fs.
-
-    Note: The filesystem is on-demand — you cannot ls /mnt/git-fs/github,
-    but you CAN access specific repo paths like /mnt/git-fs/github/owner/repo.
-    We just need to confirm the FUSE mount itself is serving.
-    """
+    """Wait until the FUSE mount is up."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         exit_code, output = container.exec(["ls", MOUNT_POINT])
