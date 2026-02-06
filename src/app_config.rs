@@ -9,12 +9,16 @@ use tracing::{debug, info};
 
 use std::{
     collections::HashMap,
+    io::IsTerminal as _,
     path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
 
-use crate::onboarding::{self, OnboardingError};
+use crate::{
+    onboarding::{self, OnboardingError},
+    term,
+};
 
 /// A `PathBuf` that automatically expands `~` to the user's home directory
 /// during deserialization. This ensures that any path loaded from configuration
@@ -116,6 +120,86 @@ impl Default for CacheConfig {
                 mesa_runtime_dir()
                     .map_or_else(|| PathBuf::from("/tmp/git-fs/cache"), |rd| rd.join("cache")),
             ),
+        }
+    }
+}
+
+/// Where daemon logs should be written.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LogTarget {
+    /// Write logs to stdout (default for foreground mode).
+    #[default]
+    Stdout,
+    /// Write logs to stderr.
+    Stderr,
+    /// Write logs to a file at the given path.
+    File(PathBuf),
+}
+
+impl LogTarget {
+    /// Opens the log file for the daemon, if this target is [`LogTarget::File`].
+    ///
+    /// Returns `None` for stdout/stderr targets (the daemonize crate's default
+    /// sends these to `/dev/null`; the tracing subscriber handles them instead).
+    pub fn open_log_file(&self) -> Result<Option<std::fs::File>, std::io::Error> {
+        match self {
+            Self::Stdout | Self::Stderr => Ok(None),
+            Self::File(path) => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
+                Ok(Some(file))
+            }
+        }
+    }
+}
+
+/// Controls whether ANSI color codes are included in log output.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ColorMode {
+    /// Auto-detect: enable color for terminals, disable for files and pipes.
+    #[default]
+    Auto,
+    /// Always include ANSI color codes.
+    Always,
+    /// Never include ANSI color codes.
+    Never,
+}
+
+/// Logging configuration for the daemon.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct LogConfig {
+    /// Where to write log output. Defaults to stdout.
+    pub target: LogTarget,
+
+    /// Whether to include ANSI color in log output.
+    /// "auto" detects based on whether the target is a terminal.
+    pub color: ColorMode,
+}
+
+impl LogConfig {
+    /// Determines whether ANSI color codes should be used for the configured target.
+    ///
+    /// Rules:
+    /// - `Always` -> true
+    /// - `Never` -> false
+    /// - `Auto` -> true only if the target is stdout/stderr AND it's a terminal (TTY)
+    pub fn should_use_color(&self) -> bool {
+        match self.color {
+            ColorMode::Always => true,
+            ColorMode::Never => false,
+            ColorMode::Auto => match self.target {
+                LogTarget::Stdout => term::should_use_color(&std::io::stdout()),
+                LogTarget::Stderr => term::should_use_color(&std::io::stderr()),
+                LogTarget::File(_) => false,
+            },
         }
     }
 }
@@ -235,12 +319,17 @@ pub struct DaemonConfig {
     /// The path to the PID file for the daemon. Uses /var/run/git-fs.pid if not specified.
     #[serde(default = "default_pid_file")]
     pub pid_file: ExpandedPathBuf,
+
+    /// Logging configuration.
+    #[serde(default)]
+    pub log: LogConfig,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             pid_file: default_pid_file(),
+            log: LogConfig::default(),
         }
     }
 }
@@ -358,6 +447,17 @@ impl Config {
                 "PID file path '{}' has no parent directory.",
                 self.daemon.pid_file.display()
             ));
+        }
+
+        if let LogTarget::File(ref path) = self.daemon.log.target {
+            if path.as_os_str().is_empty() {
+                errors.push("Log file path must not be empty.".to_owned());
+            } else if path.parent().is_none() {
+                errors.push(format!(
+                    "Log file path '{}' has no parent directory.",
+                    path.display()
+                ));
+            }
         }
 
         if errors.is_empty() {
