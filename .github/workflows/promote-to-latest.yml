@@ -148,14 +148,12 @@ jobs:
           echo "sha256=${SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Clone Homebrew tap
-        env:
-          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: |
-          if [ -z "${TAP_TOKEN}" ]; then
-            echo "::error::HOMEBREW_TAP_TOKEN secret is empty or not set"
-            exit 1
-          fi
-          git clone --branch staged "https://x-access-token:${TAP_TOKEN}@github.com/mesa-dot-dev/homebrew-tap.git" tap
+        uses: actions/checkout@v4
+        with:
+          repository: mesa-dot-dev/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+          ref: staged
 
       - name: Compute Homebrew class name
         id: class
@@ -185,13 +183,10 @@ jobs:
 
       - name: Commit and push formulae
         working-directory: tap
-        env:
-          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           git config user.name "mesa-ci[bot]"
           git config user.email "ci-bot@mesa.dev"
           git add Formula/
           git diff --cached --quiet && echo "No changes to commit" && exit 0
           git commit -m "git-fs ${{ needs.promote.outputs.base_version }}"
-          git -c "http.https://github.com/.extraheader=" -c credential.helper= \
-            push "https://x-access-token:${TAP_TOKEN}@github.com/mesa-dot-dev/homebrew-tap.git" staged
+          git push origin staged
