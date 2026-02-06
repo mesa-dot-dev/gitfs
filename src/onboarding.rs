@@ -57,7 +57,7 @@ pub fn run_wizard() -> Result<Config, OnboardingError> {
     let mut org_keys: Vec<(String, SecretString)> = Vec::new();
     loop {
         let prompt_msg = if org_keys.is_empty() {
-            "Would you like to add Mesa organizations?"
+            "Do you want to add integrations with your mesa.dev organizations?"
         } else {
             "Would you like to add another Mesa organization?"
         };
