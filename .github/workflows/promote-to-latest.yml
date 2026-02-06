@@ -165,6 +165,12 @@ jobs:
           SHA256: ${{ steps.sha.outputs.sha256 }}
           CLASS_NAME: ${{ steps.class.outputs.class_name }}
         run: |
+          if [ ! -d tap ]; then
+            echo "Error: tap directory does not exist — clone may have failed"
+            exit 1
+          fi
+          mkdir -p tap/Formula
+
           # Latest formula (class name is always GitFs)
           CLASS_NAME=GitFs envsubst '${CLASS_NAME} ${VERSION} ${SHA256}' < formula.rb > tap/Formula/git-fs.rb
 
