@@ -9,43 +9,11 @@ use std::time::SystemTime;
 use tracing::warn;
 
 use crate::fs::r#trait::{
-    CommonFileAttr, DirEntry, DirEntryType, FileAttr, FilesystemStats, Inode, Permissions,
+    CommonFileAttr, DirEntryType, FileAttr, FilesystemStats, Inode, Permissions,
 };
+use crate::fs::mescloud::dcache::InodeControlBlock;
 
-use super::{DCache, IcbLike};
-
-// ── InodeControlBlock ────────────────────────────────────────────────────
-
-pub struct InodeControlBlock {
-    /// The root inode doesn't have a parent.
-    pub parent: Option<Inode>,
-    pub rc: u64,
-    pub path: std::path::PathBuf,
-    pub children: Option<Vec<DirEntry>>,
-    /// Cached file attributes from the last lookup.
-    pub attr: Option<FileAttr>,
-}
-
-impl IcbLike for InodeControlBlock {
-    fn new_root(path: std::path::PathBuf) -> Self {
-        Self {
-            rc: 1,
-            parent: None,
-            path,
-            children: None,
-            attr: None,
-        }
-    }
-
-    fn rc(&self) -> u64 {
-        self.rc
-    }
-
-    fn rc_mut(&mut self) -> &mut u64 {
-        &mut self.rc
-    }
-
-}
+use super::DCache;
 
 // ── InodeFactory ────────────────────────────────────────────────────────
 
@@ -238,8 +206,4 @@ impl MescloudDCache {
             max_filename_length: 255,
         }
     }
-}
-
-pub fn blocks_of_size(block_size: u32, size: u64) -> u64 {
-    size.div_ceil(u64::from(block_size))
 }

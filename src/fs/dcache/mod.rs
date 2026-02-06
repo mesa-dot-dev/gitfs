@@ -1,10 +1,10 @@
 //! Generic directory cache and inode management primitives.
 
+mod dcache;
 pub mod bridge;
-pub mod mescloud;
 mod table;
 
-pub use mescloud::MescloudDCache;
+pub use dcache::MescloudDCache;
 pub use table::DCache;
 
 /// Common interface for inode control block types usable with `DCache`.
