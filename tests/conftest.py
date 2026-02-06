@@ -21,7 +21,6 @@ os.environ["TESTCONTAINERS_RYUK_DISABLED"] = "true"
 logger = logging.getLogger(__name__)
 
 MOUNT_POINT = "/mnt/git-fs"
-API_KEY = "dp_live_uAgKRbhVNcDiUZXVyTQbBIaJEerhSwQh"
 GITFS_READY_TIMEOUT = 60
 GITFS_READY_POLL_INTERVAL = 2
 
@@ -53,9 +52,6 @@ def _generate_config_toml() -> str:
         mount-point = "{MOUNT_POINT}"
         uid = 0
         gid = 0
-
-        [organizations.github]
-        api-key = "{API_KEY}"
 
         [cache]
         path = "/tmp/git-fs-cache"
