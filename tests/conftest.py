@@ -87,16 +87,18 @@ def gitfs_container(gitfs_image: str) -> Generator[DockerContainer, None, None]:
         # Write config
         config_content = _generate_config_toml()
         container.exec(["mkdir", "-p", "/etc/git-fs"])
+        # Review: Is there no create-file method on the container?
         container.exec([
             "sh", "-c",
             f"cat > /etc/git-fs/config.toml << 'HEREDOC'\n{config_content}\nHEREDOC",
         ])
 
+        # Review: Is there a point to this?
         exit_code, output = container.exec(["cat", "/etc/git-fs/config.toml"])
         assert exit_code == 0, f"Failed to write config: {output}"
         logger.info("Config written:\n%s", output.decode())
 
-        # Create mount point and start git-fs
+        # Review: We shouldn't need to create the mount point. git-fs should handle it.
         container.exec(["mkdir", "-p", MOUNT_POINT])
         container.exec([
             "sh", "-c",

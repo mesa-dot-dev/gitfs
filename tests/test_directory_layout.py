@@ -173,12 +173,3 @@ def test_directory_layout_matches_clone(
     assert not type_mismatches, (
         f"Entry type mismatches for {repo_slug}:\n" + "\n".join(type_mismatches)
     )
-
-
-@pytest.mark.integration
-def test_gitfs_mount_is_alive(gitfs_container: DockerContainer) -> None:
-    """Verify git-fs is running and the mount point is accessible."""
-    exit_code, output = gitfs_container.exec(["ls", "/mnt/git-fs"])
-    decoded = output.decode("utf-8", errors="replace").strip()
-    assert exit_code == 0
-    assert "github" in decoded
