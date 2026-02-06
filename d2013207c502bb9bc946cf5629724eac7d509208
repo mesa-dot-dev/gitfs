@@ -1,0 +1,1 @@
+{"version":3,"timestamp":"2026-02-06T21:04:45.661Z","sessions":{"b72253cf03b3c707":{"agent":"claude","model":"claude-opus-4-6","prompts":[{"id":2,"timestamp":"2026-02-06T21:03:46.854Z","content":null,"tools":{"read":1,"edit":1},"duration":30}],"startedAt":"2026-02-06T21:03:46.854Z"}},"files":{"src/onboarding.rs":[{"session":"b72253cf03b3c707","lines":"59-64","prompt":2}]}}
