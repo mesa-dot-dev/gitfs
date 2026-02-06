@@ -9,8 +9,14 @@ import time
 from pathlib import Path
 from typing import Generator
 
+import os
+
 import pytest
 from testcontainers.core.container import DockerContainer
+
+# Disable Ryuk (testcontainers' crash-recovery sidecar). The context manager
+# on DockerContainer already handles cleanup on normal/exception exit.
+os.environ["TESTCONTAINERS_RYUK_DISABLED"] = "true"
 
 logger = logging.getLogger(__name__)
 
@@ -103,18 +109,19 @@ def gitfs_container(gitfs_image: str) -> Generator[DockerContainer, None, None]:
         container.exec(["mkdir", "-p", MOUNT_POINT])
         container.exec([
             "sh", "-c",
-            "nohup git-fs --config-path /etc/git-fs/config.toml run "
+            "GIT_FS_LOG=debug nohup git-fs --config-path /etc/git-fs/config.toml run "
             "> /tmp/git-fs-stdout.log 2> /tmp/git-fs-stderr.log &",
         ])
 
         _wait_for_mount(container)
         yield container
 
-        # Diagnostic logs on teardown
+        # Diagnostic logs on teardown — DEBUG level so they only appear
+        # in pytest output when a test fails (pytest captures and replays).
         _, stdout_log = container.exec(["cat", "/tmp/git-fs-stdout.log"])
         _, stderr_log = container.exec(["cat", "/tmp/git-fs-stderr.log"])
-        logger.info("git-fs stdout:\n%s", stdout_log.decode("utf-8", errors="replace"))
-        logger.info("git-fs stderr:\n%s", stderr_log.decode("utf-8", errors="replace"))
+        logger.debug("git-fs stdout:\n%s", stdout_log.decode("utf-8", errors="replace"))
+        logger.debug("git-fs stderr:\n%s", stderr_log.decode("utf-8", errors="replace"))
 
 
 def clone_repo(repo_slug: str, dest: Path) -> Path:
