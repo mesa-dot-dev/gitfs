@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-pub(super) use crate::fs::dcache::mescloud::InodeControlBlock;
+pub(super) use super::dcache::InodeControlBlock;
 
 // ── Error types ──────────────────────────────────────────────────────────────
 
