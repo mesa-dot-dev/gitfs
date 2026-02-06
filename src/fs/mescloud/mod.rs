@@ -14,7 +14,7 @@ use crate::fs::r#trait::{
 };
 
 #[cfg(feature = "staging")]
-const MESA_API_BASE_URL: &str = "https://depot.staging.mesa.dev/api/v1";
+const MESA_API_BASE_URL: &str = "https://staging.depot.mesa.dev/api/v1";
 #[cfg(not(feature = "staging"))]
 const MESA_API_BASE_URL: &str = "https://depot.mesa.dev/api/v1";
 
