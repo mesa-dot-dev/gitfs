@@ -14,7 +14,8 @@ use crate::fs::r#trait::{
     LockOwner, OpenFile, OpenFlags,
 };
 
-use crate::fs::dcache::mescloud::{self as mescloud_dcache, MescloudDCache};
+use crate::fs::dcache::MescloudDCache;
+use super::dcache as mescloud_dcache;
 pub use super::common::{
     GetAttrError, LookupError, OpenError, ReadDirError, ReadError, ReleaseError,
 };
