@@ -31,7 +31,7 @@ struct Args {
     config_path: Option<PathBuf>,
 
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -73,7 +73,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    match args.command {
+    match args.command.unwrap_or(Command::Run { daemonize: false }) {
         Command::Run { daemonize } => {
             if let Err(e) = fuse_check::ensure_fuse() {
                 error!("{e}");
