@@ -17,6 +17,8 @@ mod common;
 pub use common::{GetAttrError, LookupError, OpenError, ReadDirError, ReadError, ReleaseError};
 use common::{InodeControlBlock, InodeFactory};
 
+mod dcache;
+
 mod org;
 pub use org::OrgConfig;
 use org::OrgFs;
