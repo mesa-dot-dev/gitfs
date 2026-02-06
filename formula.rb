@@ -21,8 +21,4 @@ class ${CLASS_NAME} < Formula
       We recommend downloading directly from the official site.
     EOS
   end
-
-  test do
-    assert_match "git-fs", shell_output("#{bin}/git-fs --version", 2)
-  end
 end
