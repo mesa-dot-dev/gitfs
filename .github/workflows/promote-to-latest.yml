@@ -185,8 +185,7 @@ jobs:
           git config user.name "mesa-ci[bot]"
           git config user.email "ci-bot@mesa.dev"
           git remote set-url origin "https://x-access-token:${TAP_TOKEN}@github.com/mesa-dot-dev/homebrew-tap.git"
-          git config --global --unset-all http.https://github.com/.extraheader || true
           git add Formula/
           git diff --cached --quiet && echo "No changes to commit" && exit 0
           git commit -m "git-fs ${{ needs.promote.outputs.base_version }}"
-          git push origin staged
+          git -c credential.helper= -c "http.https://github.com/.extraheader=" push origin staged
