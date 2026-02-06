@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import textwrap
 import time
+from collections.abc import Generator
 from pathlib import Path
-from typing import Generator
-
-import os
 
 import pytest
 from testcontainers.core.container import DockerContainer
@@ -36,9 +35,12 @@ def gitfs_image() -> str:
     logger.info("Building Docker image from %s", REPO_ROOT)
     subprocess.run(
         [
-            "docker", "build",
-            "-f", str(DOCKERFILE_PATH),
-            "-t", IMAGE_TAG,
+            "docker",
+            "build",
+            "-f",
+            str(DOCKERFILE_PATH),
+            "-t",
+            IMAGE_TAG,
             str(REPO_ROOT),
         ],
         check=True,
@@ -79,7 +81,7 @@ def _wait_for_mount(container: DockerContainer, timeout: int = GITFS_READY_TIMEO
 
 
 @pytest.fixture(scope="session")
-def gitfs_container(gitfs_image: str) -> Generator[DockerContainer, None, None]:
+def gitfs_container(gitfs_image: str) -> Generator[DockerContainer]:
     """Start a privileged container with FUSE, write config, launch git-fs."""
     container = DockerContainer(gitfs_image).with_kwargs(privileged=True)
 
@@ -88,10 +90,13 @@ def gitfs_container(gitfs_image: str) -> Generator[DockerContainer, None, None]:
         config_content = _generate_config_toml()
         container.exec(["mkdir", "-p", "/etc/git-fs"])
         # Review: Is there no create-file method on the container?
-        container.exec([
-            "sh", "-c",
-            f"cat > /etc/git-fs/config.toml << 'HEREDOC'\n{config_content}\nHEREDOC",
-        ])
+        container.exec(
+            [
+                "sh",
+                "-c",
+                f"cat > /etc/git-fs/config.toml << 'HEREDOC'\n{config_content}\nHEREDOC",
+            ]
+        )
 
         # Review: Is there a point to this?
         exit_code, output = container.exec(["cat", "/etc/git-fs/config.toml"])
@@ -100,11 +105,14 @@ def gitfs_container(gitfs_image: str) -> Generator[DockerContainer, None, None]:
 
         # Review: We shouldn't need to create the mount point. git-fs should handle it.
         container.exec(["mkdir", "-p", MOUNT_POINT])
-        container.exec([
-            "sh", "-c",
-            "GIT_FS_LOG=debug nohup git-fs --config-path /etc/git-fs/config.toml run "
-            "> /tmp/git-fs-stdout.log 2> /tmp/git-fs-stderr.log &",
-        ])
+        container.exec(
+            [
+                "sh",
+                "-c",
+                "GIT_FS_LOG=debug nohup git-fs --config-path /etc/git-fs/config.toml run "
+                "> /tmp/git-fs-stdout.log 2> /tmp/git-fs-stderr.log &",
+            ]
+        )
 
         _wait_for_mount(container)
         yield container

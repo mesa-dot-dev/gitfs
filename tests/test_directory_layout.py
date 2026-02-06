@@ -82,16 +82,18 @@ def gather_tree_from_gitfs(
             f"git-fs logs:\n{_get_gitfs_logs(container)}"
         )
 
-    exit_code, output = container.exec([
-        "find", repo_root,
-        "-mindepth", "1",
-        "-printf", r"%y %P\n",
-    ])
+    exit_code, output = container.exec(
+        [
+            "find",
+            repo_root,
+            "-mindepth",
+            "1",
+            "-printf",
+            r"%y %P\n",
+        ]
+    )
     if exit_code != 0:
-        raise RuntimeError(
-            f"find failed (exit={exit_code}): "
-            f"{output.decode('utf-8', errors='replace')}"
-        )
+        raise RuntimeError(f"find failed (exit={exit_code}): {output.decode('utf-8', errors='replace')}")
 
     entries: set[TreeEntry] = set()
     for line in output.decode("utf-8", errors="replace").strip().splitlines():
@@ -151,11 +153,9 @@ def test_directory_layout_matches_clone(
     extra_in_gitfs = gitfs_paths - clone_paths
 
     if missing_in_gitfs:
-        logger.warning("Missing in git-fs for %s:\n  %s", repo_slug,
-                        "\n  ".join(sorted(missing_in_gitfs)[:20]))
+        logger.warning("Missing in git-fs for %s:\n  %s", repo_slug, "\n  ".join(sorted(missing_in_gitfs)[:20]))
     if extra_in_gitfs:
-        logger.warning("Extra in git-fs for %s:\n  %s", repo_slug,
-                        "\n  ".join(sorted(extra_in_gitfs)[:20]))
+        logger.warning("Extra in git-fs for %s:\n  %s", repo_slug, "\n  ".join(sorted(extra_in_gitfs)[:20]))
 
     assert clone_paths == gitfs_paths, (
         f"Directory layout mismatch for {repo_slug}. "
@@ -172,6 +172,4 @@ def test_directory_layout_matches_clone(
         if clone_map[p] != gitfs_map[p]
     ]
 
-    assert not type_mismatches, (
-        f"Entry type mismatches for {repo_slug}:\n" + "\n".join(type_mismatches)
-    )
+    assert not type_mismatches, f"Entry type mismatches for {repo_slug}:\n" + "\n".join(type_mismatches)
