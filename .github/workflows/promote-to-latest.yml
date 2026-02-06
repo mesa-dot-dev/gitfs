@@ -130,6 +130,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Homebrew
         uses: Homebrew/actions/setup-homebrew@master
@@ -179,13 +181,10 @@ jobs:
 
       - name: Commit and push formulae
         working-directory: tap
-        env:
-          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           git config user.name "mesa-ci[bot]"
           git config user.email "ci-bot@mesa.dev"
-          git remote set-url origin "https://x-access-token:${TAP_TOKEN}@github.com/mesa-dot-dev/homebrew-tap.git"
           git add Formula/
           git diff --cached --quiet && echo "No changes to commit" && exit 0
           git commit -m "git-fs ${{ needs.promote.outputs.base_version }}"
-          git -c credential.helper= -c "http.https://github.com/.extraheader=" push origin staged
+          git push origin staged
