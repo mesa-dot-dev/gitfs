@@ -6,7 +6,10 @@ use std::path::PathBuf;
 use inquire::{Confirm, Password, Text, validator::Validation};
 use secrecy::SecretString;
 
-use crate::app_config::{Config, ExpandedPathBuf, OrganizationConfig};
+use crate::{
+    app_config::{Config, ExpandedPathBuf, OrganizationConfig},
+    term::should_use_color,
+};
 
 const WELCOME_MESSAGE: &str = "
     \x1b[32m@@@@\x1b[0m      Welcome to \x1b[1mgit-fs\x1b[0m! Let's get you started!
@@ -18,6 +21,18 @@ const WELCOME_MESSAGE: &str = "
     \x1b[32m@@@@\x1b[0m      Mesa ships a fast on-demand VCS, optimized for agentic AI.
     \x1b[32m@@@@\x1b[0m      You do not need to use Mesa products to use \x1b[1mgit-fs\x1b[0m, but if you
     \x1b[32m@@@@\x1b[0m      like \x1b[1mgit-fs\x1b[0m, we're sure you're going to love \x1b]8;;https://mesa.dev\x1b\\\x1b[1mmesa.dev\x1b[0m\x1b]8;;\x1b\\.
+";
+
+const WELCOME_MESSAGE_PLAIN: &str = "
+    @@@@      Welcome to git-fs! Let's get you started!
+    @@@@ @@@
+    @@@@ @@@  git-fs allows you to mount all of GitHub on your local filesystem.
+@@@ @@@@@@@@  It works by mirroring GitHub repositories to fast caches hosted on mesa.dev.
+ @@@@@@@@@@
+  @@@@@@@@
+    @@@@      Mesa ships a fast on-demand VCS, optimized for agentic AI.
+    @@@@      You do not need to use Mesa products to use git-fs, but if you
+    @@@@      like git-fs, we're sure you're going to love mesa.dev.
 ";
 
 /// Error type for onboarding wizard failures.
@@ -43,7 +58,12 @@ pub fn run_wizard() -> Result<Config, OnboardingError> {
         return Err(OnboardingError::NonInteractive);
     }
 
-    println!("{WELCOME_MESSAGE}");
+    if should_use_color(&std::io::stderr()) {
+        eprintln!("{WELCOME_MESSAGE}");
+    } else {
+        inquire::set_global_render_config(inquire::ui::RenderConfig::empty());
+        eprintln!("{WELCOME_MESSAGE_PLAIN}");
+    }
 
     let defaults = Config::default();
 

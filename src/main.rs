@@ -9,6 +9,7 @@ mod daemon;
 mod fs;
 mod fuse_check;
 mod onboarding;
+mod term;
 mod trc;
 mod updates;
 
@@ -93,16 +94,35 @@ fn main() {
                     return;
                 }
 
-                let daemonize = daemonize::Daemonize::new()
+                let log_file = match config.daemon.log.target.open_log_file() {
+                    Ok(f) => f,
+                    Err(e) => {
+                        error!("Failed to open log file: {e}");
+                        return;
+                    }
+                };
+
+                let mut daemonize = daemonize::Daemonize::new()
                     .pid_file(&config.daemon.pid_file)
                     .chown_pid_file(true)
                     .user(config.uid)
                     .group(config.gid);
 
-                // TODO(markovejnovic): Handle stdout, stderr
+                if let Some(file) = log_file {
+                    match file.try_clone() {
+                        Ok(clone) => {
+                            daemonize = daemonize.stdout(file).stderr(clone);
+                        }
+                        Err(e) => {
+                            error!("Failed to clone log file handle: {e}");
+                            return;
+                        }
+                    }
+                }
+
                 match daemonize.start() {
                     Ok(()) => {
-                        trc_handle.reconfigure_for_daemon();
+                        trc_handle.reconfigure_for_daemon(config.daemon.log.should_use_color());
                         if let Err(e) = daemon::spawn(config) {
                             error!("Daemon failed: {e}");
                             std::process::exit(1);
