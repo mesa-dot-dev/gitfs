@@ -252,6 +252,10 @@ impl DCache {
 
     // ── Filesystem stats ────────────────────────────────────────────────
 
+    pub fn fs_owner(&self) -> (u32, u32) {
+        self.fs_owner
+    }
+
     pub fn statfs(&self) -> FilesystemStats {
         FilesystemStats {
             block_size: self.block_size,
