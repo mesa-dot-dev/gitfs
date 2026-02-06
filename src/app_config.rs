@@ -9,7 +9,6 @@ use tracing::{debug, info};
 
 use std::{
     collections::HashMap,
-    io::IsTerminal as _,
     path::{Path, PathBuf},
 };
 
