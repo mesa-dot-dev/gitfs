@@ -30,7 +30,6 @@ line-length = 120
 select = ["ALL"]
 
 [tool.ruff.lint.per-file-ignores]
-"main.py" = ["T201"]
 "tests/*" = [
     "S", # It's tests, no need for security
 ]
@@ -42,7 +41,7 @@ indent-style = "space"
 [tool.pyright]
 pythonVersion = "3.14"
 typeCheckingMode = "strict"
-include = ["main.py", "tests"]
+include = ["tests"]
 reportMissingTypeStubs = false
 reportUnknownMemberType = false
 reportUnknownVariableType = false

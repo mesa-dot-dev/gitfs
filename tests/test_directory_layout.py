@@ -9,16 +9,21 @@ import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
-from testcontainers.core.container import DockerContainer
 
 from tests.conftest import MOUNT_POINT, clone_repo
+
+if TYPE_CHECKING:
+    from testcontainers.core.container import DockerContainer
 
 logger = logging.getLogger(__name__)
 
 
 class EntryKind(Enum):
+    """Kind of filesystem entry."""
+
     FILE = auto()
     DIRECTORY = auto()
     SYMLINK = auto()
@@ -26,6 +31,8 @@ class EntryKind(Enum):
 
 @dataclass(frozen=True)
 class TreeEntry:
+    """A single entry in a directory tree."""
+
     relative_path: str
     kind: EntryKind
 
@@ -42,13 +49,13 @@ def gather_tree_from_clone(clone_path: Path) -> set[TreeEntry]:
         rel_dir = os.path.relpath(dirpath, clone_str)
 
         for d in dirnames:
-            rel = os.path.join(rel_dir, d) if rel_dir != "." else d
+            rel = str(Path(rel_dir) / d) if rel_dir != "." else d
             entries.add(TreeEntry(relative_path=rel, kind=EntryKind.DIRECTORY))
 
         for f in filenames:
-            rel = os.path.join(rel_dir, f) if rel_dir != "." else f
-            full = os.path.join(dirpath, f)
-            if os.path.islink(full):
+            rel = str(Path(rel_dir) / f) if rel_dir != "." else f
+            full_path = Path(dirpath) / f
+            if full_path.is_symlink():
                 entries.add(TreeEntry(relative_path=rel, kind=EntryKind.SYMLINK))
             else:
                 entries.add(TreeEntry(relative_path=rel, kind=EntryKind.FILE))
@@ -76,11 +83,12 @@ def gather_tree_from_gitfs(
 
     exit_code, output = container.exec(["ls", repo_root])
     if exit_code != 0:
-        raise RuntimeError(
+        msg = (
             f"Repo root {repo_root} not accessible: "
             f"{output.decode('utf-8', errors='replace')}\n"
-            f"git-fs logs:\n{_get_gitfs_logs(container)}",
+            f"git-fs logs:\n{_get_gitfs_logs(container)}"
         )
+        raise RuntimeError(msg)
 
     exit_code, output = container.exec(
         [
@@ -93,7 +101,8 @@ def gather_tree_from_gitfs(
         ],
     )
     if exit_code != 0:
-        raise RuntimeError(f"find failed (exit={exit_code}): {output.decode('utf-8', errors='replace')}")
+        msg = f"find failed (exit={exit_code}): {output.decode('utf-8', errors='replace')}"
+        raise RuntimeError(msg)
 
     entries: set[TreeEntry] = set()
     for line in output.decode("utf-8", errors="replace").strip().splitlines():
@@ -130,6 +139,7 @@ def test_directory_layout_matches_clone(
     repo_slug: str,
 ) -> None:
     """Compare the directory tree visible through git-fs with a shallow clone.
+
     Only entry names and types (file/directory/symlink) are compared, NOT contents.
     """
     owner, repo = repo_slug.split("/", 1)

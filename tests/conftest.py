@@ -7,8 +7,11 @@ import os
 import subprocess
 import textwrap
 import time
-from collections.abc import Generator
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
 
 import pytest
 from testcontainers.core.container import DockerContainer
@@ -74,10 +77,11 @@ def _wait_for_mount(container: DockerContainer, timeout: int = GITFS_READY_TIMEO
             return
         time.sleep(GITFS_READY_POLL_INTERVAL)
     exit_code, output = container.exec(["ls", "-la", MOUNT_POINT])
-    raise TimeoutError(
+    msg = (
         f"git-fs mount did not become ready within {timeout}s. "
-        f"Mount point listing (exit={exit_code}): {output.decode('utf-8', errors='replace')}",
+        f"Mount point listing (exit={exit_code}): {output.decode('utf-8', errors='replace')}"
     )
+    raise TimeoutError(msg)
 
 
 @pytest.fixture(scope="session")
