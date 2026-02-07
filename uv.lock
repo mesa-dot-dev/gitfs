@@ -60,8 +60,8 @@ wheels = [
 ]
 
 [[package]]
-name = "git-fs"
-version = "0.1.0"
+name = "git-fs-tests"
+version = "0.0.0"
 source = { virtual = "." }
 
 [package.dev-dependencies]
