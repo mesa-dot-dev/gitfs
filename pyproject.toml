@@ -27,22 +27,13 @@ target-version = "py314"
 line-length = 120
 
 [tool.ruff.lint]
-select = [
-    "E",    # pycodestyle errors
-    "W",    # pycodestyle warnings
-    "F",    # pyflakes
-    "I",    # isort (import sorting)
-    "UP",   # pyupgrade
-    "B",    # flake8-bugbear
-    "SIM",  # flake8-simplify
-    "RUF",  # ruff-specific rules
-    "PT",   # flake8-pytest-style
-    "T20",  # flake8-print
-    "LOG",  # flake8-logging
-]
+select = ["ALL"]
 
 [tool.ruff.lint.per-file-ignores]
 "main.py" = ["T201"]
+"tests/*" = [
+    "S", # It's tests, no need for security
+]
 
 [tool.ruff.format]
 quote-style = "double"

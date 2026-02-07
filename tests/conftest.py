@@ -76,7 +76,7 @@ def _wait_for_mount(container: DockerContainer, timeout: int = GITFS_READY_TIMEO
     exit_code, output = container.exec(["ls", "-la", MOUNT_POINT])
     raise TimeoutError(
         f"git-fs mount did not become ready within {timeout}s. "
-        f"Mount point listing (exit={exit_code}): {output.decode('utf-8', errors='replace')}"
+        f"Mount point listing (exit={exit_code}): {output.decode('utf-8', errors='replace')}",
     )
 
 
@@ -95,7 +95,7 @@ def gitfs_container(gitfs_image: str) -> Generator[DockerContainer]:
                 "sh",
                 "-c",
                 f"cat > /etc/git-fs/config.toml << 'HEREDOC'\n{config_content}\nHEREDOC",
-            ]
+            ],
         )
 
         # Review: Is there a point to this?
@@ -111,7 +111,7 @@ def gitfs_container(gitfs_image: str) -> Generator[DockerContainer]:
                 "-c",
                 "GIT_FS_LOG=debug nohup git-fs --config-path /etc/git-fs/config.toml run "
                 "> /tmp/git-fs-stdout.log 2> /tmp/git-fs-stderr.log &",
-            ]
+            ],
         )
 
         _wait_for_mount(container)

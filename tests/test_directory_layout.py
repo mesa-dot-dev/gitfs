@@ -79,7 +79,7 @@ def gather_tree_from_gitfs(
         raise RuntimeError(
             f"Repo root {repo_root} not accessible: "
             f"{output.decode('utf-8', errors='replace')}\n"
-            f"git-fs logs:\n{_get_gitfs_logs(container)}"
+            f"git-fs logs:\n{_get_gitfs_logs(container)}",
         )
 
     exit_code, output = container.exec(
@@ -90,7 +90,7 @@ def gather_tree_from_gitfs(
             "1",
             "-printf",
             r"%y %P\n",
-        ]
+        ],
     )
     if exit_code != 0:
         raise RuntimeError(f"find failed (exit={exit_code}): {output.decode('utf-8', errors='replace')}")
@@ -129,8 +129,7 @@ def test_directory_layout_matches_clone(
     tmp_path: Path,
     repo_slug: str,
 ) -> None:
-    """
-    Compare the directory tree visible through git-fs with a shallow clone.
+    """Compare the directory tree visible through git-fs with a shallow clone.
     Only entry names and types (file/directory/symlink) are compared, NOT contents.
     """
     owner, repo = repo_slug.split("/", 1)
