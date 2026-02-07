@@ -1,7 +1,7 @@
 [project]
-name = "git-fs-tests"
+name = "git-fs"
 version = "0.1.0"
-description = "Add your description here"
+description = "Mount Mesa, GitHub and Gitlab repositories as local filesystems via FUSE"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = []
