@@ -5,3 +5,4 @@
 
 # OpenCode local plugin (installed by agentblame init)
 .opencode/
+!.opencode/

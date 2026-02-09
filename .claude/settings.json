@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "agentblame capture --provider claude"
+            "command": "command -v bunx >/dev/null 2>&1 && bunx @mesadev/agentblame capture --provider claude 2>/dev/null || true"
           }
         ]
       },
@@ -15,7 +15,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "agentblame capture --provider claude"
+            "command": "command -v bunx >/dev/null 2>&1 && bunx @mesadev/agentblame capture --provider claude 2>/dev/null || true"
           }
         ]
       },
@@ -24,7 +24,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "agentblame capture --provider claude"
+            "command": "command -v bunx >/dev/null 2>&1 && bunx @mesadev/agentblame capture --provider claude 2>/dev/null || true"
           }
         ]
       }
@@ -35,7 +35,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "agentblame capture --provider claude",
+            "command": "command -v bunx >/dev/null 2>&1 && bunx @mesadev/agentblame capture --provider claude 2>/dev/null || true",
             "async": true
           }
         ]
