@@ -70,6 +70,7 @@ class EntryInfo:
         return cls(kind=EntryKind.FILE, executable=bool(mode & stat.S_IXUSR))
 
     def __str__(self) -> str:
+        """String representation showing type and executable bit."""
         if self.kind is EntryKind.FILE:
             return f"FILE({'x' if self.executable else '-'})"
         return self.kind.value
