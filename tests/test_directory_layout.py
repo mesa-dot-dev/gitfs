@@ -53,7 +53,7 @@ class EntryKind(enum.StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class _EntryInfo:
+class EntryInfo:
     """Filesystem entry metadata: kind and executable bit."""
 
     kind: EntryKind
@@ -87,8 +87,8 @@ def dfs_compare(
     def _is_excluded(name: str) -> bool:
         return any(fnmatch.fnmatch(name, g) for g in excluded_globs)
 
-    lhs_info = _EntryInfo.from_path(lhs)
-    rhs_info = _EntryInfo.from_path(rhs)
+    lhs_info = EntryInfo.from_path(lhs)
+    rhs_info = EntryInfo.from_path(rhs)
     assert lhs_info == rhs_info, (
         f"Entry mismatch at {lhs.name}: {lhs} is {lhs_info}, {rhs} is {rhs_info}"
     )
