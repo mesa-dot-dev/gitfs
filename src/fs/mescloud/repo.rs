@@ -6,8 +6,8 @@ use std::{collections::HashMap, ffi::OsStr, path::PathBuf, time::SystemTime};
 
 use base64::Engine as _;
 use bytes::Bytes;
-use mesa_dev::low_level::content::{Content, DirEntry as MesaDirEntry};
 use mesa_dev::MesaClient;
+use mesa_dev::low_level::content::{Content, DirEntry as MesaDirEntry};
 use num_traits::cast::ToPrimitive as _;
 use tracing::{instrument, trace, warn};
 
@@ -131,7 +131,10 @@ impl Fs for RepoFs {
             .await
             .map_err(MesaApiError::from)?;
 
-        #[expect(clippy::match_same_arms, reason = "symlink arm will diverge once readlink is wired up")]
+        #[expect(
+            clippy::match_same_arms,
+            reason = "symlink arm will diverge once readlink is wired up"
+        )]
         let kind = match &content {
             Content::File(_) => DirEntryType::RegularFile,
             // TODO(MES-712): return DirEntryType::Symlink and FileAttr::Symlink, then wire up readlink.
