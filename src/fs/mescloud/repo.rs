@@ -15,6 +15,7 @@ use crate::fs::r#trait::{
     LockOwner, OpenFile, OpenFlags,
 };
 
+use super::common::MesaApiError;
 pub use super::common::{
     GetAttrError, LookupError, OpenError, ReadDirError, ReadError, ReleaseError,
 };
@@ -127,7 +128,7 @@ impl Fs for RepoFs {
             .content()
             .get(Some(self.ref_.as_str()), file_path.as_deref(), None)
             .await
-            .map_err(|e| LookupError::RemoteMesaError(e.to_string()))?;
+            .map_err(MesaApiError::from)?;
 
         let kind = match &content {
             Content::File(_) | Content::Symlink(_) => DirEntryType::RegularFile,
@@ -203,7 +204,7 @@ impl Fs for RepoFs {
             .content()
             .get(Some(self.ref_.as_str()), file_path.as_deref(), None)
             .await
-            .map_err(|e| ReadDirError::RemoteMesaError(e.to_string()))?;
+            .map_err(MesaApiError::from)?;
 
         let mesa_entries = match content {
             Content::Dir(d) => d.entries,
@@ -299,7 +300,7 @@ impl Fs for RepoFs {
             .content()
             .get(Some(self.ref_.as_str()), file_path.as_deref(), None)
             .await
-            .map_err(|e| ReadError::RemoteMesaError(e.to_string()))?;
+            .map_err(MesaApiError::from)?;
 
         let encoded_content = match content {
             Content::File(f) => f.content.unwrap_or_default(),

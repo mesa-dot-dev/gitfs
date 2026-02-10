@@ -1,8 +1,48 @@
 //! Shared types and helpers used by both `MesaFS` and `RepoFs`.
 
+use mesa_dev::low_level::apis;
 use thiserror::Error;
 
 pub(super) use super::icache::InodeControlBlock;
+
+/// A concrete error type that preserves the structure of `mesa_dev::low_level::apis::Error<T>`
+/// without the generic parameter.
+#[derive(Debug, Error)]
+pub enum MesaApiError {
+    #[error("HTTP request error")]
+    Reqwest(#[from] reqwest::Error),
+
+    #[error("HTTP middleware error")]
+    ReqwestMiddleware(#[from] reqwest_middleware::Error),
+
+    #[error("JSON deserialization error")]
+    Serde(#[from] serde_json::Error),
+
+    #[error("JSON deserialization error at path")]
+    SerdePath(#[from] serde_path_to_error::Error<serde_json::Error>),
+
+    #[error("IO error")]
+    Io(#[from] std::io::Error),
+
+    #[error("API returned HTTP {status}")]
+    Response { status: u16, body: String },
+}
+
+impl<T: std::fmt::Debug + Send + Sync + 'static> From<apis::Error<T>> for MesaApiError {
+    fn from(e: apis::Error<T>) -> Self {
+        match e {
+            apis::Error::Reqwest(e) => Self::Reqwest(e),
+            apis::Error::ReqwestMiddleware(e) => Self::ReqwestMiddleware(e),
+            apis::Error::Serde(e) => Self::Serde(e),
+            apis::Error::SerdePathToError(e) => Self::SerdePath(e),
+            apis::Error::Io(e) => Self::Io(e),
+            apis::Error::ResponseError(rc) => Self::Response {
+                status: rc.status.as_u16(),
+                body: rc.content,
+            },
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum LookupError {
@@ -12,8 +52,8 @@ pub enum LookupError {
     #[error("file does not exist")]
     FileDoesNotExist,
 
-    #[error("remote mesa error: {0}")]
-    RemoteMesaError(String),
+    #[error("remote mesa error")]
+    RemoteMesaError(#[from] MesaApiError),
 }
 
 impl From<LookupError> for i32 {
@@ -61,8 +101,8 @@ pub enum ReadError {
     #[error("inode not found")]
     InodeNotFound,
 
-    #[error("remote mesa error: {0}")]
-    RemoteMesaError(String),
+    #[error("remote mesa error")]
+    RemoteMesaError(#[from] MesaApiError),
 
     #[error("content is not a file")]
     NotAFile,
@@ -87,8 +127,8 @@ pub enum ReadDirError {
     #[error("inode not found")]
     InodeNotFound,
 
-    #[error("remote mesa error: {0}")]
-    RemoteMesaError(String),
+    #[error("remote mesa error")]
+    RemoteMesaError(#[from] MesaApiError),
 
     #[error("inode is not a directory")]
     NotADirectory,

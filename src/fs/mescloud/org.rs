@@ -8,7 +8,7 @@ use mesa_dev::MesaClient;
 use secrecy::SecretString;
 use tracing::{instrument, trace, warn};
 
-use super::common::InodeControlBlock;
+use super::common::{InodeControlBlock, MesaApiError};
 pub use super::common::{
     GetAttrError, LookupError, OpenError, ReadDirError, ReadError, ReleaseError,
 };
@@ -282,14 +282,14 @@ impl OrgFs {
     async fn wait_for_sync(
         &self,
         repo_name: &str,
-    ) -> Result<mesa_dev::models::PostByOrgRepos201Response, String> {
+    ) -> Result<mesa_dev::models::PostByOrgRepos201Response, MesaApiError> {
         self.client
             .org(&self.name)
             .repos()
             .at(repo_name)
             .get()
             .await
-            .map_err(|e| e.to_string())
+            .map_err(MesaApiError::from)
     }
 
     /// Allocate an org-level file handle and map it through the bridge.
@@ -372,10 +372,7 @@ impl Fs for OrgFs {
                     trace!(repo = name_str, "lookup: resolving repo");
 
                     // Validate repo exists via API.
-                    let repo = self
-                        .wait_for_sync(name_str)
-                        .await
-                        .map_err(LookupError::RemoteMesaError)?;
+                    let repo = self.wait_for_sync(name_str).await?;
 
                     let (ino, attr) = self.ensure_repo_inode(
                         name_str,
@@ -408,10 +405,7 @@ impl Fs for OrgFs {
                 );
 
                 // Validate via API (uses encoded name).
-                let repo = self
-                    .wait_for_sync(&encoded)
-                    .await
-                    .map_err(LookupError::RemoteMesaError)?;
+                let repo = self.wait_for_sync(&encoded).await?;
 
                 let (ino, attr) =
                     self.ensure_repo_inode(&encoded, repo_name_str, &repo.default_branch, parent);
@@ -477,7 +471,7 @@ impl Fs for OrgFs {
                     .list(None)
                     .try_collect()
                     .await
-                    .map_err(|e| ReadDirError::RemoteMesaError(e.to_string()))?;
+                    .map_err(MesaApiError::from)?;
 
                 let repo_infos: Vec<(String, String)> = repos
                     .into_iter()
