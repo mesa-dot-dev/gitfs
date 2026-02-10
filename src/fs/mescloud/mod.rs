@@ -245,7 +245,7 @@ impl Fs for MesaFS {
     type ReaddirError = ReadDirError;
     type ReleaseError = ReleaseError;
 
-    #[instrument(skip(self))]
+    #[instrument(name = "MesaFS::lookup", skip(self))]
     async fn lookup(&mut self, parent: Inode, name: &OsStr) -> Result<FileAttr, LookupError> {
         match self.inode_role(parent).await {
             InodeRole::Root => {
@@ -267,7 +267,7 @@ impl Fs for MesaFS {
         }
     }
 
-    #[instrument(skip(self))]
+    #[instrument(name = "MesaFS::getattr", skip(self))]
     async fn getattr(
         &mut self,
         ino: Inode,
@@ -276,7 +276,7 @@ impl Fs for MesaFS {
         self.composite.delegated_getattr(ino).await
     }
 
-    #[instrument(skip(self))]
+    #[instrument(name = "MesaFS::readdir", skip(self))]
     async fn readdir(&mut self, ino: Inode) -> Result<&[DirEntry], ReadDirError> {
         match self.inode_role(ino).await {
             InodeRole::Root => {
@@ -306,12 +306,12 @@ impl Fs for MesaFS {
         }
     }
 
-    #[instrument(skip(self))]
+    #[instrument(name = "MesaFS::open", skip(self))]
     async fn open(&mut self, ino: Inode, flags: OpenFlags) -> Result<OpenFile, OpenError> {
         self.composite.delegated_open(ino, flags).await
     }
 
-    #[instrument(skip(self))]
+    #[instrument(name = "MesaFS::read", skip(self))]
     async fn read(
         &mut self,
         ino: Inode,
@@ -326,7 +326,7 @@ impl Fs for MesaFS {
             .await
     }
 
-    #[instrument(skip(self))]
+    #[instrument(name = "MesaFS::release", skip(self))]
     async fn release(
         &mut self,
         ino: Inode,
@@ -339,7 +339,7 @@ impl Fs for MesaFS {
             .await
     }
 
-    #[instrument(skip(self))]
+    #[instrument(name = "MesaFS::forget", skip(self))]
     async fn forget(&mut self, ino: Inode, nlookups: u64) {
         // MesaFS has no extra state to clean up on eviction (unlike OrgFs::owner_inodes).
         let _ = self.composite.delegated_forget(ino, nlookups).await;

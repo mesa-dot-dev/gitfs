@@ -246,7 +246,7 @@ impl Fs for RepoFs {
     type ReaddirError = ReadDirError;
     type ReleaseError = ReleaseError;
 
-    #[instrument(skip(self), fields(repo = %self.repo_name))]
+    #[instrument(name = "RepoFs::lookup", skip(self), fields(repo = %self.repo_name))]
     async fn lookup(&mut self, parent: Inode, name: &OsStr) -> Result<FileAttr, LookupError> {
         debug_assert!(
             self.icache.contains(parent),
@@ -266,7 +266,7 @@ impl Fs for RepoFs {
         Ok(attr)
     }
 
-    #[instrument(skip(self), fields(repo = %self.repo_name))]
+    #[instrument(name = "RepoFs::getattr", skip(self), fields(repo = %self.repo_name))]
     async fn getattr(
         &mut self,
         ino: Inode,
@@ -278,7 +278,7 @@ impl Fs for RepoFs {
         })
     }
 
-    #[instrument(skip(self), fields(repo = %self.repo_name))]
+    #[instrument(name = "RepoFs::readdir", skip(self), fields(repo = %self.repo_name))]
     async fn readdir(&mut self, ino: Inode) -> Result<&[DirEntry], ReadDirError> {
         debug_assert!(
             self.icache.contains(ino),
@@ -349,7 +349,7 @@ impl Fs for RepoFs {
         Ok(&self.readdir_buf)
     }
 
-    #[instrument(skip(self), fields(repo = %self.repo_name))]
+    #[instrument(name = "RepoFs::open", skip(self), fields(repo = %self.repo_name))]
     async fn open(&mut self, ino: Inode, _flags: OpenFlags) -> Result<OpenFile, OpenError> {
         if !self.icache.contains(ino) {
             warn!(ino, "open on unknown inode");
@@ -371,7 +371,7 @@ impl Fs for RepoFs {
         })
     }
 
-    #[instrument(skip(self), fields(repo = %self.repo_name))]
+    #[instrument(name = "RepoFs::read", skip(self), fields(repo = %self.repo_name))]
     async fn read(
         &mut self,
         ino: Inode,
@@ -427,7 +427,7 @@ impl Fs for RepoFs {
         Ok(Bytes::copy_from_slice(&decoded[start..end]))
     }
 
-    #[instrument(skip(self), fields(repo = %self.repo_name))]
+    #[instrument(name = "RepoFs::release", skip(self), fields(repo = %self.repo_name))]
     async fn release(
         &mut self,
         ino: Inode,
@@ -447,7 +447,7 @@ impl Fs for RepoFs {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(repo = %self.repo_name))]
+    #[instrument(name = "RepoFs::forget", skip(self), fields(repo = %self.repo_name))]
     async fn forget(&mut self, ino: Inode, nlookups: u64) {
         debug_assert!(
             self.icache.contains(ino),

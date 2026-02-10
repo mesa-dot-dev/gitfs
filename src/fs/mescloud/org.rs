@@ -346,7 +346,7 @@ impl Fs for OrgFs {
     type ReaddirError = ReadDirError;
     type ReleaseError = ReleaseError;
 
-    #[instrument(skip(self), fields(org = %self.name))]
+    #[instrument(name = "OrgFs::lookup", skip(self), fields(org = %self.name))]
     async fn lookup(&mut self, parent: Inode, name: &OsStr) -> Result<FileAttr, LookupError> {
         match self.inode_role(parent).await {
             InodeRole::OrgRoot => {
@@ -406,7 +406,7 @@ impl Fs for OrgFs {
         }
     }
 
-    #[instrument(skip(self), fields(org = %self.name))]
+    #[instrument(name = "OrgFs::getattr", skip(self), fields(org = %self.name))]
     async fn getattr(
         &mut self,
         ino: Inode,
@@ -415,7 +415,7 @@ impl Fs for OrgFs {
         self.composite.delegated_getattr(ino).await
     }
 
-    #[instrument(skip(self), fields(org = %self.name))]
+    #[instrument(name = "OrgFs::readdir", skip(self), fields(org = %self.name))]
     async fn readdir(&mut self, ino: Inode) -> Result<&[DirEntry], ReadDirError> {
         match self.inode_role(ino).await {
             InodeRole::OrgRoot => {
@@ -468,12 +468,12 @@ impl Fs for OrgFs {
         }
     }
 
-    #[instrument(skip(self), fields(org = %self.name))]
+    #[instrument(name = "OrgFs::open", skip(self), fields(org = %self.name))]
     async fn open(&mut self, ino: Inode, flags: OpenFlags) -> Result<OpenFile, OpenError> {
         self.composite.delegated_open(ino, flags).await
     }
 
-    #[instrument(skip(self), fields(org = %self.name))]
+    #[instrument(name = "OrgFs::read", skip(self), fields(org = %self.name))]
     async fn read(
         &mut self,
         ino: Inode,
@@ -488,7 +488,7 @@ impl Fs for OrgFs {
             .await
     }
 
-    #[instrument(skip(self), fields(org = %self.name))]
+    #[instrument(name = "OrgFs::release", skip(self), fields(org = %self.name))]
     async fn release(
         &mut self,
         ino: Inode,
@@ -501,7 +501,7 @@ impl Fs for OrgFs {
             .await
     }
 
-    #[instrument(skip(self), fields(org = %self.name))]
+    #[instrument(name = "OrgFs::forget", skip(self), fields(org = %self.name))]
     async fn forget(&mut self, ino: Inode, nlookups: u64) {
         let evicted = self.composite.delegated_forget(ino, nlookups).await;
         if evicted {
