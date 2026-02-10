@@ -765,6 +765,7 @@ dependencies = [
  "libc",
  "mesa-dev",
  "nix",
+ "num-traits",
  "rand",
  "reqwest",
  "reqwest-middleware",

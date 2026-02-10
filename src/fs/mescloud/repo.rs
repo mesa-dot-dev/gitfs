@@ -8,6 +8,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use mesa_dev::low_level::content::{Content, DirEntry as MesaDirEntry};
 use mesa_dev::MesaClient;
+use num_traits::cast::ToPrimitive as _;
 use tracing::{instrument, trace, warn};
 
 use crate::fs::r#trait::{
@@ -130,8 +131,11 @@ impl Fs for RepoFs {
             .await
             .map_err(MesaApiError::from)?;
 
+        #[expect(clippy::match_same_arms, reason = "symlink arm will diverge once readlink is wired up")]
         let kind = match &content {
-            Content::File(_) | Content::Symlink(_) => DirEntryType::RegularFile,
+            Content::File(_) => DirEntryType::RegularFile,
+            // TODO(MES-712): return DirEntryType::Symlink and FileAttr::Symlink, then wire up readlink.
+            Content::Symlink(_) => DirEntryType::RegularFile,
             Content::Dir(_) => DirEntryType::Directory,
         };
 
@@ -140,17 +144,16 @@ impl Fs for RepoFs {
         let now = SystemTime::now();
         let attr = match &content {
             Content::File(f) => {
-                #[expect(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                let size = f.size as u64;
+                let size = f.size.to_u64().unwrap_or(0);
                 FileAttr::RegularFile {
                     common: self.icache.make_common_file_attr(ino, 0o644, now, now),
                     size,
                     blocks: mescloud_icache::blocks_of_size(Self::BLOCK_SIZE, size),
                 }
             }
+            // TODO(MES-712): return FileAttr::Symlink { target, size } and wire up readlink.
             Content::Symlink(s) => {
-                #[expect(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                let size = s.size as u64;
+                let size = s.size.to_u64().unwrap_or(0);
                 FileAttr::RegularFile {
                     common: self.icache.make_common_file_attr(ino, 0o644, now, now),
                     size,
@@ -216,6 +219,7 @@ impl Fs for RepoFs {
             .filter_map(|e| {
                 let (name, kind) = match e {
                     MesaDirEntry::File(f) => (f.name?, DirEntryType::RegularFile),
+                    // TODO(MES-712): return DirEntryType::Symlink once readlink is wired up.
                     MesaDirEntry::Symlink(s) => (s.name?, DirEntryType::RegularFile),
                     MesaDirEntry::Dir(d) => (d.name?, DirEntryType::Directory),
                 };
@@ -304,6 +308,8 @@ impl Fs for RepoFs {
 
         let encoded_content = match content {
             Content::File(f) => f.content.unwrap_or_default(),
+            // TODO(MES-712): return ReadError::NotAFile once symlinks are surfaced as
+            // DirEntryType::Symlink, and implement readlink to return the link target.
             Content::Symlink(s) => s.content.unwrap_or_default(),
             Content::Dir(_) => return Err(ReadError::NotAFile),
         };
