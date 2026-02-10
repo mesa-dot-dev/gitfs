@@ -25,10 +25,6 @@ pub use super::common::{
 use super::icache as mescloud_icache;
 use super::icache::{InodeControlBlock, MescloudICache};
 
-// ---------------------------------------------------------------------------
-// RepoResolver
-// ---------------------------------------------------------------------------
-
 pub(super) struct RepoResolver {
     client: MesaClient,
     org_name: String,
@@ -60,8 +56,7 @@ impl IcbResolver for RepoResolver {
 
         async move {
             let stub = stub.unwrap_or_else(|| unreachable!("RepoResolver requires a stub ICB"));
-            let file_path =
-                build_repo_path(stub.parent, &stub.path, cache, RepoFs::ROOT_INO).await;
+            let file_path = build_repo_path(stub.parent, &stub.path, cache, RepoFs::ROOT_INO).await;
 
             let content = client
                 .org(&org_name)
@@ -111,10 +106,6 @@ impl IcbResolver for RepoResolver {
     }
 }
 
-// ---------------------------------------------------------------------------
-// build_repo_path helper
-// ---------------------------------------------------------------------------
-
 /// Walk the parent chain in the cache to build the repo-relative path.
 /// Returns `None` for the root inode (maps to `path=None` in the mesa content API).
 async fn build_repo_path(
@@ -141,10 +132,6 @@ async fn build_repo_path(
     let joined: PathBuf = components.iter().collect();
     joined.to_str().map(String::from)
 }
-
-// ---------------------------------------------------------------------------
-// RepoFs
-// ---------------------------------------------------------------------------
 
 /// A filesystem rooted at a single mesa repository.
 ///
