@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 
 use bytes::Bytes;
-use mesa_dev::Mesa as MesaClient;
+use mesa_dev::MesaClient;
 use secrecy::ExposeSecret as _;
 use tracing::{instrument, trace, warn};
 
@@ -67,8 +67,9 @@ impl MesaFS {
             org_inodes: HashMap::new(),
             org_slots: orgs
                 .map(|org_conf| {
-                    let client = MesaClient::builder(org_conf.api_key.expose_secret())
-                        .base_url(MESA_API_BASE_URL)
+                    let client = MesaClient::builder()
+                        .with_api_key(org_conf.api_key.expose_secret())
+                        .with_base_path(MESA_API_BASE_URL)
                         .build();
                     let org = OrgFs::new(org_conf.name, client, fs_owner);
                     OrgSlot {

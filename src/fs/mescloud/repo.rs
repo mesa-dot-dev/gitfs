@@ -6,7 +6,9 @@ use std::{collections::HashMap, ffi::OsStr, path::PathBuf, time::SystemTime};
 
 use base64::Engine as _;
 use bytes::Bytes;
-use mesa_dev::Mesa as MesaClient;
+use mesa_dev::MesaClient;
+use mesa_dev::low_level::content::{Content, DirEntry as MesaDirEntry};
+use num_traits::cast::ToPrimitive as _;
 use tracing::{instrument, trace, warn};
 
 use crate::fs::r#trait::{
@@ -14,6 +16,7 @@ use crate::fs::r#trait::{
     LockOwner, OpenFile, OpenFlags,
 };
 
+use super::common::MesaApiError;
 pub use super::common::{
     GetAttrError, LookupError, OpenError, ReadDirError, ReadError, ReleaseError,
 };
@@ -120,25 +123,47 @@ impl Fs for RepoFs {
 
         let content = self
             .client
-            .content(&self.org_name, &self.repo_name)
-            .get(file_path.as_deref(), Some(self.ref_.as_str()))
-            .await?;
+            .org(&self.org_name)
+            .repos()
+            .at(&self.repo_name)
+            .content()
+            .get(Some(self.ref_.as_str()), file_path.as_deref(), None)
+            .await
+            .map_err(MesaApiError::from)?;
 
+        #[expect(
+            clippy::match_same_arms,
+            reason = "symlink arm will diverge once readlink is wired up"
+        )]
         let kind = match &content {
-            mesa_dev::models::Content::File { .. } => DirEntryType::RegularFile,
-            mesa_dev::models::Content::Dir { .. } => DirEntryType::Directory,
+            Content::File(_) => DirEntryType::RegularFile,
+            // TODO(MES-712): return DirEntryType::Symlink and FileAttr::Symlink, then wire up readlink.
+            Content::Symlink(_) => DirEntryType::RegularFile,
+            Content::Dir(_) => DirEntryType::Directory,
         };
 
         let (ino, _) = self.icache.ensure_child_inode(parent, name, kind);
 
         let now = SystemTime::now();
-        let attr = match content {
-            mesa_dev::models::Content::File { size, .. } => FileAttr::RegularFile {
-                common: self.icache.make_common_file_attr(ino, 0o644, now, now),
-                size,
-                blocks: mescloud_icache::blocks_of_size(Self::BLOCK_SIZE, size),
-            },
-            mesa_dev::models::Content::Dir { .. } => FileAttr::Directory {
+        let attr = match &content {
+            Content::File(f) => {
+                let size = f.size.to_u64().unwrap_or(0);
+                FileAttr::RegularFile {
+                    common: self.icache.make_common_file_attr(ino, 0o644, now, now),
+                    size,
+                    blocks: mescloud_icache::blocks_of_size(Self::BLOCK_SIZE, size),
+                }
+            }
+            // TODO(MES-712): return FileAttr::Symlink { target, size } and wire up readlink.
+            Content::Symlink(s) => {
+                let size = s.size.to_u64().unwrap_or(0);
+                FileAttr::RegularFile {
+                    common: self.icache.make_common_file_attr(ino, 0o644, now, now),
+                    size,
+                    blocks: mescloud_icache::blocks_of_size(Self::BLOCK_SIZE, size),
+                }
+            }
+            Content::Dir(_) => FileAttr::Directory {
                 common: self.icache.make_common_file_attr(ino, 0o755, now, now),
             },
         };
@@ -179,23 +204,29 @@ impl Fs for RepoFs {
 
         let content = self
             .client
-            .content(&self.org_name, &self.repo_name)
-            .get(file_path.as_deref(), Some(self.ref_.as_str()))
-            .await?;
+            .org(&self.org_name)
+            .repos()
+            .at(&self.repo_name)
+            .content()
+            .get(Some(self.ref_.as_str()), file_path.as_deref(), None)
+            .await
+            .map_err(MesaApiError::from)?;
 
         let mesa_entries = match content {
-            mesa_dev::models::Content::Dir { entries, .. } => entries,
-            mesa_dev::models::Content::File { .. } => return Err(ReadDirError::NotADirectory),
+            Content::Dir(d) => d.entries,
+            Content::File(_) | Content::Symlink(_) => return Err(ReadDirError::NotADirectory),
         };
 
-        let collected: Vec<_> = mesa_entries
+        let collected: Vec<(String, DirEntryType)> = mesa_entries
             .into_iter()
-            .map(|e| {
-                let kind = match e.entry_type {
-                    mesa_dev::models::DirEntryType::File => DirEntryType::RegularFile,
-                    mesa_dev::models::DirEntryType::Dir => DirEntryType::Directory,
+            .filter_map(|e| {
+                let (name, kind) = match e {
+                    MesaDirEntry::File(f) => (f.name?, DirEntryType::RegularFile),
+                    // TODO(MES-712): return DirEntryType::Symlink once readlink is wired up.
+                    MesaDirEntry::Symlink(s) => (s.name?, DirEntryType::RegularFile),
+                    MesaDirEntry::Dir(d) => (d.name?, DirEntryType::Directory),
                 };
-                (e.name, kind)
+                Some((name, kind))
             })
             .collect();
 
@@ -270,13 +301,20 @@ impl Fs for RepoFs {
 
         let content = self
             .client
-            .content(&self.org_name, &self.repo_name)
-            .get(file_path.as_deref(), Some(self.ref_.as_str()))
-            .await?;
+            .org(&self.org_name)
+            .repos()
+            .at(&self.repo_name)
+            .content()
+            .get(Some(self.ref_.as_str()), file_path.as_deref(), None)
+            .await
+            .map_err(MesaApiError::from)?;
 
         let encoded_content = match content {
-            mesa_dev::models::Content::File { content, .. } => content,
-            mesa_dev::models::Content::Dir { .. } => return Err(ReadError::NotAFile),
+            Content::File(f) => f.content.unwrap_or_default(),
+            // TODO(MES-712): return ReadError::NotAFile once symlinks are surfaced as
+            // DirEntryType::Symlink, and implement readlink to return the link target.
+            Content::Symlink(s) => s.content.unwrap_or_default(),
+            Content::Dir(_) => return Err(ReadError::NotAFile),
         };
 
         let decoded = base64::engine::general_purpose::STANDARD.decode(&encoded_content)?;

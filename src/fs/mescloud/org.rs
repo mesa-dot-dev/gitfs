@@ -4,14 +4,14 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 use futures::TryStreamExt as _;
-use mesa_dev::Mesa as MesaClient;
+use mesa_dev::MesaClient;
 use secrecy::SecretString;
 use tracing::{instrument, trace, warn};
 
-use super::common::InodeControlBlock;
 pub use super::common::{
     GetAttrError, LookupError, OpenError, ReadDirError, ReadError, ReleaseError,
 };
+use super::common::{InodeControlBlock, MesaApiError};
 use super::icache::MescloudICache;
 use super::repo::RepoFs;
 use crate::fs::icache::bridge::HashMapBridge;
@@ -278,18 +278,18 @@ impl OrgFs {
         (ino, attr)
     }
 
-    /// Poll `repos().get()` until the repo is no longer syncing.
+    /// Fetch a repo by name via the API.
     async fn wait_for_sync(
         &self,
         repo_name: &str,
-    ) -> Result<mesa_dev::models::Repo, mesa_dev::error::MesaError> {
-        let mut repo = self.client.repos(&self.name).get(repo_name).await?;
-        while repo.status.is_some() {
-            trace!(repo = repo_name, "repo is syncing, waiting...");
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            repo = self.client.repos(&self.name).get(repo_name).await?;
-        }
-        Ok(repo)
+    ) -> Result<mesa_dev::models::PostByOrgRepos201Response, MesaApiError> {
+        self.client
+            .org(&self.name)
+            .repos()
+            .at(repo_name)
+            .get()
+            .await
+            .map_err(MesaApiError::from)
     }
 
     /// Allocate an org-level file handle and map it through the bridge.
@@ -371,7 +371,7 @@ impl Fs for OrgFs {
                     // Children of org root are repos.
                     trace!(repo = name_str, "lookup: resolving repo");
 
-                    // Validate repo exists via API, waiting for sync if needed.
+                    // Validate repo exists via API.
                     let repo = self.wait_for_sync(name_str).await?;
 
                     let (ino, attr) = self.ensure_repo_inode(
@@ -404,7 +404,7 @@ impl Fs for OrgFs {
                     "lookup: resolving github repo via owner dir"
                 );
 
-                // Validate via API (uses encoded name), waiting for sync if needed.
+                // Validate via API (uses encoded name).
                 let repo = self.wait_for_sync(&encoded).await?;
 
                 let (ino, attr) =
@@ -464,17 +464,22 @@ impl Fs for OrgFs {
                 }
 
                 // List repos via API.
-                let repos: Vec<mesa_dev::models::Repo> = self
+                let repos: Vec<mesa_dev::models::GetByOrgRepos200ResponseReposInner> = self
                     .client
-                    .repos(&self.name)
-                    .list_all()
+                    .org(&self.name)
+                    .repos()
+                    .list(None)
                     .try_collect()
-                    .await?;
+                    .await
+                    .map_err(MesaApiError::from)?;
 
                 let repo_infos: Vec<(String, String)> = repos
                     .into_iter()
-                    .filter(|r| r.status.is_none()) // skip repos still syncing
-                    .map(|r| (r.name, r.default_branch))
+                    .filter_map(|r| {
+                        let name = r.name?;
+                        let branch = r.default_branch.unwrap_or_else(|| "main".to_owned());
+                        Some((name, branch))
+                    })
                     .collect();
                 trace!(count = repo_infos.len(), "readdir: fetched repo list");
 
