@@ -1,16 +1,14 @@
 //! An implementation of a filesystem that directly overlays the host filesystem.
 use bytes::Bytes;
 use nix::sys::statvfs::statvfs;
-use std::{
-    collections::{HashMap, hash_map::Entry},
-    path::PathBuf,
-};
+use std::{collections::HashMap, path::PathBuf};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
 use std::ffi::OsStr;
 use tracing::warn;
 
+use crate::fs::icache::{ICache, IcbLike};
 use crate::fs::r#trait::{
     DirEntry, FileAttr, FileHandle, FileOpenOptions, FilesystemStats, Fs, Inode, LockOwner,
     OpenFile, OpenFlags,
@@ -141,36 +139,42 @@ struct InodeControlBlock {
     pub children: Option<Vec<DirEntry>>,
 }
 
+impl IcbLike for InodeControlBlock {
+    fn new_root(path: PathBuf) -> Self {
+        Self {
+            rc: 1,
+            path,
+            children: None,
+        }
+    }
+
+    fn rc(&self) -> u64 {
+        self.rc
+    }
+
+    fn rc_mut(&mut self) -> &mut u64 {
+        &mut self.rc
+    }
+}
+
 pub struct LocalFs {
-    inode_table: HashMap<Inode, InodeControlBlock>,
+    icache: ICache<InodeControlBlock>,
     open_files: HashMap<FileHandle, tokio::fs::File>,
-    next_fh: FileHandle,
 }
 
 impl LocalFs {
     #[expect(dead_code, reason = "alternative filesystem implementation")]
     pub fn new(abs_path: impl Into<PathBuf>) -> Self {
-        let mut inode_table = HashMap::new();
-        inode_table.insert(
-            1,
-            InodeControlBlock {
-                rc: 1,
-                path: abs_path.into(),
-                children: None,
-            },
-        );
-
         Self {
-            inode_table,
+            icache: ICache::new(1, abs_path),
             open_files: HashMap::new(),
-            next_fh: 1,
         }
     }
 
     fn abspath(&self) -> &PathBuf {
         &self
-            .inode_table
-            .get(&1)
+            .icache
+            .get_icb(1)
             .unwrap_or_else(|| unreachable!("root inode 1 must always exist in inode_table"))
             .path
     }
@@ -202,10 +206,10 @@ impl Fs for LocalFs {
 
     async fn lookup(&mut self, parent: Inode, name: &OsStr) -> Result<FileAttr, LookupError> {
         debug_assert!(
-            self.inode_table.contains_key(&parent),
+            self.icache.contains(parent),
             "parent inode {parent} not in inode_table"
         );
-        let parent_icb = self.inode_table.get(&parent).ok_or_else(|| {
+        let parent_icb = self.icache.get_icb(parent).ok_or_else(|| {
             warn!(
                 "Lookup called on unknown parent inode {}. This is a programming bug",
                 parent
@@ -222,15 +226,14 @@ impl Fs for LocalFs {
         debug_assert!(file_attr.is_ok(), "FileAttr conversion failed unexpectedly");
         let file_attr = file_attr?;
 
-        let map_entry =
-            self.inode_table
-                .entry(file_attr.common().ino)
-                .or_insert(InodeControlBlock {
-                    rc: 0,
-                    path: child_path,
-                    children: None,
-                });
-        map_entry.rc += 1;
+        let icb = self
+            .icache
+            .entry_or_insert_icb(file_attr.common().ino, || InodeControlBlock {
+                rc: 0,
+                path: child_path,
+                children: None,
+            });
+        *icb.rc_mut() += 1;
 
         Ok(file_attr)
     }
@@ -261,11 +264,8 @@ impl Fs for LocalFs {
             Ok(file_attr?)
         } else {
             // No open path, so we have to do a painful stat on the path.
-            debug_assert!(
-                self.inode_table.contains_key(&ino),
-                "inode {ino} not in inode_table"
-            );
-            let icb = self.inode_table.get(&ino).ok_or_else(|| {
+            debug_assert!(self.icache.contains(ino), "inode {ino} not in inode_table");
+            let icb = self.icache.get_icb(ino).ok_or_else(|| {
                 warn!(
                     "GetAttr called on unknown inode {}. This is a programming bug",
                     ino
@@ -284,12 +284,9 @@ impl Fs for LocalFs {
     }
 
     async fn readdir(&mut self, ino: Inode) -> Result<&[DirEntry], ReadDirError> {
-        debug_assert!(
-            self.inode_table.contains_key(&ino),
-            "inode {ino} not in inode_table"
-        );
+        debug_assert!(self.icache.contains(ino), "inode {ino} not in inode_table");
 
-        let inode_cb = self.inode_table.get_mut(&ino).ok_or_else(|| {
+        let inode_cb = self.icache.get_icb(ino).ok_or_else(|| {
             warn!(
                 parent = ino,
                 "Readdir of unknown parent inode. Programming bug"
@@ -315,7 +312,7 @@ impl Fs for LocalFs {
             entries.push(Self::parse_tokio_dirent(&dir_entry).await?);
         }
 
-        let inode_cb = self.inode_table.get_mut(&ino).ok_or_else(|| {
+        let inode_cb = self.icache.get_icb_mut(ino).ok_or_else(|| {
             warn!(parent = ino, "inode disappeared. TOCTOU programming bug");
             ReadDirError::InodeNotFound
         })?;
@@ -324,11 +321,8 @@ impl Fs for LocalFs {
     }
 
     async fn open(&mut self, ino: Inode, flags: OpenFlags) -> Result<OpenFile, OpenError> {
-        debug_assert!(
-            self.inode_table.contains_key(&ino),
-            "inode {ino} not in inode_table"
-        );
-        let icb = self.inode_table.get(&ino).ok_or_else(|| {
+        debug_assert!(self.icache.contains(ino), "inode {ino} not in inode_table");
+        let icb = self.icache.get_icb(ino).ok_or_else(|| {
             warn!(
                 "Open called on unknown inode {}. This is a programming bug",
                 ino
@@ -348,8 +342,7 @@ impl Fs for LocalFs {
             .map_err(OpenError::Io)?;
 
         // Generate a new file handle.
-        let fh = self.next_fh;
-        self.next_fh += 1;
+        let fh = self.icache.allocate_fh();
         self.open_files.insert(fh, file);
 
         Ok(OpenFile {
@@ -369,10 +362,7 @@ impl Fs for LocalFs {
         _lock_owner: Option<LockOwner>,
     ) -> Result<Bytes, ReadError> {
         // TODO(markovejnovic): Respect flags and lock_owner.
-        debug_assert!(
-            self.inode_table.contains_key(&ino),
-            "inode {ino} not in inode_table"
-        );
+        debug_assert!(self.icache.contains(ino), "inode {ino} not in inode_table");
         debug_assert!(
             self.open_files.contains_key(&fh),
             "file handle {fh} not in open_files"
@@ -414,26 +404,9 @@ impl Fs for LocalFs {
     }
 
     async fn forget(&mut self, ino: Inode, nlookups: u64) {
-        debug_assert!(
-            self.inode_table.contains_key(&ino),
-            "inode {ino} not in inode_table"
-        );
+        debug_assert!(self.icache.contains(ino), "inode {ino} not in inode_table");
 
-        match self.inode_table.entry(ino) {
-            Entry::Occupied(mut entry) => {
-                if entry.get().rc <= nlookups {
-                    entry.remove();
-                } else {
-                    entry.get_mut().rc -= nlookups;
-                }
-            }
-            Entry::Vacant(_) => {
-                warn!(
-                    "Forget called on unknown inode {}. This is a programming bug",
-                    ino
-                );
-            }
-        }
+        self.icache.forget(ino, nlookups);
     }
 
     async fn statfs(&mut self) -> Result<FilesystemStats, std::io::Error> {
@@ -456,7 +429,7 @@ impl Fs for LocalFs {
             #[allow(clippy::allow_attributes)]
             #[allow(clippy::useless_conversion)]
             available_blocks: u64::from(stat.blocks_available()),
-            total_inodes: self.inode_table.len() as u64,
+            total_inodes: self.icache.inode_count() as u64,
             #[allow(clippy::allow_attributes)]
             #[allow(clippy::useless_conversion)]
             free_inodes: u64::from(stat.files_free()),

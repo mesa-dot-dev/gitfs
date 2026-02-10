@@ -14,10 +14,11 @@ use crate::fs::r#trait::{
     LockOwner, OpenFile, OpenFlags,
 };
 
-use super::dcache::{self, DCache};
 pub use super::common::{
     GetAttrError, LookupError, OpenError, ReadDirError, ReadError, ReleaseError,
 };
+use super::icache as mescloud_icache;
+use super::icache::MescloudICache;
 
 /// A filesystem rooted at a single mesa repository.
 ///
@@ -29,7 +30,7 @@ pub struct RepoFs {
     repo_name: String,
     ref_: String,
 
-    dcache: DCache,
+    icache: MescloudICache,
     open_files: HashMap<FileHandle, Inode>,
 }
 
@@ -50,7 +51,7 @@ impl RepoFs {
             org_name,
             repo_name,
             ref_,
-            dcache: DCache::new(Self::ROOT_INO, fs_owner, Self::BLOCK_SIZE),
+            icache: MescloudICache::new(Self::ROOT_INO, fs_owner, Self::BLOCK_SIZE),
             open_files: HashMap::new(),
         }
     }
@@ -62,7 +63,7 @@ impl RepoFs {
 
     /// Get the cached attr for an inode, if present.
     pub(crate) fn inode_table_get_attr(&self, ino: Inode) -> Option<FileAttr> {
-        self.dcache.get_attr(ino)
+        self.icache.get_attr(ino)
     }
 
     /// Build the repo-relative path for an inode by walking up the parent chain.
@@ -77,7 +78,7 @@ impl RepoFs {
         let mut components = Vec::new();
         let mut current = ino;
         while current != Self::ROOT_INO {
-            let icb = self.dcache.get_icb(current)?;
+            let icb = self.icache.get_icb(current)?;
             components.push(icb.path.clone());
             current = icb.parent?;
         }
@@ -111,7 +112,7 @@ impl Fs for RepoFs {
     #[instrument(skip(self), fields(repo = %self.repo_name))]
     async fn lookup(&mut self, parent: Inode, name: &OsStr) -> Result<FileAttr, LookupError> {
         debug_assert!(
-            self.dcache.contains(parent),
+            self.icache.contains(parent),
             "lookup: parent inode {parent} not in inode table"
         );
 
@@ -128,22 +129,22 @@ impl Fs for RepoFs {
             mesa_dev::models::Content::Dir { .. } => DirEntryType::Directory,
         };
 
-        let (ino, _) = self.dcache.ensure_child_inode(parent, name, kind);
+        let (ino, _) = self.icache.ensure_child_inode(parent, name, kind);
 
         let now = SystemTime::now();
         let attr = match content {
             mesa_dev::models::Content::File { size, .. } => FileAttr::RegularFile {
-                common: self.dcache.make_common_file_attr(ino, 0o644, now, now),
+                common: self.icache.make_common_file_attr(ino, 0o644, now, now),
                 size,
-                blocks: dcache::blocks_of_size(Self::BLOCK_SIZE, size),
+                blocks: mescloud_icache::blocks_of_size(Self::BLOCK_SIZE, size),
             },
             mesa_dev::models::Content::Dir { .. } => FileAttr::Directory {
-                common: self.dcache.make_common_file_attr(ino, 0o755, now, now),
+                common: self.icache.make_common_file_attr(ino, 0o755, now, now),
             },
         };
-        self.dcache.cache_attr(ino, attr);
+        self.icache.cache_attr(ino, attr);
 
-        let rc = self.dcache.inc_rc(ino);
+        let rc = self.icache.inc_rc(ino);
         trace!(ino, path = ?file_path, rc, "resolved inode");
         Ok(attr)
     }
@@ -154,7 +155,7 @@ impl Fs for RepoFs {
         ino: Inode,
         _fh: Option<FileHandle>,
     ) -> Result<FileAttr, GetAttrError> {
-        self.dcache.get_attr(ino).ok_or_else(|| {
+        self.icache.get_attr(ino).ok_or_else(|| {
             warn!(ino, "getattr on unknown inode");
             GetAttrError::InodeNotFound
         })
@@ -163,12 +164,12 @@ impl Fs for RepoFs {
     #[instrument(skip(self), fields(repo = %self.repo_name))]
     async fn readdir(&mut self, ino: Inode) -> Result<&[DirEntry], ReadDirError> {
         debug_assert!(
-            self.dcache.contains(ino),
+            self.icache.contains(ino),
             "readdir: inode {ino} not in inode table"
         );
         debug_assert!(
             matches!(
-                self.dcache.get_attr(ino),
+                self.icache.get_attr(ino),
                 Some(FileAttr::Directory { .. }) | None
             ),
             "readdir: inode {ino} has non-directory cached attr"
@@ -202,7 +203,7 @@ impl Fs for RepoFs {
 
         let mut entries = Vec::with_capacity(collected.len());
         for (name, kind) in &collected {
-            let (child_ino, _) = self.dcache.ensure_child_inode(ino, OsStr::new(name), *kind);
+            let (child_ino, _) = self.icache.ensure_child_inode(ino, OsStr::new(name), *kind);
             entries.push(DirEntry {
                 ino: child_ino,
                 name: name.clone().into(),
@@ -211,7 +212,7 @@ impl Fs for RepoFs {
         }
 
         let icb = self
-            .dcache
+            .icache
             .get_icb_mut(ino)
             .ok_or(ReadDirError::InodeNotFound)?;
         Ok(icb.children.insert(entries))
@@ -219,18 +220,18 @@ impl Fs for RepoFs {
 
     #[instrument(skip(self), fields(repo = %self.repo_name))]
     async fn open(&mut self, ino: Inode, _flags: OpenFlags) -> Result<OpenFile, OpenError> {
-        if !self.dcache.contains(ino) {
+        if !self.icache.contains(ino) {
             warn!(ino, "open on unknown inode");
             return Err(OpenError::InodeNotFound);
         }
         debug_assert!(
             matches!(
-                self.dcache.get_attr(ino),
+                self.icache.get_attr(ino),
                 Some(FileAttr::RegularFile { .. }) | None
             ),
             "open: inode {ino} has non-file cached attr"
         );
-        let fh = self.dcache.allocate_fh();
+        let fh = self.icache.allocate_fh();
         self.open_files.insert(fh, ino);
         trace!(ino, fh, "assigned file handle");
         Ok(OpenFile {
@@ -259,7 +260,7 @@ impl Fs for RepoFs {
         );
         debug_assert!(
             matches!(
-                self.dcache.get_attr(ino),
+                self.icache.get_attr(ino),
                 Some(FileAttr::RegularFile { .. }) | None
             ),
             "read: inode {ino} has non-file cached attr"
@@ -311,14 +312,14 @@ impl Fs for RepoFs {
     #[instrument(skip(self), fields(repo = %self.repo_name))]
     async fn forget(&mut self, ino: Inode, nlookups: u64) {
         debug_assert!(
-            self.dcache.contains(ino),
+            self.icache.contains(ino),
             "forget: inode {ino} not in inode table"
         );
 
-        self.dcache.forget(ino, nlookups);
+        self.icache.forget(ino, nlookups);
     }
 
     async fn statfs(&mut self) -> Result<FilesystemStats, std::io::Error> {
-        Ok(self.dcache.statfs())
+        Ok(self.icache.statfs())
     }
 }

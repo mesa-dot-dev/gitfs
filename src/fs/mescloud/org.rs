@@ -9,12 +9,12 @@ use secrecy::SecretString;
 use tracing::{instrument, trace, warn};
 
 use super::common::InodeControlBlock;
-use super::dcache::DCache;
 pub use super::common::{
     GetAttrError, LookupError, OpenError, ReadDirError, ReadError, ReleaseError,
 };
+use super::icache::MescloudICache;
 use super::repo::RepoFs;
-use crate::fs::inode_bridge::HashMapBridge;
+use crate::fs::icache::bridge::HashMapBridge;
 use crate::fs::r#trait::{
     DirEntry, DirEntryType, FileAttr, FileHandle, FilesystemStats, Fs, Inode, LockOwner, OpenFile,
     OpenFlags,
@@ -50,7 +50,7 @@ pub struct OrgFs {
     name: String,
     client: MesaClient,
 
-    dcache: DCache,
+    icache: MescloudICache,
 
     /// Maps org-level repo-root inodes → index into `repos`.
     repo_inodes: HashMap<Inode, usize>,
@@ -100,22 +100,22 @@ impl OrgFs {
         // Check existing
         for (&ino, existing_owner) in &self.owner_inodes {
             if existing_owner == owner {
-                if let Some(attr) = self.dcache.get_attr(ino) {
+                if let Some(attr) = self.icache.get_attr(ino) {
                     return (ino, attr);
                 }
                 let now = SystemTime::now();
                 let attr = FileAttr::Directory {
-                    common: self.dcache.make_common_file_attr(ino, 0o755, now, now),
+                    common: self.icache.make_common_file_attr(ino, 0o755, now, now),
                 };
-                self.dcache.cache_attr(ino, attr);
+                self.icache.cache_attr(ino, attr);
                 return (ino, attr);
             }
         }
 
         // Allocate new
-        let ino = self.dcache.allocate_inode();
+        let ino = self.icache.allocate_inode();
         let now = SystemTime::now();
-        self.dcache.insert_icb(
+        self.icache.insert_icb(
             ino,
             InodeControlBlock {
                 rc: 0,
@@ -127,22 +127,22 @@ impl OrgFs {
         );
         self.owner_inodes.insert(ino, owner.to_owned());
         let attr = FileAttr::Directory {
-            common: self.dcache.make_common_file_attr(ino, 0o755, now, now),
+            common: self.icache.make_common_file_attr(ino, 0o755, now, now),
         };
-        self.dcache.cache_attr(ino, attr);
+        self.icache.cache_attr(ino, attr);
         (ino, attr)
     }
 
     /// Get the cached attr for an inode, if present.
     pub(crate) fn inode_table_get_attr(&self, ino: Inode) -> Option<FileAttr> {
-        self.dcache.get_attr(ino)
+        self.icache.get_attr(ino)
     }
 
     pub fn new(name: String, client: MesaClient, fs_owner: (u32, u32)) -> Self {
         Self {
             name,
             client,
-            dcache: DCache::new(Self::ROOT_INO, fs_owner, Self::BLOCK_SIZE),
+            icache: MescloudICache::new(Self::ROOT_INO, fs_owner, Self::BLOCK_SIZE),
             repo_inodes: HashMap::new(),
             owner_inodes: HashMap::new(),
             repos: Vec::new(),
@@ -181,7 +181,7 @@ impl OrgFs {
         }
         // Walk parents.
         let mut current = ino;
-        while let Some(parent) = self.dcache.get_icb(current).and_then(|icb| icb.parent) {
+        while let Some(parent) = self.icache.get_icb(current).and_then(|icb| icb.parent) {
             if let Some(&idx) = self.repo_inodes.get(&parent) {
                 return Some(idx);
             }
@@ -210,7 +210,7 @@ impl OrgFs {
         // Check existing repos.
         for (&ino, &idx) in &self.repo_inodes {
             if self.repos[idx].repo.repo_name() == repo_name {
-                if let Some(icb) = self.dcache.get_icb(ino)
+                if let Some(icb) = self.icache.get_icb(ino)
                     && let Some(attr) = icb.attr
                 {
                     trace!(
@@ -229,15 +229,15 @@ impl OrgFs {
                 );
                 let now = SystemTime::now();
                 let attr = FileAttr::Directory {
-                    common: self.dcache.make_common_file_attr(ino, 0o755, now, now),
+                    common: self.icache.make_common_file_attr(ino, 0o755, now, now),
                 };
-                self.dcache.cache_attr(ino, attr);
+                self.icache.cache_attr(ino, attr);
                 return (ino, attr);
             }
         }
 
         // Allocate new.
-        let ino = self.dcache.allocate_inode();
+        let ino = self.icache.allocate_inode();
         trace!(
             ino,
             repo = repo_name,
@@ -245,7 +245,7 @@ impl OrgFs {
         );
 
         let now = SystemTime::now();
-        self.dcache.insert_icb(
+        self.icache.insert_icb(
             ino,
             InodeControlBlock {
                 rc: 0,
@@ -261,7 +261,7 @@ impl OrgFs {
             self.name.clone(),
             repo_name.to_owned(),
             default_branch.to_owned(),
-            self.dcache.fs_owner(),
+            self.icache.fs_owner(),
         );
 
         let mut bridge = HashMapBridge::new();
@@ -272,9 +272,9 @@ impl OrgFs {
         self.repo_inodes.insert(ino, idx);
 
         let attr = FileAttr::Directory {
-            common: self.dcache.make_common_file_attr(ino, 0o755, now, now),
+            common: self.icache.make_common_file_attr(ino, 0o755, now, now),
         };
-        self.dcache.cache_attr(ino, attr);
+        self.icache.cache_attr(ino, attr);
         (ino, attr)
     }
 
@@ -294,7 +294,7 @@ impl OrgFs {
 
     /// Allocate an org-level file handle and map it through the bridge.
     fn alloc_fh(&mut self, slot_idx: usize, repo_fh: FileHandle) -> FileHandle {
-        let fh = self.dcache.allocate_fh();
+        let fh = self.icache.allocate_fh();
         self.repos[slot_idx].bridge.insert_fh(fh, repo_fh);
         fh
     }
@@ -311,10 +311,10 @@ impl OrgFs {
     ) -> Inode {
         let org_ino = self.repos[slot_idx]
             .bridge
-            .backward_or_insert_inode(repo_ino, || self.dcache.allocate_inode());
+            .backward_or_insert_inode(repo_ino, || self.icache.allocate_inode());
 
         // Ensure there's an ICB in the org table.
-        let icb = self.dcache.entry_or_insert_icb(org_ino, || {
+        let icb = self.icache.entry_or_insert_icb(org_ino, || {
             trace!(
                 org_ino,
                 repo_ino,
@@ -352,7 +352,7 @@ impl Fs for OrgFs {
     #[instrument(skip(self), fields(org = %self.name))]
     async fn lookup(&mut self, parent: Inode, name: &OsStr) -> Result<FileAttr, LookupError> {
         debug_assert!(
-            self.dcache.contains(parent),
+            self.icache.contains(parent),
             "lookup: parent inode {parent} not in inode table"
         );
 
@@ -365,7 +365,7 @@ impl Fs for OrgFs {
                     // name is an owner like "torvalds" — create lazily, no API validation.
                     trace!(owner = name_str, "lookup: resolving github owner dir");
                     let (ino, attr) = self.ensure_owner_inode(name_str);
-                    self.dcache.inc_rc(ino);
+                    self.icache.inc_rc(ino);
                     Ok(attr)
                 } else {
                     // Children of org root are repos.
@@ -380,13 +380,8 @@ impl Fs for OrgFs {
                         &repo.default_branch,
                         Self::ROOT_INO,
                     );
-                    let rc = self.dcache.inc_rc(ino);
-                    trace!(
-                        ino,
-                        repo = name_str,
-                        rc,
-                        "lookup: resolved repo inode"
-                    );
+                    let rc = self.icache.inc_rc(ino);
+                    trace!(ino, repo = name_str, rc, "lookup: resolved repo inode");
                     Ok(attr)
                 }
             }
@@ -414,7 +409,7 @@ impl Fs for OrgFs {
 
                 let (ino, attr) =
                     self.ensure_repo_inode(&encoded, repo_name_str, &repo.default_branch, parent);
-                self.dcache.inc_rc(ino);
+                self.icache.inc_rc(ino);
                 Ok(attr)
             }
             InodeRole::RepoOwned { idx } => {
@@ -434,14 +429,9 @@ impl Fs for OrgFs {
 
                 // Rebuild attr with org inode.
                 let org_attr = self.repos[idx].bridge.attr_backward(repo_attr);
-                self.dcache.cache_attr(org_ino, org_attr);
-                let rc = self.dcache.inc_rc(org_ino);
-                trace!(
-                    org_ino,
-                    repo_ino,
-                    rc,
-                    "lookup: resolved content inode"
-                );
+                self.icache.cache_attr(org_ino, org_attr);
+                let rc = self.icache.inc_rc(org_ino);
+                trace!(org_ino, repo_ino, rc, "lookup: resolved content inode");
                 Ok(org_attr)
             }
         }
@@ -453,7 +443,7 @@ impl Fs for OrgFs {
         ino: Inode,
         _fh: Option<FileHandle>,
     ) -> Result<FileAttr, GetAttrError> {
-        self.dcache.get_attr(ino).ok_or_else(|| {
+        self.icache.get_attr(ino).ok_or_else(|| {
             warn!(ino, "getattr on unknown inode");
             GetAttrError::InodeNotFound
         })
@@ -462,7 +452,7 @@ impl Fs for OrgFs {
     #[instrument(skip(self), fields(org = %self.name))]
     async fn readdir(&mut self, ino: Inode) -> Result<&[DirEntry], ReadDirError> {
         debug_assert!(
-            self.dcache.contains(ino),
+            self.icache.contains(ino),
             "readdir: inode {ino} not in inode table"
         );
 
@@ -504,7 +494,7 @@ impl Fs for OrgFs {
                 }
 
                 let icb = self
-                    .dcache
+                    .icache
                     .get_icb_mut(ino)
                     .ok_or(ReadDirError::InodeNotFound)?;
                 Ok(icb.children.insert(entries))
@@ -541,7 +531,7 @@ impl Fs for OrgFs {
                         self.repos[idx].repo.inode_table_get_attr(entry.ino)
                     {
                         let org_attr = self.repos[idx].bridge.attr_backward(repo_icb_attr);
-                        self.dcache.cache_attr(org_child_ino, org_attr);
+                        self.icache.cache_attr(org_child_ino, org_attr);
                     } else {
                         trace!(
                             repo_ino = entry.ino,
@@ -558,7 +548,7 @@ impl Fs for OrgFs {
                 }
 
                 let icb = self
-                    .dcache
+                    .icache
                     .get_icb_mut(ino)
                     .ok_or(ReadDirError::InodeNotFound)?;
                 Ok(icb.children.insert(org_entries))
@@ -662,7 +652,7 @@ impl Fs for OrgFs {
     #[instrument(skip(self), fields(org = %self.name))]
     async fn forget(&mut self, ino: Inode, nlookups: u64) {
         debug_assert!(
-            self.dcache.contains(ino),
+            self.icache.contains(ino),
             "forget: inode {ino} not in inode table"
         );
 
@@ -678,7 +668,7 @@ impl Fs for OrgFs {
             }
         }
 
-        if self.dcache.forget(ino, nlookups).is_some() {
+        if self.icache.forget(ino, nlookups).is_some() {
             // Clean up repo_inodes and owner_inodes mappings.
             self.repo_inodes.remove(&ino);
             self.owner_inodes.remove(&ino);
@@ -690,6 +680,6 @@ impl Fs for OrgFs {
     }
 
     async fn statfs(&mut self) -> Result<FilesystemStats, std::io::Error> {
-        Ok(self.dcache.statfs())
+        Ok(self.icache.statfs())
     }
 }
