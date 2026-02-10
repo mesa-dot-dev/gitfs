@@ -6,7 +6,8 @@ use std::{collections::HashMap, ffi::OsStr, path::PathBuf, time::SystemTime};
 
 use base64::Engine as _;
 use bytes::Bytes;
-use mesa_dev::Mesa as MesaClient;
+use mesa_dev::low_level::content::{Content, DirEntry as MesaDirEntry};
+use mesa_dev::MesaClient;
 use tracing::{instrument, trace, warn};
 
 use crate::fs::r#trait::{
@@ -120,25 +121,42 @@ impl Fs for RepoFs {
 
         let content = self
             .client
-            .content(&self.org_name, &self.repo_name)
-            .get(file_path.as_deref(), Some(self.ref_.as_str()))
-            .await?;
+            .org(&self.org_name)
+            .repos()
+            .at(&self.repo_name)
+            .content()
+            .get(Some(self.ref_.as_str()), file_path.as_deref(), None)
+            .await
+            .map_err(|e| LookupError::RemoteMesaError(e.to_string()))?;
 
         let kind = match &content {
-            mesa_dev::models::Content::File { .. } => DirEntryType::RegularFile,
-            mesa_dev::models::Content::Dir { .. } => DirEntryType::Directory,
+            Content::File(_) | Content::Symlink(_) => DirEntryType::RegularFile,
+            Content::Dir(_) => DirEntryType::Directory,
         };
 
         let (ino, _) = self.icache.ensure_child_inode(parent, name, kind);
 
         let now = SystemTime::now();
-        let attr = match content {
-            mesa_dev::models::Content::File { size, .. } => FileAttr::RegularFile {
-                common: self.icache.make_common_file_attr(ino, 0o644, now, now),
-                size,
-                blocks: mescloud_icache::blocks_of_size(Self::BLOCK_SIZE, size),
-            },
-            mesa_dev::models::Content::Dir { .. } => FileAttr::Directory {
+        let attr = match &content {
+            Content::File(f) => {
+                #[expect(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                let size = f.size as u64;
+                FileAttr::RegularFile {
+                    common: self.icache.make_common_file_attr(ino, 0o644, now, now),
+                    size,
+                    blocks: mescloud_icache::blocks_of_size(Self::BLOCK_SIZE, size),
+                }
+            }
+            Content::Symlink(s) => {
+                #[expect(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                let size = s.size as u64;
+                FileAttr::RegularFile {
+                    common: self.icache.make_common_file_attr(ino, 0o644, now, now),
+                    size,
+                    blocks: mescloud_icache::blocks_of_size(Self::BLOCK_SIZE, size),
+                }
+            }
+            Content::Dir(_) => FileAttr::Directory {
                 common: self.icache.make_common_file_attr(ino, 0o755, now, now),
             },
         };
@@ -179,23 +197,28 @@ impl Fs for RepoFs {
 
         let content = self
             .client
-            .content(&self.org_name, &self.repo_name)
-            .get(file_path.as_deref(), Some(self.ref_.as_str()))
-            .await?;
+            .org(&self.org_name)
+            .repos()
+            .at(&self.repo_name)
+            .content()
+            .get(Some(self.ref_.as_str()), file_path.as_deref(), None)
+            .await
+            .map_err(|e| ReadDirError::RemoteMesaError(e.to_string()))?;
 
         let mesa_entries = match content {
-            mesa_dev::models::Content::Dir { entries, .. } => entries,
-            mesa_dev::models::Content::File { .. } => return Err(ReadDirError::NotADirectory),
+            Content::Dir(d) => d.entries,
+            Content::File(_) | Content::Symlink(_) => return Err(ReadDirError::NotADirectory),
         };
 
-        let collected: Vec<_> = mesa_entries
+        let collected: Vec<(String, DirEntryType)> = mesa_entries
             .into_iter()
-            .map(|e| {
-                let kind = match e.entry_type {
-                    mesa_dev::models::DirEntryType::File => DirEntryType::RegularFile,
-                    mesa_dev::models::DirEntryType::Dir => DirEntryType::Directory,
+            .filter_map(|e| {
+                let (name, kind) = match e {
+                    MesaDirEntry::File(f) => (f.name?, DirEntryType::RegularFile),
+                    MesaDirEntry::Symlink(s) => (s.name?, DirEntryType::RegularFile),
+                    MesaDirEntry::Dir(d) => (d.name?, DirEntryType::Directory),
                 };
-                (e.name, kind)
+                Some((name, kind))
             })
             .collect();
 
@@ -270,13 +293,18 @@ impl Fs for RepoFs {
 
         let content = self
             .client
-            .content(&self.org_name, &self.repo_name)
-            .get(file_path.as_deref(), Some(self.ref_.as_str()))
-            .await?;
+            .org(&self.org_name)
+            .repos()
+            .at(&self.repo_name)
+            .content()
+            .get(Some(self.ref_.as_str()), file_path.as_deref(), None)
+            .await
+            .map_err(|e| ReadError::RemoteMesaError(e.to_string()))?;
 
         let encoded_content = match content {
-            mesa_dev::models::Content::File { content, .. } => content,
-            mesa_dev::models::Content::Dir { .. } => return Err(ReadError::NotAFile),
+            Content::File(f) => f.content.unwrap_or_default(),
+            Content::Symlink(s) => s.content.unwrap_or_default(),
+            Content::Dir(_) => return Err(ReadError::NotAFile),
         };
 
         let decoded = base64::engine::general_purpose::STANDARD.decode(&encoded_content)?;

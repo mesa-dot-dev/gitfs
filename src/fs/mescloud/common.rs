@@ -13,7 +13,7 @@ pub enum LookupError {
     FileDoesNotExist,
 
     #[error("remote mesa error: {0}")]
-    RemoteMesaError(#[from] mesa_dev::error::MesaError),
+    RemoteMesaError(String),
 }
 
 impl From<LookupError> for i32 {
@@ -62,7 +62,7 @@ pub enum ReadError {
     InodeNotFound,
 
     #[error("remote mesa error: {0}")]
-    RemoteMesaError(#[from] mesa_dev::error::MesaError),
+    RemoteMesaError(String),
 
     #[error("content is not a file")]
     NotAFile,
@@ -88,7 +88,7 @@ pub enum ReadDirError {
     InodeNotFound,
 
     #[error("remote mesa error: {0}")]
-    RemoteMesaError(#[from] mesa_dev::error::MesaError),
+    RemoteMesaError(String),
 
     #[error("inode is not a directory")]
     NotADirectory,
