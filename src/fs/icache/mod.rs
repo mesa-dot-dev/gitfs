@@ -19,4 +19,6 @@ pub trait IcbLike {
     fn new_root(path: std::path::PathBuf) -> Self;
     fn rc(&self) -> u64;
     fn rc_mut(&mut self) -> &mut u64;
+    /// Returns true if this entry needs resolution (e.g., attr not yet fetched).
+    fn needs_resolve(&self) -> bool;
 }

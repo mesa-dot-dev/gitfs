@@ -39,6 +39,10 @@ impl IcbLike for InodeControlBlock {
     fn rc_mut(&mut self) -> &mut u64 {
         &mut self.rc
     }
+
+    fn needs_resolve(&self) -> bool {
+        self.attr.is_none()
+    }
 }
 
 /// Calculate the number of blocks needed for a given size.

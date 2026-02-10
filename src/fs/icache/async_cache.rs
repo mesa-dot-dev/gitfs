@@ -342,6 +342,9 @@ mod tests {
         fn rc_mut(&mut self) -> &mut u64 {
             &mut self.rc
         }
+        fn needs_resolve(&self) -> bool {
+            false
+        }
     }
 
     struct TestResolver {

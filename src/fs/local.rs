@@ -155,6 +155,10 @@ impl IcbLike for InodeControlBlock {
     fn rc_mut(&mut self) -> &mut u64 {
         &mut self.rc
     }
+
+    fn needs_resolve(&self) -> bool {
+        false // local FS entries are always fully resolved
+    }
 }
 
 pub struct LocalFs {
