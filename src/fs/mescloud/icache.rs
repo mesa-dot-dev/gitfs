@@ -4,7 +4,9 @@ use std::ffi::OsStr;
 use std::time::SystemTime;
 
 use crate::fs::icache::{AsyncICache, IcbLike, IcbResolver, InodeFactory};
-use crate::fs::r#trait::{CommonFileAttr, FileAttr, FilesystemStats, Inode, Permissions};
+use crate::fs::r#trait::{
+    CommonFileAttr, DirEntryType, FileAttr, FilesystemStats, Inode, Permissions,
+};
 
 /// Inode control block for mescloud filesystem layers.
 pub struct InodeControlBlock {
@@ -13,6 +15,8 @@ pub struct InodeControlBlock {
     pub path: std::path::PathBuf,
     /// Cached file attributes from the last lookup.
     pub attr: Option<FileAttr>,
+    /// Cached directory children from the resolver (directories only).
+    pub children: Option<Vec<(String, DirEntryType)>>,
 }
 
 impl IcbLike for InodeControlBlock {
@@ -22,6 +26,7 @@ impl IcbLike for InodeControlBlock {
             parent: None,
             path,
             attr: None,
+            children: None,
         }
     }
 
@@ -34,7 +39,11 @@ impl IcbLike for InodeControlBlock {
     }
 
     fn needs_resolve(&self) -> bool {
-        self.attr.is_none()
+        match self.attr {
+            None => true,
+            Some(FileAttr::Directory { .. }) => self.children.is_none(),
+            Some(_) => false,
+        }
     }
 }
 
@@ -98,8 +107,13 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
 
     // -- Delegated from AsyncICache (async) --
 
-    pub async fn contains(&self, ino: Inode) -> bool {
-        self.inner.contains(ino).await
+    pub fn contains(&self, ino: Inode) -> bool {
+        self.inner.contains(ino)
+    }
+
+    #[expect(dead_code, reason = "public API method for future use")]
+    pub fn contains_resolved(&self, ino: Inode) -> bool {
+        self.inner.contains_resolved(ino)
     }
 
     pub async fn get_icb<T>(
@@ -204,7 +218,7 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     }
 
     /// Find an existing child by (parent, name) or allocate a new inode.
-    /// If new, inserts a stub ICB (parent+path set, attr=None, rc=0).
+    /// If new, inserts a stub ICB (parent+path set, attr=None, children=None, rc=0).
     /// Does NOT bump rc. Returns the inode number.
     pub async fn ensure_child_ino(&self, parent: Inode, name: &OsStr) -> Inode {
         // Search for existing child by parent + name
@@ -229,6 +243,7 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
                     path: name.into(),
                     parent: Some(parent),
                     attr: None,
+                    children: None,
                 },
             )
             .await;
@@ -239,5 +254,87 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     #[expect(dead_code, reason = "public API method for future use")]
     pub fn inner(&self) -> &AsyncICache<R> {
         &self.inner
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::r#trait::DirEntryType;
+
+    fn dummy_dir_attr(ino: Inode) -> FileAttr {
+        let now = SystemTime::now();
+        FileAttr::Directory {
+            common: make_common_file_attr(ino, 0o755, now, now, (0, 0), 4096),
+        }
+    }
+
+    fn dummy_file_attr(ino: Inode) -> FileAttr {
+        let now = SystemTime::now();
+        FileAttr::RegularFile {
+            common: make_common_file_attr(ino, 0o644, now, now, (0, 0), 4096),
+            size: 100,
+            blocks: 1,
+        }
+    }
+
+    #[test]
+    fn needs_resolve_stub_returns_true() {
+        let icb = InodeControlBlock {
+            parent: Some(1),
+            rc: 0,
+            path: "stub".into(),
+            attr: None,
+            children: None,
+        };
+        assert!(icb.needs_resolve());
+    }
+
+    #[test]
+    fn needs_resolve_file_with_attr_returns_false() {
+        let icb = InodeControlBlock {
+            parent: Some(1),
+            rc: 1,
+            path: "file.txt".into(),
+            attr: Some(dummy_file_attr(2)),
+            children: None,
+        };
+        assert!(!icb.needs_resolve());
+    }
+
+    #[test]
+    fn needs_resolve_dir_without_children_returns_true() {
+        let icb = InodeControlBlock {
+            parent: Some(1),
+            rc: 1,
+            path: "dir".into(),
+            attr: Some(dummy_dir_attr(3)),
+            children: None,
+        };
+        assert!(icb.needs_resolve());
+    }
+
+    #[test]
+    fn needs_resolve_dir_with_children_returns_false() {
+        let icb = InodeControlBlock {
+            parent: Some(1),
+            rc: 1,
+            path: "dir".into(),
+            attr: Some(dummy_dir_attr(3)),
+            children: Some(vec![("README.md".to_owned(), DirEntryType::RegularFile)]),
+        };
+        assert!(!icb.needs_resolve());
+    }
+
+    #[test]
+    fn needs_resolve_dir_with_empty_children_returns_false() {
+        let icb = InodeControlBlock {
+            parent: Some(1),
+            rc: 1,
+            path: "empty-dir".into(),
+            attr: Some(dummy_dir_attr(4)),
+            children: Some(vec![]),
+        };
+        assert!(!icb.needs_resolve());
     }
 }

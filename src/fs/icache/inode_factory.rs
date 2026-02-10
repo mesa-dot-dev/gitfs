@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use crate::fs::r#trait::Inode;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Monotonically increasing inode allocator.
 pub struct InodeFactory {

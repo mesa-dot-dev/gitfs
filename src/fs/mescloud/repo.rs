@@ -101,6 +101,7 @@ impl IcbResolver for RepoResolver {
                 path: stub.path,
                 rc: stub.rc,
                 attr: Some(attr),
+                children: None,
             })
         }
     }
@@ -228,7 +229,7 @@ impl Fs for RepoFs {
     #[instrument(skip(self), fields(repo = %self.repo_name))]
     async fn lookup(&mut self, parent: Inode, name: &OsStr) -> Result<FileAttr, LookupError> {
         debug_assert!(
-            self.icache.contains(parent).await,
+            self.icache.contains(parent),
             "lookup: parent inode {parent} not in inode table"
         );
 
@@ -260,7 +261,7 @@ impl Fs for RepoFs {
     #[instrument(skip(self), fields(repo = %self.repo_name))]
     async fn readdir(&mut self, ino: Inode) -> Result<&[DirEntry], ReadDirError> {
         debug_assert!(
-            self.icache.contains(ino).await,
+            self.icache.contains(ino),
             "readdir: inode {ino} not in inode table"
         );
         debug_assert!(
@@ -351,7 +352,7 @@ impl Fs for RepoFs {
 
     #[instrument(skip(self), fields(repo = %self.repo_name))]
     async fn open(&mut self, ino: Inode, _flags: OpenFlags) -> Result<OpenFile, OpenError> {
-        if !self.icache.contains(ino).await {
+        if !self.icache.contains(ino) {
             warn!(ino, "open on unknown inode");
             return Err(OpenError::InodeNotFound);
         }
@@ -450,7 +451,7 @@ impl Fs for RepoFs {
     #[instrument(skip(self), fields(repo = %self.repo_name))]
     async fn forget(&mut self, ino: Inode, nlookups: u64) {
         debug_assert!(
-            self.icache.contains(ino).await,
+            self.icache.contains(ino),
             "forget: inode {ino} not in inode table"
         );
 

@@ -64,6 +64,7 @@ impl IcbResolver for MesaResolver {
                 path: "/".into(),
                 rc: 0,
                 attr: None,
+                children: None,
             });
             let now = SystemTime::now();
             let attr = FileAttr::Directory {
@@ -73,6 +74,7 @@ impl IcbResolver for MesaResolver {
             };
             Ok(InodeControlBlock {
                 attr: Some(attr),
+                children: Some(vec![]),
                 ..stub
             })
         }
@@ -229,6 +231,7 @@ impl MesaFS {
                     path: org_name.as_str().into(),
                     parent: Some(Self::ROOT_NODE_INO),
                     attr: None,
+                    children: None,
                 },
             )
             .await;
@@ -282,6 +285,7 @@ impl MesaFS {
                     path: name.into(),
                     parent: Some(parent_mesa_ino),
                     attr: None,
+                    children: None,
                 },
                 |_| {},
             )

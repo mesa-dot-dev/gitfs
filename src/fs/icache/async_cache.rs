@@ -108,9 +108,22 @@ impl<R: IcbResolver> AsyncICache<R> {
         }
     }
 
-    /// Check whether `ino` exists. **Awaits** if the entry is `InFlight`.
-    pub async fn contains(&self, ino: Inode) -> bool {
-        self.wait_for_available(ino).await
+    /// Check whether `ino` has an entry in the table (either `InFlight` or `Available`).
+    ///
+    /// This is a non-blocking, synchronous check. It does **not** wait for
+    /// `InFlight` entries to resolve.
+    pub fn contains(&self, ino: Inode) -> bool {
+        self.inode_table.contains_sync(&ino)
+    }
+
+    /// Check whether `ino` is fully resolved (`Available`).
+    ///
+    /// Returns `false` if the entry is missing **or** still `InFlight`.
+    /// This is a non-blocking, synchronous check.
+    pub fn contains_resolved(&self, ino: Inode) -> bool {
+        self.inode_table
+            .read_sync(&ino, |_, s| matches!(s, IcbState::Available(_)))
+            .unwrap_or(false)
     }
 
     /// Read an ICB via closure. **Awaits** if `InFlight`.
@@ -453,13 +466,43 @@ mod tests {
     #[tokio::test]
     async fn contains_returns_true_for_root() {
         let cache = test_cache();
-        assert!(cache.contains(1).await, "root should exist");
+        assert!(cache.contains(1), "root should exist");
     }
 
     #[tokio::test]
     async fn contains_returns_false_for_missing() {
         let cache = test_cache();
-        assert!(!cache.contains(999).await, "missing inode should not exist");
+        assert!(!cache.contains(999), "missing inode should not exist");
+    }
+
+    #[tokio::test]
+    async fn contains_resolved_returns_true_for_root() {
+        let cache = test_cache();
+        assert!(cache.contains_resolved(1), "root should be resolved");
+    }
+
+    #[tokio::test]
+    async fn contains_resolved_returns_false_for_missing() {
+        let cache = test_cache();
+        assert!(
+            !cache.contains_resolved(999),
+            "missing inode should not be resolved"
+        );
+    }
+
+    #[tokio::test]
+    async fn contains_resolved_returns_false_for_inflight() {
+        let cache = test_cache();
+        let (_tx, rx) = watch::channel(());
+        cache
+            .inode_table
+            .upsert_async(42, IcbState::InFlight(rx))
+            .await;
+        assert!(cache.contains(42), "InFlight entry should exist");
+        assert!(
+            !cache.contains_resolved(42),
+            "InFlight entry should not be resolved"
+        );
     }
 
     #[tokio::test]
@@ -483,7 +526,7 @@ mod tests {
             .await
             .expect("task panicked")
             .expect("resolve failed");
-        assert!(cache.contains(42).await, "should be true after resolve");
+        assert!(cache.contains(42), "should be true after resolve");
     }
 
     #[tokio::test]
@@ -554,7 +597,7 @@ mod tests {
                 },
             )
             .await;
-        assert!(cache.contains(42).await, "inserted entry should exist");
+        assert!(cache.contains(42), "inserted entry should exist");
         assert_eq!(cache.inode_count(), 2, "root + inserted = 2");
     }
 
@@ -690,7 +733,7 @@ mod tests {
 
         let evicted = cache.forget(42, 3).await;
         assert!(evicted.is_some(), "rc 3 - 3 = 0, should evict");
-        assert!(!cache.contains(42).await, "evicted entry should be gone");
+        assert!(!cache.contains(42), "evicted entry should be gone");
         assert_eq!(cache.inode_count(), 1, "only root remains");
     }
 
@@ -776,13 +819,10 @@ mod tests {
             .await;
         drop(tx);
 
-        // This must NOT hang
-        let result =
-            tokio::time::timeout(std::time::Duration::from_millis(100), cache.contains(42)).await;
-        assert_eq!(
-            result,
-            Ok(true),
-            "should not hang on already-completed entry"
+        assert!(cache.contains(42), "entry should exist in table");
+        assert!(
+            cache.contains_resolved(42),
+            "should be resolved after insert_icb overwrote InFlight"
         );
     }
 
@@ -822,7 +862,7 @@ mod tests {
         let path: Result<PathBuf, String> = cache.get_or_resolve(42, |icb| icb.path.clone()).await;
         assert_eq!(path, Ok(PathBuf::from("/resolved")));
         // Should now be cached
-        assert!(cache.contains(42).await);
+        assert!(cache.contains(42));
     }
 
     #[tokio::test]
@@ -835,7 +875,7 @@ mod tests {
             cache.get_or_resolve(42, |icb| icb.path.clone()).await;
         assert_eq!(result, Err("network error".to_owned()));
         // Entry should be cleaned up on error
-        assert!(!cache.contains(42).await);
+        assert!(!cache.contains(42));
     }
 
     struct CountingResolver {

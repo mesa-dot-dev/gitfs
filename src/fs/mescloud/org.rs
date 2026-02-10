@@ -53,6 +53,7 @@ impl IcbResolver for OrgResolver {
                 path: "/".into(),
                 rc: 0,
                 attr: None,
+                children: None,
             });
             let now = SystemTime::now();
             let attr = FileAttr::Directory {
@@ -62,6 +63,7 @@ impl IcbResolver for OrgResolver {
             };
             Ok(InodeControlBlock {
                 attr: Some(attr),
+                children: Some(vec![]),
                 ..stub
             })
         }
@@ -184,6 +186,7 @@ impl OrgFs {
                     path: owner.into(),
                     parent: Some(Self::ROOT_INO),
                     attr: None,
+                    children: None,
                 },
             )
             .await;
@@ -329,6 +332,7 @@ impl OrgFs {
                     path: display_name.into(),
                     parent: Some(parent_ino),
                     attr: None,
+                    children: None,
                 },
             )
             .await;
@@ -413,6 +417,7 @@ impl OrgFs {
                         path: name.into(),
                         parent: Some(parent_org_ino),
                         attr: None,
+                        children: None,
                     }
                 },
                 |icb| {
