@@ -328,7 +328,7 @@ pub trait Fs {
     type ReaddirError: std::error::Error;
     type ReleaseError: std::error::Error;
 
-    /// For each lookup call made by the kernel, it expects the dcache to be updated with the
+    /// For each lookup call made by the kernel, it expects the icache to be updated with the
     /// returned `FileAttr`.
     async fn lookup(&mut self, parent: Inode, name: &OsStr) -> Result<FileAttr, Self::LookupError>;
 
