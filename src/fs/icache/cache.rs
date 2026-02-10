@@ -47,12 +47,6 @@ impl<I: IcbLike> ICache<I> {
         self.inode_table.contains_key(&ino)
     }
 
-    /// Insert an ICB directly.
-    #[expect(dead_code, reason = "public API method for future use")]
-    pub fn insert_icb(&mut self, ino: Inode, icb: I) {
-        self.inode_table.insert(ino, icb);
-    }
-
     /// Insert an ICB only if absent.
     /// Returns a mutable reference to the (possibly pre-existing) ICB.
     pub fn entry_or_insert_icb(&mut self, ino: Inode, f: impl FnOnce() -> I) -> &mut I {
@@ -62,17 +56,6 @@ impl<I: IcbLike> ICache<I> {
     /// Number of inodes in the table.
     pub fn inode_count(&self) -> usize {
         self.inode_table.len()
-    }
-
-    /// Increment rc. Panics (via unwrap) if inode doesn't exist.
-    #[expect(dead_code, reason = "public API method for future use")]
-    pub fn inc_rc(&mut self, ino: Inode) -> u64 {
-        let icb = self
-            .inode_table
-            .get_mut(&ino)
-            .unwrap_or_else(|| unreachable!("inc_rc: inode {ino} not in table"));
-        *icb.rc_mut() += 1;
-        icb.rc()
     }
 
     /// Decrement rc by `nlookups`. Returns `Some(evicted_icb)` if the inode was evicted.
@@ -93,10 +76,5 @@ impl<I: IcbLike> ICache<I> {
                 None
             }
         }
-    }
-
-    #[expect(dead_code, reason = "public API method for future use")]
-    pub fn iter(&self) -> impl Iterator<Item = (&Inode, &I)> {
-        self.inode_table.iter()
     }
 }
