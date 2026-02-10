@@ -3,10 +3,10 @@ name: ShellCheck
 on:
   push:
     branches: [main]
-    paths: ["**.sh"]
+    paths: ["**.sh", "**.bash", "**.zsh", "**.ksh"]
   pull_request:
     branches: [main]
-    paths: ["**.sh"]
+    paths: ["**.sh", "**.bash", "**.zsh", "**.ksh"]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -19,13 +19,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run ShellCheck (strictest settings)
+      - name: Run ShellCheck
         run: |
+          shopt -s globstar nullglob
           shellcheck --version
           shellcheck \
-            --shell=sh \
             --severity=style \
             --enable=all \
-            --external-sources \
             --format=gcc \
-            ./install.sh
+            **/*.sh **/*.bash **/*.zsh **/*.ksh

@@ -1,0 +1,38 @@
+name: Python Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Ruff & Pyright
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Ruff check (lint)
+        run: uv run ruff check .
+
+      - name: Ruff format (formatting check)
+        run: uv run ruff format --check .
+
+      - name: Pyright (type check)
+        run: uv run pyright
