@@ -101,6 +101,7 @@ impl MesaFS {
     const BLOCK_SIZE: u32 = 4096;
 
     /// Create a new `MesaFS` instance.
+    #[must_use]
     pub fn new(orgs: impl Iterator<Item = OrgConfig>, fs_owner: (u32, u32)) -> Self {
         let resolver = MesaResolver {
             fs_owner,

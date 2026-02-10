@@ -100,6 +100,7 @@ impl OrgFs {
     const BLOCK_SIZE: u32 = 4096;
 
     /// The name of the organization.
+    #[must_use]
     pub(crate) fn name(&self) -> &str {
         &self.name
     }
@@ -185,6 +186,7 @@ impl OrgFs {
         (ino, attr)
     }
 
+    #[must_use]
     pub fn new(name: String, client: MesaClient, fs_owner: (u32, u32)) -> Self {
         let resolver = OrgResolver {
             fs_owner,
