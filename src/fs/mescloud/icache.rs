@@ -111,26 +111,12 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         self.inner.contains(ino)
     }
 
-    #[expect(dead_code, reason = "public API method for future use")]
-    pub fn contains_resolved(&self, ino: Inode) -> bool {
-        self.inner.contains_resolved(ino)
-    }
-
     pub async fn get_icb<T>(
         &self,
         ino: Inode,
         f: impl FnOnce(&InodeControlBlock) -> T,
     ) -> Option<T> {
         self.inner.get_icb(ino, f).await
-    }
-
-    #[expect(dead_code, reason = "public API method for future use")]
-    pub async fn get_icb_mut<T>(
-        &self,
-        ino: Inode,
-        f: impl FnOnce(&mut InodeControlBlock) -> T,
-    ) -> Option<T> {
-        self.inner.get_icb_mut(ino, f).await
     }
 
     pub async fn insert_icb(&self, ino: Inode, icb: InodeControlBlock) {
@@ -160,18 +146,6 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         then: impl FnOnce(&InodeControlBlock) -> T,
     ) -> Result<T, R::Error> {
         self.inner.get_or_resolve(ino, then).await
-    }
-
-    // -- Delegated (sync) --
-
-    #[expect(dead_code, reason = "public API method for future use")]
-    pub fn for_each(&self, f: impl FnMut(&Inode, &InodeControlBlock)) {
-        self.inner.for_each(f);
-    }
-
-    #[expect(dead_code, reason = "public API method for future use")]
-    pub fn inode_count(&self) -> usize {
-        self.inner.inode_count()
     }
 
     // -- Domain-specific --
@@ -248,12 +222,6 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
             )
             .await;
         ino
-    }
-
-    /// Direct access to the inner async cache for resolvers that need it.
-    #[expect(dead_code, reason = "public API method for future use")]
-    pub fn inner(&self) -> &AsyncICache<R> {
-        &self.inner
     }
 }
 

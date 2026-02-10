@@ -2,13 +2,11 @@
 
 pub mod async_cache;
 pub mod bridge;
-mod cache;
 mod file_table;
 mod inode_factory;
 
 pub use async_cache::AsyncICache;
 pub use async_cache::IcbResolver;
-pub use cache::ICache;
 pub use file_table::FileTable;
 pub use inode_factory::InodeFactory;
 

@@ -116,16 +116,6 @@ impl<R: IcbResolver> AsyncICache<R> {
         self.inode_table.contains_sync(&ino)
     }
 
-    /// Check whether `ino` is fully resolved (`Available`).
-    ///
-    /// Returns `false` if the entry is missing **or** still `InFlight`.
-    /// This is a non-blocking, synchronous check.
-    pub fn contains_resolved(&self, ino: Inode) -> bool {
-        self.inode_table
-            .read_sync(&ino, |_, s| matches!(s, IcbState::Available(_)))
-            .unwrap_or(false)
-    }
-
     /// Read an ICB via closure. **Awaits** if `InFlight`.
     /// Returns `None` if `ino` doesn't exist.
     pub async fn get_icb<T>(&self, ino: Inode, f: impl FnOnce(&R::Icb) -> T) -> Option<T> {
@@ -476,36 +466,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn contains_resolved_returns_true_for_root() {
-        let cache = test_cache();
-        assert!(cache.contains_resolved(1), "root should be resolved");
-    }
-
-    #[tokio::test]
-    async fn contains_resolved_returns_false_for_missing() {
-        let cache = test_cache();
-        assert!(
-            !cache.contains_resolved(999),
-            "missing inode should not be resolved"
-        );
-    }
-
-    #[tokio::test]
-    async fn contains_resolved_returns_false_for_inflight() {
-        let cache = test_cache();
-        let (_tx, rx) = watch::channel(());
-        cache
-            .inode_table
-            .upsert_async(42, IcbState::InFlight(rx))
-            .await;
-        assert!(cache.contains(42), "InFlight entry should exist");
-        assert!(
-            !cache.contains_resolved(42),
-            "InFlight entry should not be resolved"
-        );
-    }
-
-    #[tokio::test]
     async fn contains_after_resolver_completes() {
         let resolver = TestResolver::new();
         resolver.add(
@@ -820,10 +780,6 @@ mod tests {
         drop(tx);
 
         assert!(cache.contains(42), "entry should exist in table");
-        assert!(
-            cache.contains_resolved(42),
-            "should be resolved after insert_icb overwrote InFlight"
-        );
     }
 
     // -- get_or_resolve tests --

@@ -111,18 +111,6 @@ impl OrgFs {
         self.name == "github"
     }
 
-    /// Decode a base64-encoded repo name from the API. Returns "owner/repo".
-    /// TODO(MES-674): Cleanup "special" casing for github.
-    #[expect(dead_code)]
-    fn decode_github_repo_name(encoded: &str) -> Option<String> {
-        use base64::Engine as _;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .ok()?;
-        let decoded = String::from_utf8(bytes).ok()?;
-        decoded.contains('/').then_some(decoded)
-    }
-
     /// Encode "owner/repo" to base64 for API calls.
     /// TODO(MES-674): Cleanup "special" casing for github.
     fn encode_github_repo_name(decoded: &str) -> String {
