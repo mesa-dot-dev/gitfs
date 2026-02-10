@@ -290,42 +290,21 @@ impl Fs for RepoFs {
             "readdir: inode {ino} has non-directory cached attr"
         );
 
-        let file_path = self.path_of_inode(ino).await;
+        let children = self
+            .icache
+            .get_or_resolve(ino, |icb| icb.children.clone())
+            .await?
+            .ok_or(ReadDirError::NotADirectory)?;
 
-        let content = self
-            .client
-            .org(&self.org_name)
-            .repos()
-            .at(&self.repo_name)
-            .content()
-            .get(Some(self.ref_.as_str()), file_path.as_deref(), None)
-            .await
-            .map_err(MesaApiError::from)?;
+        trace!(
+            ino,
+            count = children.len(),
+            "readdir: resolved directory listing from icache"
+        );
 
-        let mesa_entries = match content {
-            Content::Dir(d) => d.entries,
-            Content::File(_) | Content::Symlink(_) => return Err(ReadDirError::NotADirectory),
-        };
-
-        let collected: Vec<(String, DirEntryType)> = mesa_entries
-            .into_iter()
-            .filter_map(|e| {
-                let (name, kind) = match e {
-                    MesaDirEntry::File(f) => (f.name?, DirEntryType::RegularFile),
-                    // TODO(MES-712): return DirEntryType::Symlink once readlink is wired up.
-                    MesaDirEntry::Symlink(s) => (s.name?, DirEntryType::RegularFile),
-                    MesaDirEntry::Dir(d) => (d.name?, DirEntryType::Directory),
-                };
-                Some((name, kind))
-            })
-            .collect();
-
-        trace!(ino, path = ?file_path, count = collected.len(), "fetched directory listing");
-
-        let mut entries = Vec::with_capacity(collected.len());
-        for (name, kind) in &collected {
+        let mut entries = Vec::with_capacity(children.len());
+        for (name, kind) in &children {
             let child_ino = self.icache.ensure_child_ino(ino, OsStr::new(name)).await;
-            // Insert fully-populated attr (bypassing resolver) since we know the kind from the listing
             let now = SystemTime::now();
             let attr = match kind {
                 DirEntryType::Directory => FileAttr::Directory {
