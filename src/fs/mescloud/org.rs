@@ -9,11 +9,11 @@ use mesa_dev::MesaClient;
 use secrecy::SecretString;
 use tracing::{instrument, trace, warn};
 
-use super::common::InodeCachePeek as _;
 pub use super::common::{
     GetAttrError, LookupError, OpenError, ReadDirError, ReadError, ReleaseError,
 };
 use super::common::{InodeControlBlock, MesaApiError};
+use super::composite::{ChildSlot, CompositeFs};
 use super::icache as mescloud_icache;
 use super::icache::MescloudICache;
 use super::repo::RepoFs;
@@ -23,10 +23,6 @@ use crate::fs::r#trait::{
     DirEntry, DirEntryType, FileAttr, FileHandle, FilesystemStats, Fs, Inode, LockOwner, OpenFile,
     OpenFlags,
 };
-
-// ---------------------------------------------------------------------------
-// OrgResolver
-// ---------------------------------------------------------------------------
 
 pub(super) struct OrgResolver {
     fs_owner: (u32, u32),
@@ -71,20 +67,10 @@ impl IcbResolver for OrgResolver {
     }
 }
 
-// ---------------------------------------------------------------------------
-// OrgFs
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone)]
 pub struct OrgConfig {
     pub name: String,
     pub api_key: SecretString,
-}
-
-/// Per-repo wrapper with inode and file handle translation.
-struct RepoSlot {
-    repo: RepoFs,
-    bridge: HashMapBridge, // left = org, right = repo
 }
 
 /// Classifies an inode by its role in the org hierarchy.
@@ -94,27 +80,19 @@ enum InodeRole {
     /// A virtual owner directory (github only).
     OwnerDir,
     /// An inode owned by some repo.
-    RepoOwned { idx: usize },
+    RepoOwned,
 }
 
 /// A filesystem rooted at a single organization.
 ///
-/// Owns multiple [`RepoFs`] instances and translates inodes between its namespace
-/// and each repo's namespace using [`HashMapBridge`].
+/// Composes multiple [`RepoFs`] instances, each with its own inode namespace,
+/// delegating to [`CompositeFs`] for inode/fh translation at each boundary.
 pub struct OrgFs {
     name: String,
     client: MesaClient,
-
-    icache: MescloudICache<OrgResolver>,
-    file_table: FileTable,
-    readdir_buf: Vec<DirEntry>,
-
-    /// Maps org-level repo-root inodes → index into `repos`.
-    repo_inodes: HashMap<Inode, usize>,
-    /// Maps org-level owner-dir inodes → owner name.
-    /// Only populated when org name is "github".
+    composite: CompositeFs<OrgResolver, RepoFs>,
+    /// Maps org-level owner-dir inodes to owner name (github only).
     owner_inodes: HashMap<Inode, String>,
-    repos: Vec<RepoSlot>,
 }
 
 impl OrgFs {
@@ -157,7 +135,7 @@ impl OrgFs {
         // Check existing
         for (&ino, existing_owner) in &self.owner_inodes {
             if existing_owner == owner {
-                if let Some(attr) = self.icache.get_attr(ino).await {
+                if let Some(attr) = self.composite.icache.get_attr(ino).await {
                     return (ino, attr);
                 }
                 let now = SystemTime::now();
@@ -167,19 +145,20 @@ impl OrgFs {
                         0o755,
                         now,
                         now,
-                        self.icache.fs_owner(),
-                        self.icache.block_size(),
+                        self.composite.icache.fs_owner(),
+                        self.composite.icache.block_size(),
                     ),
                 };
-                self.icache.cache_attr(ino, attr).await;
+                self.composite.icache.cache_attr(ino, attr).await;
                 return (ino, attr);
             }
         }
 
         // Allocate new
-        let ino = self.icache.allocate_inode();
+        let ino = self.composite.icache.allocate_inode();
         let now = SystemTime::now();
-        self.icache
+        self.composite
+            .icache
             .insert_icb(
                 ino,
                 InodeControlBlock {
@@ -198,11 +177,11 @@ impl OrgFs {
                 0o755,
                 now,
                 now,
-                self.icache.fs_owner(),
-                self.icache.block_size(),
+                self.composite.icache.fs_owner(),
+                self.composite.icache.block_size(),
             ),
         };
-        self.icache.cache_attr(ino, attr).await;
+        self.composite.icache.cache_attr(ino, attr).await;
         (ino, attr)
     }
 
@@ -214,12 +193,14 @@ impl OrgFs {
         Self {
             name,
             client,
-            icache: MescloudICache::new(resolver, Self::ROOT_INO, fs_owner, Self::BLOCK_SIZE),
-            file_table: FileTable::new(),
-            readdir_buf: Vec::new(),
-            repo_inodes: HashMap::new(),
+            composite: CompositeFs {
+                icache: MescloudICache::new(resolver, Self::ROOT_INO, fs_owner, Self::BLOCK_SIZE),
+                file_table: FileTable::new(),
+                readdir_buf: Vec::new(),
+                child_inodes: HashMap::new(),
+                slots: Vec::new(),
+            },
             owner_inodes: HashMap::new(),
-            repos: Vec::new(),
         }
     }
 
@@ -231,41 +212,14 @@ impl OrgFs {
         if self.owner_inodes.contains_key(&ino) {
             return InodeRole::OwnerDir;
         }
-        if let Some(&idx) = self.repo_inodes.get(&ino) {
-            return InodeRole::RepoOwned { idx };
+        if self.composite.child_inodes.contains_key(&ino) {
+            return InodeRole::RepoOwned;
         }
-        // Walk parent chain to find owning repo.
-        if let Some(idx) = self.repo_slot_for_inode(ino).await {
-            return InodeRole::RepoOwned { idx };
+        if self.composite.slot_for_inode(ino).await.is_some() {
+            return InodeRole::RepoOwned;
         }
-        // Shouldn't happen — all non-root inodes should be repo-owned.
-        trace!(
-            ino,
-            "inode_role: inode not found in any repo slot, falling back to OrgRoot"
-        );
         debug_assert!(false, "inode {ino} not found in any repo slot");
         InodeRole::OrgRoot
-    }
-
-    /// Find the repo slot index that owns `ino` by walking the parent chain.
-    async fn repo_slot_for_inode(&self, ino: Inode) -> Option<usize> {
-        // Direct repo root?
-        if let Some(&idx) = self.repo_inodes.get(&ino) {
-            return Some(idx);
-        }
-        // Walk parents.
-        let mut current = ino;
-        loop {
-            let parent = self
-                .icache
-                .get_icb(current, |icb| icb.parent)
-                .await
-                .flatten()?;
-            if let Some(&idx) = self.repo_inodes.get(&parent) {
-                return Some(idx);
-            }
-            current = parent;
-        }
     }
 
     /// Ensure an inode + `RepoFs` exists for the given repo name.
@@ -282,10 +236,15 @@ impl OrgFs {
         parent_ino: Inode,
     ) -> (Inode, FileAttr) {
         // Check existing repos.
-        for (&ino, &idx) in &self.repo_inodes {
-            if self.repos[idx].repo.repo_name() == repo_name {
-                if let Some(attr) = self.icache.get_attr(ino).await {
-                    let rc = self.icache.get_icb(ino, |icb| icb.rc).await.unwrap_or(0);
+        for (&ino, &idx) in &self.composite.child_inodes {
+            if self.composite.slots[idx].inner.repo_name() == repo_name {
+                if let Some(attr) = self.composite.icache.get_attr(ino).await {
+                    let rc = self
+                        .composite
+                        .icache
+                        .get_icb(ino, |icb| icb.rc)
+                        .await
+                        .unwrap_or(0);
                     trace!(ino, repo = repo_name, rc, "ensure_repo_inode: reusing");
                     return (ino, attr);
                 }
@@ -302,17 +261,17 @@ impl OrgFs {
                         0o755,
                         now,
                         now,
-                        self.icache.fs_owner(),
-                        self.icache.block_size(),
+                        self.composite.icache.fs_owner(),
+                        self.composite.icache.block_size(),
                     ),
                 };
-                self.icache.cache_attr(ino, attr).await;
+                self.composite.icache.cache_attr(ino, attr).await;
                 return (ino, attr);
             }
         }
 
         // Allocate new.
-        let ino = self.icache.allocate_inode();
+        let ino = self.composite.icache.allocate_inode();
         trace!(
             ino,
             repo = repo_name,
@@ -320,7 +279,8 @@ impl OrgFs {
         );
 
         let now = SystemTime::now();
-        self.icache
+        self.composite
+            .icache
             .insert_icb(
                 ino,
                 InodeControlBlock {
@@ -338,15 +298,18 @@ impl OrgFs {
             self.name.clone(),
             repo_name.to_owned(),
             default_branch.to_owned(),
-            self.icache.fs_owner(),
+            self.composite.icache.fs_owner(),
         );
 
         let mut bridge = HashMapBridge::new();
         bridge.insert_inode(ino, RepoFs::ROOT_INO);
 
-        let idx = self.repos.len();
-        self.repos.push(RepoSlot { repo, bridge });
-        self.repo_inodes.insert(ino, idx);
+        let idx = self.composite.slots.len();
+        self.composite.slots.push(ChildSlot {
+            inner: repo,
+            bridge,
+        });
+        self.composite.child_inodes.insert(ino, idx);
 
         let attr = FileAttr::Directory {
             common: mescloud_icache::make_common_file_attr(
@@ -354,11 +317,11 @@ impl OrgFs {
                 0o755,
                 now,
                 now,
-                self.icache.fs_owner(),
-                self.icache.block_size(),
+                self.composite.icache.fs_owner(),
+                self.composite.icache.block_size(),
             ),
         };
-        self.icache.cache_attr(ino, attr).await;
+        self.composite.icache.cache_attr(ino, attr).await;
         (ino, attr)
     }
 
@@ -375,63 +338,12 @@ impl OrgFs {
             .await
             .map_err(MesaApiError::from)
     }
-
-    /// Allocate an org-level file handle and map it through the bridge.
-    fn alloc_fh(&mut self, slot_idx: usize, repo_fh: FileHandle) -> FileHandle {
-        let fh = self.file_table.allocate();
-        self.repos[slot_idx].bridge.insert_fh(fh, repo_fh);
-        fh
-    }
-
-    /// Translate a repo inode to an org inode, allocating if needed.
-    /// Also mirrors the ICB into the org's inode table.
-    async fn translate_repo_ino_to_org(
-        &mut self,
-        slot_idx: usize,
-        repo_ino: Inode,
-        parent_org_ino: Inode,
-        name: &OsStr,
-        _kind: DirEntryType,
-    ) -> Inode {
-        let org_ino = self.repos[slot_idx]
-            .bridge
-            .backward_or_insert_inode(repo_ino, || self.icache.allocate_inode());
-
-        self.icache
-            .entry_or_insert_icb(
-                org_ino,
-                || {
-                    trace!(
-                        org_ino,
-                        repo_ino,
-                        parent = parent_org_ino,
-                        ?name,
-                        "translate: created new org ICB"
-                    );
-                    InodeControlBlock {
-                        rc: 0,
-                        path: name.into(),
-                        parent: Some(parent_org_ino),
-                        attr: None,
-                        children: None,
-                    }
-                },
-                |icb| {
-                    if icb.rc > 0 || icb.attr.is_some() {
-                        trace!(org_ino, repo_ino, "translate: reused existing org ICB");
-                    }
-                },
-            )
-            .await;
-
-        org_ino
-    }
 }
 
 #[async_trait::async_trait]
 impl super::common::InodeCachePeek for OrgFs {
     async fn peek_attr(&self, ino: Inode) -> Option<FileAttr> {
-        self.icache.get_attr(ino).await
+        self.composite.icache.get_attr(ino).await
     }
 }
 
@@ -455,7 +367,7 @@ impl Fs for OrgFs {
                     // name is an owner like "torvalds" — create lazily, no API validation.
                     trace!(owner = name_str, "lookup: resolving github owner dir");
                     let (ino, attr) = self.ensure_owner_inode(name_str).await;
-                    self.icache.inc_rc(ino).await;
+                    self.composite.icache.inc_rc(ino).await;
                     Ok(attr)
                 } else {
                     // Children of org root are repos.
@@ -467,7 +379,7 @@ impl Fs for OrgFs {
                     let (ino, attr) = self
                         .ensure_repo_inode(name_str, name_str, &repo.default_branch, Self::ROOT_INO)
                         .await;
-                    let rc = self.icache.inc_rc(ino).await;
+                    let rc = self.composite.icache.inc_rc(ino).await;
                     trace!(ino, repo = name_str, rc, "lookup: resolved repo inode");
                     Ok(attr)
                 }
@@ -497,33 +409,10 @@ impl Fs for OrgFs {
                 let (ino, attr) = self
                     .ensure_repo_inode(&encoded, repo_name_str, &repo.default_branch, parent)
                     .await;
-                self.icache.inc_rc(ino).await;
+                self.composite.icache.inc_rc(ino).await;
                 Ok(attr)
             }
-            InodeRole::RepoOwned { idx } => {
-                // Delegate to repo.
-                let repo_parent = self.repos[idx]
-                    .bridge
-                    .forward_or_insert_inode(parent, || unreachable!("forward should find parent"));
-                // ^ forward should always find parent since it was previously mapped.
-                // Using forward_or_insert just for safety, but the allocate closure should never run.
-
-                let repo_attr = self.repos[idx].repo.lookup(repo_parent, name).await?;
-                let repo_ino = repo_attr.common().ino;
-
-                // Translate back to org namespace.
-                let kind: DirEntryType = repo_attr.into();
-                let org_ino = self
-                    .translate_repo_ino_to_org(idx, repo_ino, parent, name, kind)
-                    .await;
-
-                // Rebuild attr with org inode.
-                let org_attr = self.repos[idx].bridge.attr_backward(repo_attr);
-                self.icache.cache_attr(org_ino, org_attr).await;
-                let rc = self.icache.inc_rc(org_ino).await;
-                trace!(org_ino, repo_ino, rc, "lookup: resolved content inode");
-                Ok(org_attr)
-            }
+            InodeRole::RepoOwned => self.composite.delegated_lookup(parent, name).await,
         }
     }
 
@@ -533,10 +422,7 @@ impl Fs for OrgFs {
         ino: Inode,
         _fh: Option<FileHandle>,
     ) -> Result<FileAttr, GetAttrError> {
-        self.icache.get_attr(ino).await.ok_or_else(|| {
-            warn!(ino, "getattr on unknown inode");
-            GetAttrError::InodeNotFound
-        })
+        self.composite.delegated_getattr(ino).await
     }
 
     #[instrument(skip(self), fields(org = %self.name))]
@@ -580,79 +466,21 @@ impl Fs for OrgFs {
                     });
                 }
 
-                self.readdir_buf = entries;
-                Ok(&self.readdir_buf)
+                self.composite.readdir_buf = entries;
+                Ok(&self.composite.readdir_buf)
             }
             InodeRole::OwnerDir if self.is_github() => {
                 // TODO(MES-674): Cleanup "special" casing for github.
                 Err(ReadDirError::NotPermitted)
             }
             InodeRole::OwnerDir => Err(ReadDirError::NotADirectory),
-            InodeRole::RepoOwned { idx } => {
-                // Delegate to repo.
-                let repo_ino = self.repos[idx]
-                    .bridge
-                    .forward_or_insert_inode(ino, || unreachable!("readdir: ino should be mapped"));
-
-                let repo_entries = self.repos[idx].repo.readdir(repo_ino).await?;
-                // Clone entries to release borrow on repo before mutating self.
-                let repo_entries: Vec<DirEntry> = repo_entries.to_vec();
-
-                let mut org_entries = Vec::with_capacity(repo_entries.len());
-                for entry in &repo_entries {
-                    let org_child_ino = self
-                        .translate_repo_ino_to_org(idx, entry.ino, ino, &entry.name, entry.kind)
-                        .await;
-
-                    // Cache attr from repo if available.
-                    if let Some(repo_icb_attr) = self.repos[idx].repo.peek_attr(entry.ino).await {
-                        let org_attr = self.repos[idx].bridge.attr_backward(repo_icb_attr);
-                        self.icache.cache_attr(org_child_ino, org_attr).await;
-                    } else {
-                        trace!(
-                            repo_ino = entry.ino,
-                            org_ino = org_child_ino,
-                            "readdir: no cached attr from repo to propagate"
-                        );
-                    }
-
-                    org_entries.push(DirEntry {
-                        ino: org_child_ino,
-                        name: entry.name.clone(),
-                        kind: entry.kind,
-                    });
-                }
-
-                self.readdir_buf = org_entries;
-                Ok(&self.readdir_buf)
-            }
+            InodeRole::RepoOwned => self.composite.delegated_readdir(ino).await,
         }
     }
 
     #[instrument(skip(self), fields(org = %self.name))]
     async fn open(&mut self, ino: Inode, flags: OpenFlags) -> Result<OpenFile, OpenError> {
-        let idx = self.repo_slot_for_inode(ino).await.ok_or_else(|| {
-            warn!(ino, "open on inode not belonging to any repo");
-            OpenError::InodeNotFound
-        })?;
-
-        let repo_ino = self.repos[idx]
-            .bridge
-            .forward_or_insert_inode(ino, || unreachable!("open: ino should be mapped"));
-
-        let repo_open = self.repos[idx].repo.open(repo_ino, flags).await?;
-        let org_fh = self.alloc_fh(idx, repo_open.handle);
-
-        trace!(
-            ino,
-            org_fh,
-            repo_fh = repo_open.handle,
-            "open: assigned file handle"
-        );
-        Ok(OpenFile {
-            handle: org_fh,
-            options: repo_open.options,
-        })
+        self.composite.delegated_open(ino, flags).await
     }
 
     #[instrument(skip(self), fields(org = %self.name))]
@@ -665,26 +493,8 @@ impl Fs for OrgFs {
         flags: OpenFlags,
         lock_owner: Option<LockOwner>,
     ) -> Result<Bytes, ReadError> {
-        let idx = self.repo_slot_for_inode(ino).await.ok_or_else(|| {
-            warn!(ino, "read on inode not belonging to any repo");
-            ReadError::InodeNotFound
-        })?;
-
-        let repo_ino = self.repos[idx]
-            .bridge
-            .forward_or_insert_inode(ino, || unreachable!("read: ino should be mapped"));
-        let repo_fh = self.repos[idx].bridge.fh_forward(fh).ok_or_else(|| {
-            warn!(fh, "read: no fh mapping found");
-            ReadError::FileNotOpen
-        })?;
-
-        trace!(
-            ino,
-            fh, repo_ino, repo_fh, offset, size, "read: delegating to repo"
-        );
-        self.repos[idx]
-            .repo
-            .read(repo_ino, repo_fh, offset, size, flags, lock_owner)
+        self.composite
+            .delegated_read(ino, fh, offset, size, flags, lock_owner)
             .await
     }
 
@@ -696,58 +506,20 @@ impl Fs for OrgFs {
         flags: OpenFlags,
         flush: bool,
     ) -> Result<(), ReleaseError> {
-        let idx = self.repo_slot_for_inode(ino).await.ok_or_else(|| {
-            warn!(ino, "release on inode not belonging to any repo");
-            ReleaseError::FileNotOpen
-        })?;
-
-        let repo_ino = self.repos[idx]
-            .bridge
-            .forward_or_insert_inode(ino, || unreachable!("release: ino should be mapped"));
-        let repo_fh = self.repos[idx].bridge.fh_forward(fh).ok_or_else(|| {
-            warn!(fh, "release: no fh mapping found");
-            ReleaseError::FileNotOpen
-        })?;
-
-        trace!(ino, fh, repo_ino, repo_fh, "release: delegating to repo");
-        let result = self.repos[idx]
-            .repo
-            .release(repo_ino, repo_fh, flags, flush)
-            .await;
-
-        // Clean up fh mapping.
-        self.repos[idx].bridge.remove_fh_by_left(fh);
-        trace!(ino, fh, "release: cleaned up fh mapping");
-
-        result
+        self.composite
+            .delegated_release(ino, fh, flags, flush)
+            .await
     }
 
     #[instrument(skip(self), fields(org = %self.name))]
     async fn forget(&mut self, ino: Inode, nlookups: u64) {
-        // Propagate forget to inner repo if applicable.
-        if let Some(idx) = self.repo_slot_for_inode(ino).await {
-            if let Some(&repo_ino) = self.repos[idx].bridge.inode_map_get_by_left(ino) {
-                self.repos[idx].repo.forget(repo_ino, nlookups).await;
-            } else {
-                trace!(
-                    ino,
-                    "forget: no bridge mapping found, skipping repo propagation"
-                );
-            }
-        }
-
-        if self.icache.forget(ino, nlookups).await.is_some() {
-            // Clean up repo_inodes and owner_inodes mappings.
-            self.repo_inodes.remove(&ino);
+        let evicted = self.composite.delegated_forget(ino, nlookups).await;
+        if evicted {
             self.owner_inodes.remove(&ino);
-            // Clean up bridge mapping — find which slot, remove.
-            for slot in &mut self.repos {
-                slot.bridge.remove_inode_by_left(ino);
-            }
         }
     }
 
     async fn statfs(&mut self) -> Result<FilesystemStats, std::io::Error> {
-        Ok(self.icache.statfs())
+        Ok(self.composite.delegated_statfs())
     }
 }
