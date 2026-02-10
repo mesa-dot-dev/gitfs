@@ -45,7 +45,7 @@ pub fn blocks_of_size(block_size: u32, size: u64) -> u64 {
     size.div_ceil(u64::from(block_size))
 }
 
-/// Free function -- usable by both MescloudICache and resolvers.
+/// Free function -- usable by both `MescloudICache` and resolvers.
 pub fn make_common_file_attr(
     ino: Inode,
     perm: u16,
@@ -68,7 +68,7 @@ pub fn make_common_file_attr(
     }
 }
 
-/// Mescloud-specific directory cache wrapper over AsyncICache.
+/// Mescloud-specific directory cache wrapper over `AsyncICache`.
 pub struct MescloudICache<R: IcbResolver<Icb = InodeControlBlock>> {
     inner: AsyncICache<R>,
     inode_factory: InodeFactory,
@@ -108,6 +108,7 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         self.inner.get_icb(ino, f).await
     }
 
+    #[expect(dead_code, reason = "public API method for future use")]
     pub async fn get_icb_mut<T>(
         &self,
         ino: Inode,
@@ -117,7 +118,7 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     }
 
     pub async fn insert_icb(&self, ino: Inode, icb: InodeControlBlock) {
-        self.inner.insert_icb(ino, icb).await
+        self.inner.insert_icb(ino, icb).await;
     }
 
     pub async fn entry_or_insert_icb<T>(
@@ -151,10 +152,12 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         self.inner.allocate_fh()
     }
 
+    #[expect(dead_code, reason = "public API method for future use")]
     pub fn for_each(&self, f: impl FnMut(&Inode, &InodeControlBlock)) {
-        self.inner.for_each(f)
+        self.inner.for_each(f);
     }
 
+    #[expect(dead_code, reason = "public API method for future use")]
     pub fn inode_count(&self) -> usize {
         self.inner.inode_count()
     }
@@ -235,6 +238,7 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     }
 
     /// Direct access to the inner async cache for resolvers that need it.
+    #[expect(dead_code, reason = "public API method for future use")]
     pub fn inner(&self) -> &AsyncICache<R> {
         &self.inner
     }

@@ -220,7 +220,7 @@ impl<R: IcbResolver> AsyncICache<R> {
                         let t = then_fn.take().unwrap_or_else(|| unreachable!());
                         Some(t(icb))
                     }
-                    _ => None,
+                    IcbState::InFlight(_) | IcbState::Available(_) => None,
                 })
                 .await;
             if let Some(Some(r)) = hit {
@@ -240,9 +240,8 @@ impl<R: IcbResolver> AsyncICache<R> {
                         // Stub needing resolution — extract stub, replace with InFlight
                         let (tx, rx) = watch::channel(());
                         let old = std::mem::replace(occ.get_mut(), IcbState::InFlight(rx));
-                        let stub = match old {
-                            IcbState::Available(icb) => icb,
-                            _ => unreachable!(),
+                        let IcbState::Available(stub) = old else {
+                            unreachable!()
                         };
                         drop(occ); // release shard lock before awaiting
 

@@ -48,6 +48,7 @@ impl<I: IcbLike> ICache<I> {
     }
 
     /// Insert an ICB directly.
+    #[expect(dead_code, reason = "public API method for future use")]
     pub fn insert_icb(&mut self, ino: Inode, icb: I) {
         self.inode_table.insert(ino, icb);
     }
@@ -64,6 +65,7 @@ impl<I: IcbLike> ICache<I> {
     }
 
     /// Increment rc. Panics (via unwrap) if inode doesn't exist.
+    #[expect(dead_code, reason = "public API method for future use")]
     pub fn inc_rc(&mut self, ino: Inode) -> u64 {
         let icb = self
             .inode_table
@@ -93,6 +95,7 @@ impl<I: IcbLike> ICache<I> {
         }
     }
 
+    #[expect(dead_code, reason = "public API method for future use")]
     pub fn iter(&self) -> impl Iterator<Item = (&Inode, &I)> {
         self.inode_table.iter()
     }

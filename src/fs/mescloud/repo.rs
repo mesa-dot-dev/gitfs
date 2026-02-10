@@ -59,7 +59,7 @@ impl IcbResolver for RepoResolver {
         let block_size = self.block_size;
 
         async move {
-            let stub = stub.expect("RepoResolver requires a stub ICB");
+            let stub = stub.unwrap_or_else(|| unreachable!("RepoResolver requires a stub ICB"));
             let file_path =
                 build_repo_path(stub.parent, &stub.path, cache, RepoFs::ROOT_INO).await;
 
@@ -73,10 +73,6 @@ impl IcbResolver for RepoResolver {
                 .map_err(MesaApiError::from)?;
 
             let now = SystemTime::now();
-            #[expect(
-                clippy::match_same_arms,
-                reason = "symlink arm will diverge once readlink is wired up"
-            )]
             let attr = match &content {
                 Content::File(f) => {
                     let size = f.size.to_u64().unwrap_or(0);
@@ -250,8 +246,9 @@ impl Fs for RepoFs {
         let ino = self.icache.ensure_child_ino(parent, name).await;
         let attr = self
             .icache
-            .get_or_resolve(ino, |icb| icb.attr.expect("resolver should populate attr"))
-            .await?;
+            .get_or_resolve(ino, |icb| icb.attr)
+            .await?
+            .ok_or(LookupError::InodeNotFound)?;
         self.icache.cache_attr(ino, attr).await;
 
         let rc = self.icache.inc_rc(ino).await;
@@ -333,7 +330,12 @@ impl Fs for RepoFs {
                         self.icache.block_size(),
                     ),
                 },
-                _ => FileAttr::RegularFile {
+                DirEntryType::RegularFile
+                | DirEntryType::Symlink
+                | DirEntryType::CharDevice
+                | DirEntryType::BlockDevice
+                | DirEntryType::NamedPipe
+                | DirEntryType::Socket => FileAttr::RegularFile {
                     common: mescloud_icache::make_common_file_attr(
                         child_ino,
                         0o644,
