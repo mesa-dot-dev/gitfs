@@ -1,18 +1,19 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use crate::fs::r#trait::Inode;
 
 /// Monotonically increasing inode allocator.
 pub struct InodeFactory {
-    next_inode: Inode,
+    next_inode: AtomicU64,
 }
 
 impl InodeFactory {
     pub fn new(start: Inode) -> Self {
-        Self { next_inode: start }
+        Self {
+            next_inode: AtomicU64::new(start),
+        }
     }
 
-    pub fn allocate(&mut self) -> Inode {
-        let ino = self.next_inode;
-        self.next_inode += 1;
-        ino
+    pub fn allocate(&self) -> Inode {
+        self.next_inode.fetch_add(1, Ordering::Relaxed)
     }
 }
