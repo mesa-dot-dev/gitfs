@@ -9,7 +9,7 @@ use secrecy::ExposeSecret as _;
 use tracing::{instrument, trace, warn};
 
 use crate::fs::icache::bridge::HashMapBridge;
-use crate::fs::icache::{AsyncICache, IcbResolver};
+use crate::fs::icache::{AsyncICache, FileTable, IcbResolver};
 use crate::fs::r#trait::{
     DirEntry, DirEntryType, FileAttr, FileHandle, FilesystemStats, Fs, Inode, LockOwner, OpenFile,
     OpenFlags,
@@ -24,8 +24,8 @@ mod common;
 use common::InodeControlBlock;
 pub use common::{GetAttrError, LookupError, OpenError, ReadDirError, ReadError, ReleaseError};
 
-use icache::MescloudICache;
 use icache as mescloud_icache;
+use icache::MescloudICache;
 
 mod org;
 pub use org::OrgConfig;
@@ -103,6 +103,7 @@ enum InodeRole {
 /// using [`HashMapBridge`] for bidirectional inode/fh translation at each boundary.
 pub struct MesaFS {
     icache: MescloudICache<MesaResolver>,
+    file_table: FileTable,
     readdir_buf: Vec<DirEntry>,
 
     /// Maps mesa-level org-root inodes → index into `org_slots`.
@@ -122,6 +123,7 @@ impl MesaFS {
         };
         Self {
             icache: MescloudICache::new(resolver, Self::ROOT_NODE_INO, fs_owner, Self::BLOCK_SIZE),
+            file_table: FileTable::new(),
             readdir_buf: Vec::new(),
             org_inodes: HashMap::new(),
             org_slots: orgs
@@ -189,9 +191,7 @@ impl MesaFS {
                     .unwrap_or(0);
                 trace!(
                     ino = existing_ino,
-                    org_idx,
-                    rc,
-                    "ensure_org_inode: reusing existing inode"
+                    org_idx, rc, "ensure_org_inode: reusing existing inode"
                 );
                 return (existing_ino, attr);
             }
@@ -256,7 +256,7 @@ impl MesaFS {
 
     /// Allocate a mesa-level file handle and map it through the bridge.
     fn alloc_fh(&mut self, slot_idx: usize, org_fh: FileHandle) -> FileHandle {
-        let fh = self.icache.allocate_fh();
+        let fh = self.file_table.allocate();
         self.org_slots[slot_idx].bridge.insert_fh(fh, org_fh);
         fh
     }
@@ -327,8 +327,9 @@ impl Fs for MesaFS {
                 let org_attr = self.org_slots[idx].org.lookup(org_parent, name).await?;
                 let org_ino = org_attr.common().ino;
 
-                let mesa_ino =
-                    self.translate_org_ino_to_mesa(idx, org_ino, parent, name).await;
+                let mesa_ino = self
+                    .translate_org_ino_to_mesa(idx, org_ino, parent, name)
+                    .await;
 
                 let mesa_attr = self.org_slots[idx].bridge.attr_backward(org_attr);
                 self.icache.cache_attr(mesa_ino, mesa_attr).await;
@@ -387,12 +388,15 @@ impl Fs for MesaFS {
 
                 let mut mesa_entries = Vec::with_capacity(org_entries.len());
                 for entry in &org_entries {
-                    let mesa_child_ino =
-                        self.translate_org_ino_to_mesa(idx, entry.ino, ino, &entry.name).await;
+                    let mesa_child_ino = self
+                        .translate_org_ino_to_mesa(idx, entry.ino, ino, &entry.name)
+                        .await;
 
                     // Cache attr from org if available.
-                    if let Some(org_icb_attr) =
-                        self.org_slots[idx].org.inode_table_get_attr(entry.ino).await
+                    if let Some(org_icb_attr) = self.org_slots[idx]
+                        .org
+                        .inode_table_get_attr(entry.ino)
+                        .await
                     {
                         let mesa_attr = self.org_slots[idx].bridge.attr_backward(org_icb_attr);
                         self.icache.cache_attr(mesa_child_ino, mesa_attr).await;

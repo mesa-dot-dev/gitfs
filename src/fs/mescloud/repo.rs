@@ -12,7 +12,7 @@ use mesa_dev::low_level::content::{Content, DirEntry as MesaDirEntry};
 use num_traits::cast::ToPrimitive as _;
 use tracing::{instrument, trace, warn};
 
-use crate::fs::icache::{AsyncICache, IcbResolver};
+use crate::fs::icache::{AsyncICache, FileTable, IcbResolver};
 use crate::fs::r#trait::{
     DirEntry, DirEntryType, FileAttr, FileHandle, FileOpenOptions, FilesystemStats, Fs, Inode,
     LockOwner, OpenFile, OpenFlags,
@@ -144,6 +144,7 @@ pub struct RepoFs {
     ref_: String,
 
     icache: MescloudICache<RepoResolver>,
+    file_table: FileTable,
     readdir_buf: Vec<DirEntry>,
     open_files: HashMap<FileHandle, Inode>,
 }
@@ -174,6 +175,7 @@ impl RepoFs {
             repo_name,
             ref_,
             icache: MescloudICache::new(resolver, Self::ROOT_INO, fs_owner, Self::BLOCK_SIZE),
+            file_table: FileTable::new(),
             readdir_buf: Vec::new(),
             open_files: HashMap::new(),
         }
@@ -360,7 +362,7 @@ impl Fs for RepoFs {
             ),
             "open: inode {ino} has non-file cached attr"
         );
-        let fh = self.icache.allocate_fh();
+        let fh = self.file_table.allocate();
         self.open_files.insert(fh, ino);
         trace!(ino, fh, "assigned file handle");
         Ok(OpenFile {

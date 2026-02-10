@@ -3,14 +3,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::fs::r#trait::FileHandle;
 
 /// Monotonically increasing file handle allocator.
-#[allow(clippy::allow_attributes)]
-#[allow(dead_code)]
 pub struct FileTable {
     next_fh: AtomicU64,
 }
 
-#[allow(clippy::allow_attributes)]
-#[allow(dead_code)]
 impl FileTable {
     pub fn new() -> Self {
         Self {

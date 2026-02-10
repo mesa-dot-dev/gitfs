@@ -1,20 +1,24 @@
 //! Async inode cache with InFlight/Available state machine.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use scc::HashMap as ConcurrentHashMap;
 use tokio::sync::watch;
 
 use tracing::{trace, warn};
 
-use crate::fs::r#trait::{FileHandle, Inode};
+use crate::fs::r#trait::Inode;
 
 use super::IcbLike;
 
 /// State of an entry in the async inode cache.
 pub enum IcbState<I> {
     /// Entry is being loaded; waiters clone the receiver and `.changed().await`.
+    ///
+    /// The channel carries `()` rather than the resolved value because the map
+    /// is the single source of truth: ICBs are mutated in-place (rc, attrs) so
+    /// a snapshot in the channel would immediately go stale. Sender-drop also
+    /// gives us implicit, leak-proof signalling on both success and error paths.
     InFlight(watch::Receiver<()>),
     /// Entry is ready for use.
     Available(I),
@@ -49,11 +53,10 @@ pub trait IcbResolver: Send + Sync {
 /// Async, concurrency-safe inode cache.
 ///
 /// All methods take `&self` — internal synchronization is provided by
-/// `scc::HashMap` (sharded lock-free map) and `AtomicU64`.
+/// `scc::HashMap` (sharded lock-free map).
 pub struct AsyncICache<R: IcbResolver> {
     resolver: R,
     inode_table: ConcurrentHashMap<Inode, IcbState<R::Icb>>,
-    next_fh: AtomicU64,
 }
 
 impl<R: IcbResolver> AsyncICache<R> {
@@ -68,13 +71,7 @@ impl<R: IcbResolver> AsyncICache<R> {
         Self {
             resolver,
             inode_table: table,
-            next_fh: AtomicU64::new(1),
         }
-    }
-
-    /// Allocate a monotonically increasing file handle.
-    pub fn allocate_fh(&self) -> FileHandle {
-        self.next_fh.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Number of entries (`InFlight` + `Available`) in the table.
@@ -370,6 +367,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap as StdHashMap;
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
     #[derive(Debug, Clone, PartialEq)]
@@ -752,14 +750,6 @@ mod tests {
             count += 1;
         });
         assert_eq!(count, 1, "only root, not the InFlight entry");
-    }
-
-    #[tokio::test]
-    async fn allocate_fh_increments() {
-        let cache = test_cache();
-        assert_eq!(cache.allocate_fh(), 1, "first fh should be 1");
-        assert_eq!(cache.allocate_fh(), 2, "second fh should be 2");
-        assert_eq!(cache.allocate_fh(), 3, "third fh should be 3");
     }
 
     #[tokio::test]

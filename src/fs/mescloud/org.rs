@@ -17,7 +17,7 @@ use super::icache as mescloud_icache;
 use super::icache::MescloudICache;
 use super::repo::RepoFs;
 use crate::fs::icache::bridge::HashMapBridge;
-use crate::fs::icache::{AsyncICache, IcbResolver};
+use crate::fs::icache::{AsyncICache, FileTable, IcbResolver};
 use crate::fs::r#trait::{
     DirEntry, DirEntryType, FileAttr, FileHandle, FilesystemStats, Fs, Inode, LockOwner, OpenFile,
     OpenFlags,
@@ -103,6 +103,7 @@ pub struct OrgFs {
     client: MesaClient,
 
     icache: MescloudICache<OrgResolver>,
+    file_table: FileTable,
     readdir_buf: Vec<DirEntry>,
 
     /// Maps org-level repo-root inodes → index into `repos`.
@@ -215,6 +216,7 @@ impl OrgFs {
             name,
             client,
             icache: MescloudICache::new(resolver, Self::ROOT_INO, fs_owner, Self::BLOCK_SIZE),
+            file_table: FileTable::new(),
             readdir_buf: Vec::new(),
             repo_inodes: HashMap::new(),
             owner_inodes: HashMap::new(),
@@ -285,12 +287,7 @@ impl OrgFs {
             if self.repos[idx].repo.repo_name() == repo_name {
                 if let Some(attr) = self.icache.get_attr(ino).await {
                     let rc = self.icache.get_icb(ino, |icb| icb.rc).await.unwrap_or(0);
-                    trace!(
-                        ino,
-                        repo = repo_name,
-                        rc,
-                        "ensure_repo_inode: reusing"
-                    );
+                    trace!(ino, repo = repo_name, rc, "ensure_repo_inode: reusing");
                     return (ino, attr);
                 }
                 // Attr missing — rebuild.
@@ -381,7 +378,7 @@ impl OrgFs {
 
     /// Allocate an org-level file handle and map it through the bridge.
     fn alloc_fh(&mut self, slot_idx: usize, repo_fh: FileHandle) -> FileHandle {
-        let fh = self.icache.allocate_fh();
+        let fh = self.file_table.allocate();
         self.repos[slot_idx].bridge.insert_fh(fh, repo_fh);
         fh
     }
@@ -460,12 +457,7 @@ impl Fs for OrgFs {
                     let repo = self.wait_for_sync(name_str).await?;
 
                     let (ino, attr) = self
-                        .ensure_repo_inode(
-                            name_str,
-                            name_str,
-                            &repo.default_branch,
-                            Self::ROOT_INO,
-                        )
+                        .ensure_repo_inode(name_str, name_str, &repo.default_branch, Self::ROOT_INO)
                         .await;
                     let rc = self.icache.inc_rc(ino).await;
                     trace!(ino, repo = name_str, rc, "lookup: resolved repo inode");
@@ -513,8 +505,9 @@ impl Fs for OrgFs {
 
                 // Translate back to org namespace.
                 let kind: DirEntryType = repo_attr.into();
-                let org_ino =
-                    self.translate_repo_ino_to_org(idx, repo_ino, parent, name, kind).await;
+                let org_ino = self
+                    .translate_repo_ino_to_org(idx, repo_ino, parent, name, kind)
+                    .await;
 
                 // Rebuild attr with org inode.
                 let org_attr = self.repos[idx].bridge.attr_backward(repo_attr);
@@ -570,12 +563,7 @@ impl Fs for OrgFs {
                 let mut entries = Vec::with_capacity(repo_infos.len());
                 for (repo_name, default_branch) in &repo_infos {
                     let (repo_ino, _) = self
-                        .ensure_repo_inode(
-                            repo_name,
-                            repo_name,
-                            default_branch,
-                            Self::ROOT_INO,
-                        )
+                        .ensure_repo_inode(repo_name, repo_name, default_branch, Self::ROOT_INO)
                         .await;
                     entries.push(DirEntry {
                         ino: repo_ino,
@@ -605,13 +593,7 @@ impl Fs for OrgFs {
                 let mut org_entries = Vec::with_capacity(repo_entries.len());
                 for entry in &repo_entries {
                     let org_child_ino = self
-                        .translate_repo_ino_to_org(
-                            idx,
-                            entry.ino,
-                            ino,
-                            &entry.name,
-                            entry.kind,
-                        )
+                        .translate_repo_ino_to_org(idx, entry.ino, ino, &entry.name, entry.kind)
                         .await;
 
                     // Cache attr from repo if available.

@@ -4,9 +4,7 @@ use std::ffi::OsStr;
 use std::time::SystemTime;
 
 use crate::fs::icache::{AsyncICache, IcbLike, IcbResolver, InodeFactory};
-use crate::fs::r#trait::{
-    CommonFileAttr, FileAttr, FileHandle, FilesystemStats, Inode, Permissions,
-};
+use crate::fs::r#trait::{CommonFileAttr, FileAttr, FilesystemStats, Inode, Permissions};
 
 /// Inode control block for mescloud filesystem layers.
 pub struct InodeControlBlock {
@@ -104,7 +102,11 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         self.inner.contains(ino).await
     }
 
-    pub async fn get_icb<T>(&self, ino: Inode, f: impl FnOnce(&InodeControlBlock) -> T) -> Option<T> {
+    pub async fn get_icb<T>(
+        &self,
+        ino: Inode,
+        f: impl FnOnce(&InodeControlBlock) -> T,
+    ) -> Option<T> {
         self.inner.get_icb(ino, f).await
     }
 
@@ -147,10 +149,6 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     }
 
     // -- Delegated (sync) --
-
-    pub fn allocate_fh(&self) -> FileHandle {
-        self.inner.allocate_fh()
-    }
 
     #[expect(dead_code, reason = "public API method for future use")]
     pub fn for_each(&self, f: impl FnMut(&Inode, &InodeControlBlock)) {

@@ -4,17 +4,15 @@ use std::collections::HashMap;
 
 use tracing::{trace, warn};
 
-use crate::fs::r#trait::{FileHandle, Inode};
+use crate::fs::r#trait::Inode;
 
 use super::IcbLike;
 
 /// Generic directory cache.
 ///
-/// Owns an inode table and a file handle counter. Provides reference counting,
-/// ICB lookup/insertion, and file handle allocation.
+/// Owns an inode table. Provides reference counting and ICB lookup/insertion.
 pub struct ICache<I: IcbLike> {
     inode_table: HashMap<Inode, I>,
-    next_fh: FileHandle,
 }
 
 impl<I: IcbLike> ICache<I> {
@@ -22,17 +20,7 @@ impl<I: IcbLike> ICache<I> {
     pub fn new(root_ino: Inode, root_path: impl Into<std::path::PathBuf>) -> Self {
         let mut inode_table = HashMap::new();
         inode_table.insert(root_ino, I::new_root(root_path.into()));
-        Self {
-            inode_table,
-            next_fh: 1,
-        }
-    }
-
-    /// Allocate a file handle (increments `next_fh` and returns the old value).
-    pub fn allocate_fh(&mut self) -> FileHandle {
-        let fh = self.next_fh;
-        self.next_fh += 1;
-        fh
+        Self { inode_table }
     }
 
     pub fn get_icb(&self, ino: Inode) -> Option<&I> {

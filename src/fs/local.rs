@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 use std::ffi::OsStr;
 use tracing::warn;
 
-use crate::fs::icache::{ICache, IcbLike};
+use crate::fs::icache::{FileTable, ICache, IcbLike};
 use crate::fs::r#trait::{
     DirEntry, FileAttr, FileHandle, FileOpenOptions, FilesystemStats, Fs, Inode, LockOwner,
     OpenFile, OpenFlags,
@@ -163,6 +163,7 @@ impl IcbLike for InodeControlBlock {
 
 pub struct LocalFs {
     icache: ICache<InodeControlBlock>,
+    file_table: FileTable,
     open_files: HashMap<FileHandle, tokio::fs::File>,
 }
 
@@ -171,6 +172,7 @@ impl LocalFs {
     pub fn new(abs_path: impl Into<PathBuf>) -> Self {
         Self {
             icache: ICache::new(1, abs_path),
+            file_table: FileTable::new(),
             open_files: HashMap::new(),
         }
     }
@@ -346,7 +348,7 @@ impl Fs for LocalFs {
             .map_err(OpenError::Io)?;
 
         // Generate a new file handle.
-        let fh = self.icache.allocate_fh();
+        let fh = self.file_table.allocate();
         self.open_files.insert(fh, file);
 
         Ok(OpenFile {
