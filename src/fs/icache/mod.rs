@@ -3,11 +3,14 @@
 pub mod async_cache;
 pub mod bridge;
 mod cache;
+mod file_table;
 mod inode_factory;
 
 pub use async_cache::AsyncICache;
 pub use async_cache::IcbResolver;
 pub use cache::ICache;
+#[expect(unused_imports)]
+pub use file_table::FileTable;
 pub use inode_factory::InodeFactory;
 
 /// Common interface for inode control block types usable with `ICache`.
