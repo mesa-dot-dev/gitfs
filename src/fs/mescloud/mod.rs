@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::future::Future;
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use mesa_dev::MesaClient;
@@ -7,6 +9,7 @@ use secrecy::ExposeSecret as _;
 use tracing::{instrument, trace, warn};
 
 use crate::fs::icache::bridge::HashMapBridge;
+use crate::fs::icache::{AsyncICache, IcbResolver};
 use crate::fs::r#trait::{
     DirEntry, DirEntryType, FileAttr, FileHandle, FilesystemStats, Fs, Inode, LockOwner, OpenFile,
     OpenFlags,
@@ -22,6 +25,7 @@ use common::InodeControlBlock;
 pub use common::{GetAttrError, LookupError, OpenError, ReadDirError, ReadError, ReleaseError};
 
 use icache::MescloudICache;
+use icache as mescloud_icache;
 
 mod org;
 pub use org::OrgConfig;
@@ -29,6 +33,55 @@ use org::OrgFs;
 
 pub mod icache;
 pub mod repo;
+
+// ---------------------------------------------------------------------------
+// MesaResolver
+// ---------------------------------------------------------------------------
+
+struct MesaResolver {
+    fs_owner: (u32, u32),
+    block_size: u32,
+}
+
+impl IcbResolver for MesaResolver {
+    type Icb = InodeControlBlock;
+    type Error = std::convert::Infallible;
+
+    fn resolve(
+        &self,
+        ino: Inode,
+        stub: Option<InodeControlBlock>,
+        _cache: &AsyncICache<Self>,
+    ) -> impl Future<Output = Result<InodeControlBlock, std::convert::Infallible>> + Send
+    where
+        Self: Sized,
+    {
+        let fs_owner = self.fs_owner;
+        let block_size = self.block_size;
+        async move {
+            let stub = stub.unwrap_or_else(|| InodeControlBlock {
+                parent: None,
+                path: "/".into(),
+                rc: 0,
+                attr: None,
+            });
+            let now = SystemTime::now();
+            let attr = FileAttr::Directory {
+                common: mescloud_icache::make_common_file_attr(
+                    ino, 0o755, now, now, fs_owner, block_size,
+                ),
+            };
+            Ok(InodeControlBlock {
+                attr: Some(attr),
+                ..stub
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MesaFS
+// ---------------------------------------------------------------------------
 
 /// Per-org wrapper with inode and file handle translation.
 struct OrgSlot {
@@ -49,7 +102,8 @@ enum InodeRole {
 /// Composes multiple [`OrgFs`] instances, each with its own inode namespace,
 /// using [`HashMapBridge`] for bidirectional inode/fh translation at each boundary.
 pub struct MesaFS {
-    icache: MescloudICache,
+    icache: MescloudICache<MesaResolver>,
+    readdir_buf: Vec<DirEntry>,
 
     /// Maps mesa-level org-root inodes → index into `org_slots`.
     org_inodes: HashMap<Inode, usize>,
@@ -62,8 +116,13 @@ impl MesaFS {
 
     /// Create a new `MesaFS` instance.
     pub fn new(orgs: impl Iterator<Item = OrgConfig>, fs_owner: (u32, u32)) -> Self {
+        let resolver = MesaResolver {
+            fs_owner,
+            block_size: Self::BLOCK_SIZE,
+        };
         Self {
-            icache: MescloudICache::new(Self::ROOT_NODE_INO, fs_owner, Self::BLOCK_SIZE),
+            icache: MescloudICache::new(resolver, Self::ROOT_NODE_INO, fs_owner, Self::BLOCK_SIZE),
+            readdir_buf: Vec::new(),
             org_inodes: HashMap::new(),
             org_slots: orgs
                 .map(|org_conf| {
@@ -82,7 +141,7 @@ impl MesaFS {
     }
 
     /// Classify an inode by its role.
-    fn inode_role(&self, ino: Inode) -> InodeRole {
+    async fn inode_role(&self, ino: Inode) -> InodeRole {
         if ino == Self::ROOT_NODE_INO {
             return InodeRole::Root;
         }
@@ -90,7 +149,7 @@ impl MesaFS {
             return InodeRole::OrgOwned { idx };
         }
         // Walk parent chain.
-        if let Some(idx) = self.org_slot_for_inode(ino) {
+        if let Some(idx) = self.org_slot_for_inode(ino).await {
             return InodeRole::OrgOwned { idx };
         }
         debug_assert!(false, "inode {ino} not found in any org slot");
@@ -98,33 +157,40 @@ impl MesaFS {
     }
 
     /// Find the org slot index that owns `ino` by walking the parent chain.
-    fn org_slot_for_inode(&self, ino: Inode) -> Option<usize> {
+    async fn org_slot_for_inode(&self, ino: Inode) -> Option<usize> {
         if let Some(&idx) = self.org_inodes.get(&ino) {
             return Some(idx);
         }
         let mut current = ino;
-        while let Some(parent) = self.icache.get_icb(current).and_then(|icb| icb.parent) {
+        loop {
+            let parent = self
+                .icache
+                .get_icb(current, |icb| icb.parent)
+                .await
+                .flatten()?;
             if let Some(&idx) = self.org_inodes.get(&parent) {
                 return Some(idx);
             }
             current = parent;
         }
-        None
     }
 
     /// Ensure a mesa-level inode exists for the org at `org_idx`.
     /// Seeds the bridge with (`mesa_org_ino`, `OrgFs::ROOT_INO`).
     /// Does NOT bump rc.
-    fn ensure_org_inode(&mut self, org_idx: usize) -> (Inode, FileAttr) {
+    async fn ensure_org_inode(&mut self, org_idx: usize) -> (Inode, FileAttr) {
         // Check if an inode already exists.
         if let Some((&existing_ino, _)) = self.org_inodes.iter().find(|&(_, &idx)| idx == org_idx) {
-            if let Some(icb) = self.icache.get_icb(existing_ino)
-                && let Some(attr) = icb.attr
-            {
+            if let Some(attr) = self.icache.get_attr(existing_ino).await {
+                let rc = self
+                    .icache
+                    .get_icb(existing_ino, |icb| icb.rc)
+                    .await
+                    .unwrap_or(0);
                 trace!(
                     ino = existing_ino,
                     org_idx,
-                    rc = icb.rc,
+                    rc,
                     "ensure_org_inode: reusing existing inode"
                 );
                 return (existing_ino, attr);
@@ -134,13 +200,18 @@ impl MesaFS {
                 ino = existing_ino,
                 org_idx, "ensure_org_inode: attr missing, rebuilding"
             );
-            let now = std::time::SystemTime::now();
+            let now = SystemTime::now();
             let attr = FileAttr::Directory {
-                common: self
-                    .icache
-                    .make_common_file_attr(existing_ino, 0o755, now, now),
+                common: mescloud_icache::make_common_file_attr(
+                    existing_ino,
+                    0o755,
+                    now,
+                    now,
+                    self.icache.fs_owner(),
+                    self.icache.block_size(),
+                ),
             };
-            self.icache.cache_attr(existing_ino, attr);
+            self.icache.cache_attr(existing_ino, attr).await;
             return (existing_ino, attr);
         }
 
@@ -149,17 +220,18 @@ impl MesaFS {
         let ino = self.icache.allocate_inode();
         trace!(ino, org_idx, org = %org_name, "ensure_org_inode: allocated new inode");
 
-        let now = std::time::SystemTime::now();
-        self.icache.insert_icb(
-            ino,
-            InodeControlBlock {
-                rc: 0,
-                path: org_name.as_str().into(),
-                parent: Some(Self::ROOT_NODE_INO),
-                children: None,
-                attr: None,
-            },
-        );
+        let now = SystemTime::now();
+        self.icache
+            .insert_icb(
+                ino,
+                InodeControlBlock {
+                    rc: 0,
+                    path: org_name.as_str().into(),
+                    parent: Some(Self::ROOT_NODE_INO),
+                    attr: None,
+                },
+            )
+            .await;
 
         self.org_inodes.insert(ino, org_idx);
 
@@ -169,9 +241,16 @@ impl MesaFS {
             .insert_inode(ino, OrgFs::ROOT_INO);
 
         let attr = FileAttr::Directory {
-            common: self.icache.make_common_file_attr(ino, 0o755, now, now),
+            common: mescloud_icache::make_common_file_attr(
+                ino,
+                0o755,
+                now,
+                now,
+                self.icache.fs_owner(),
+                self.icache.block_size(),
+            ),
         };
-        self.icache.cache_attr(ino, attr);
+        self.icache.cache_attr(ino, attr).await;
         (ino, attr)
     }
 
@@ -184,7 +263,7 @@ impl MesaFS {
 
     /// Translate an org inode to a mesa inode, allocating if needed.
     /// Also mirrors the ICB into the mesa `inode_table`.
-    fn translate_org_ino_to_mesa(
+    async fn translate_org_ino_to_mesa(
         &mut self,
         slot_idx: usize,
         org_ino: Inode,
@@ -196,13 +275,17 @@ impl MesaFS {
             .backward_or_insert_inode(org_ino, || self.icache.allocate_inode());
 
         self.icache
-            .entry_or_insert_icb(mesa_ino, || InodeControlBlock {
-                rc: 0,
-                path: name.into(),
-                parent: Some(parent_mesa_ino),
-                children: None,
-                attr: None,
-            });
+            .entry_or_insert_icb(
+                mesa_ino,
+                || InodeControlBlock {
+                    rc: 0,
+                    path: name.into(),
+                    parent: Some(parent_mesa_ino),
+                    attr: None,
+                },
+                |_| {},
+            )
+            .await;
 
         mesa_ino
     }
@@ -219,12 +302,7 @@ impl Fs for MesaFS {
 
     #[instrument(skip(self))]
     async fn lookup(&mut self, parent: Inode, name: &OsStr) -> Result<FileAttr, LookupError> {
-        debug_assert!(
-            self.icache.contains(parent),
-            "lookup: parent inode {parent} not in inode table"
-        );
-
-        match self.inode_role(parent) {
+        match self.inode_role(parent).await {
             InodeRole::Root => {
                 // Children of root are orgs.
                 let org_name = name.to_str().ok_or(LookupError::InodeNotFound)?;
@@ -235,8 +313,8 @@ impl Fs for MesaFS {
                     .ok_or(LookupError::InodeNotFound)?;
 
                 trace!(org = org_name, "lookup: matched org");
-                let (ino, attr) = self.ensure_org_inode(org_idx);
-                let rc = self.icache.inc_rc(ino);
+                let (ino, attr) = self.ensure_org_inode(org_idx).await;
+                let rc = self.icache.inc_rc(ino).await;
                 trace!(ino, org = org_name, rc, "lookup: resolved org inode");
                 Ok(attr)
             }
@@ -249,11 +327,12 @@ impl Fs for MesaFS {
                 let org_attr = self.org_slots[idx].org.lookup(org_parent, name).await?;
                 let org_ino = org_attr.common().ino;
 
-                let mesa_ino = self.translate_org_ino_to_mesa(idx, org_ino, parent, name);
+                let mesa_ino =
+                    self.translate_org_ino_to_mesa(idx, org_ino, parent, name).await;
 
                 let mesa_attr = self.org_slots[idx].bridge.attr_backward(org_attr);
-                self.icache.cache_attr(mesa_ino, mesa_attr);
-                let rc = self.icache.inc_rc(mesa_ino);
+                self.icache.cache_attr(mesa_ino, mesa_attr).await;
+                let rc = self.icache.inc_rc(mesa_ino).await;
                 trace!(mesa_ino, org_ino, rc, "lookup: resolved via org delegation");
                 Ok(mesa_attr)
             }
@@ -266,7 +345,7 @@ impl Fs for MesaFS {
         ino: Inode,
         _fh: Option<FileHandle>,
     ) -> Result<FileAttr, GetAttrError> {
-        self.icache.get_attr(ino).ok_or_else(|| {
+        self.icache.get_attr(ino).await.ok_or_else(|| {
             warn!(ino, "getattr on unknown inode");
             GetAttrError::InodeNotFound
         })
@@ -274,12 +353,7 @@ impl Fs for MesaFS {
 
     #[instrument(skip(self))]
     async fn readdir(&mut self, ino: Inode) -> Result<&[DirEntry], ReadDirError> {
-        debug_assert!(
-            self.icache.contains(ino),
-            "readdir: inode {ino} not in inode table"
-        );
-
-        match self.inode_role(ino) {
+        match self.inode_role(ino).await {
             InodeRole::Root => {
                 let org_info: Vec<(usize, String)> = self
                     .org_slots
@@ -290,7 +364,7 @@ impl Fs for MesaFS {
 
                 let mut entries = Vec::with_capacity(org_info.len());
                 for (org_idx, name) in &org_info {
-                    let (org_ino, _) = self.ensure_org_inode(*org_idx);
+                    let (org_ino, _) = self.ensure_org_inode(*org_idx).await;
                     entries.push(DirEntry {
                         ino: org_ino,
                         name: name.clone().into(),
@@ -300,11 +374,8 @@ impl Fs for MesaFS {
 
                 trace!(entry_count = entries.len(), "readdir: listing orgs");
 
-                let icb = self
-                    .icache
-                    .get_icb_mut(ino)
-                    .ok_or(ReadDirError::InodeNotFound)?;
-                Ok(icb.children.insert(entries))
+                self.readdir_buf = entries;
+                Ok(&self.readdir_buf)
             }
             InodeRole::OrgOwned { idx } => {
                 let org_ino = self.org_slots[idx]
@@ -317,14 +388,14 @@ impl Fs for MesaFS {
                 let mut mesa_entries = Vec::with_capacity(org_entries.len());
                 for entry in &org_entries {
                     let mesa_child_ino =
-                        self.translate_org_ino_to_mesa(idx, entry.ino, ino, &entry.name);
+                        self.translate_org_ino_to_mesa(idx, entry.ino, ino, &entry.name).await;
 
                     // Cache attr from org if available.
                     if let Some(org_icb_attr) =
-                        self.org_slots[idx].org.inode_table_get_attr(entry.ino)
+                        self.org_slots[idx].org.inode_table_get_attr(entry.ino).await
                     {
                         let mesa_attr = self.org_slots[idx].bridge.attr_backward(org_icb_attr);
-                        self.icache.cache_attr(mesa_child_ino, mesa_attr);
+                        self.icache.cache_attr(mesa_child_ino, mesa_attr).await;
                     }
 
                     mesa_entries.push(DirEntry {
@@ -334,18 +405,15 @@ impl Fs for MesaFS {
                     });
                 }
 
-                let icb = self
-                    .icache
-                    .get_icb_mut(ino)
-                    .ok_or(ReadDirError::InodeNotFound)?;
-                Ok(icb.children.insert(mesa_entries))
+                self.readdir_buf = mesa_entries;
+                Ok(&self.readdir_buf)
             }
         }
     }
 
     #[instrument(skip(self))]
     async fn open(&mut self, ino: Inode, flags: OpenFlags) -> Result<OpenFile, OpenError> {
-        let idx = self.org_slot_for_inode(ino).ok_or_else(|| {
+        let idx = self.org_slot_for_inode(ino).await.ok_or_else(|| {
             warn!(ino, "open on inode not belonging to any org");
             OpenError::InodeNotFound
         })?;
@@ -379,7 +447,7 @@ impl Fs for MesaFS {
         flags: OpenFlags,
         lock_owner: Option<LockOwner>,
     ) -> Result<Bytes, ReadError> {
-        let idx = self.org_slot_for_inode(ino).ok_or_else(|| {
+        let idx = self.org_slot_for_inode(ino).await.ok_or_else(|| {
             warn!(ino, "read on inode not belonging to any org");
             ReadError::InodeNotFound
         })?;
@@ -406,7 +474,7 @@ impl Fs for MesaFS {
         flags: OpenFlags,
         flush: bool,
     ) -> Result<(), ReleaseError> {
-        let idx = self.org_slot_for_inode(ino).ok_or_else(|| {
+        let idx = self.org_slot_for_inode(ino).await.ok_or_else(|| {
             warn!(ino, "release on inode not belonging to any org");
             ReleaseError::FileNotOpen
         })?;
@@ -432,19 +500,14 @@ impl Fs for MesaFS {
 
     #[instrument(skip(self))]
     async fn forget(&mut self, ino: Inode, nlookups: u64) {
-        debug_assert!(
-            self.icache.contains(ino),
-            "forget: inode {ino} not in inode table"
-        );
-
         // Propagate forget to inner org if applicable.
-        if let Some(idx) = self.org_slot_for_inode(ino)
+        if let Some(idx) = self.org_slot_for_inode(ino).await
             && let Some(&org_ino) = self.org_slots[idx].bridge.inode_map_get_by_left(ino)
         {
             self.org_slots[idx].org.forget(org_ino, nlookups).await;
         }
 
-        if self.icache.forget(ino, nlookups).is_some() {
+        if self.icache.forget(ino, nlookups).await.is_some() {
             self.org_inodes.remove(&ino);
             for slot in &mut self.org_slots {
                 slot.bridge.remove_inode_by_left(ino);
