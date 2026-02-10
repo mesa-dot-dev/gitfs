@@ -21,6 +21,7 @@ const MESA_API_BASE_URL: &str = "https://staging.depot.mesa.dev/api/v1";
 const MESA_API_BASE_URL: &str = "https://depot.mesa.dev/api/v1";
 
 mod common;
+mod composite;
 use common::InodeControlBlock;
 pub use common::{GetAttrError, LookupError, OpenError, ReadDirError, ReadError, ReleaseError};
 
