@@ -9,6 +9,7 @@ use mesa_dev::MesaClient;
 use secrecy::SecretString;
 use tracing::{instrument, trace, warn};
 
+use super::common::InodeCachePeek as _;
 pub use super::common::{
     GetAttrError, LookupError, OpenError, ReadDirError, ReadError, ReleaseError,
 };
@@ -203,11 +204,6 @@ impl OrgFs {
         };
         self.icache.cache_attr(ino, attr).await;
         (ino, attr)
-    }
-
-    /// Get the cached attr for an inode, if present.
-    pub(crate) async fn inode_table_get_attr(&self, ino: Inode) -> Option<FileAttr> {
-        self.icache.get_attr(ino).await
     }
 
     pub fn new(name: String, client: MesaClient, fs_owner: (u32, u32)) -> Self {
@@ -433,6 +429,13 @@ impl OrgFs {
 }
 
 #[async_trait::async_trait]
+impl super::common::InodeCachePeek for OrgFs {
+    async fn peek_attr(&self, ino: Inode) -> Option<FileAttr> {
+        self.icache.get_attr(ino).await
+    }
+}
+
+#[async_trait::async_trait]
 impl Fs for OrgFs {
     type LookupError = LookupError;
     type GetAttrError = GetAttrError;
@@ -602,9 +605,7 @@ impl Fs for OrgFs {
                         .await;
 
                     // Cache attr from repo if available.
-                    if let Some(repo_icb_attr) =
-                        self.repos[idx].repo.inode_table_get_attr(entry.ino).await
-                    {
+                    if let Some(repo_icb_attr) = self.repos[idx].repo.peek_attr(entry.ino).await {
                         let org_attr = self.repos[idx].bridge.attr_backward(repo_icb_attr);
                         self.icache.cache_attr(org_child_ino, org_attr).await;
                     } else {

@@ -3,6 +3,8 @@
 use mesa_dev::low_level::apis;
 use thiserror::Error;
 
+use crate::fs::r#trait::{FileAttr, Inode};
+
 pub(super) use super::icache::InodeControlBlock;
 
 /// A concrete error type that preserves the structure of `mesa_dev::low_level::apis::Error<T>`
@@ -169,6 +171,12 @@ impl From<ReleaseError> for i32 {
             ReleaseError::FileNotOpen => libc::EBADF,
         }
     }
+}
+
+/// Allows a parent compositor to peek at cached attrs from a child filesystem.
+#[async_trait::async_trait]
+pub(super) trait InodeCachePeek {
+    async fn peek_attr(&self, ino: Inode) -> Option<FileAttr>;
 }
 
 #[cfg(test)]

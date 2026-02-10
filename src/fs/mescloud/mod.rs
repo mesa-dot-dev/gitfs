@@ -22,6 +22,7 @@ const MESA_API_BASE_URL: &str = "https://depot.mesa.dev/api/v1";
 
 mod common;
 mod composite;
+use common::InodeCachePeek as _;
 use common::InodeControlBlock;
 pub use common::{GetAttrError, LookupError, OpenError, ReadDirError, ReadError, ReleaseError};
 
@@ -398,11 +399,7 @@ impl Fs for MesaFS {
                         .await;
 
                     // Cache attr from org if available.
-                    if let Some(org_icb_attr) = self.org_slots[idx]
-                        .org
-                        .inode_table_get_attr(entry.ino)
-                        .await
-                    {
+                    if let Some(org_icb_attr) = self.org_slots[idx].org.peek_attr(entry.ino).await {
                         let mesa_attr = self.org_slots[idx].bridge.attr_backward(org_icb_attr);
                         self.icache.cache_attr(mesa_child_ino, mesa_attr).await;
                     }

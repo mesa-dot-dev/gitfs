@@ -205,11 +205,6 @@ impl RepoFs {
         &self.repo_name
     }
 
-    /// Get the cached attr for an inode, if present.
-    pub(crate) async fn inode_table_get_attr(&self, ino: Inode) -> Option<FileAttr> {
-        self.icache.get_attr(ino).await
-    }
-
     /// Build the repo-relative path for an inode by walking up the parent chain.
     ///
     /// Returns `None` for the root inode (the repo top-level maps to `path=None` in the
@@ -232,6 +227,13 @@ impl RepoFs {
         components.reverse();
         let joined: PathBuf = components.iter().collect();
         joined.to_str().map(String::from)
+    }
+}
+
+#[async_trait::async_trait]
+impl super::common::InodeCachePeek for RepoFs {
+    async fn peek_attr(&self, ino: Inode) -> Option<FileAttr> {
+        self.icache.get_attr(ino).await
     }
 }
 
