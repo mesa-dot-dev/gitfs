@@ -31,8 +31,19 @@ pub trait IcbResolver: Send + Sync {
     /// Error type returned when resolution fails.
     type Error: Send;
 
-    /// Resolve an inode to its control block.
-    fn resolve(&self, ino: Inode) -> impl Future<Output = Result<Self::Icb, Self::Error>> + Send;
+    /// Resolve an inode to a fully-populated control block.
+    ///
+    /// - `stub`: `Some(icb)` if upgrading an existing stub entry, `None` if creating
+    ///   from scratch. The stub typically has `parent` and `path` set but `attr` missing.
+    /// - `cache`: reference to the cache, useful for walking parent chains to build paths.
+    fn resolve(
+        &self,
+        ino: Inode,
+        stub: Option<Self::Icb>,
+        cache: &AsyncICache<Self>,
+    ) -> impl Future<Output = Result<Self::Icb, Self::Error>> + Send
+    where
+        Self: Sized;
 }
 
 /// Async, concurrency-safe inode cache.
@@ -183,9 +194,11 @@ impl<R: IcbResolver> AsyncICache<R> {
         }
     }
 
-    /// Look up `ino`. If `Available`, run `then` and return `Ok(T)`.
-    /// If absent, call the resolver to fetch the ICB, cache it, then run `then`.
-    /// If another task is already resolving this inode (`InFlight`), wait for it.
+    /// Look up `ino`. If `Available` and fully resolved, run `then` and return
+    /// `Ok(T)`. If `Available` but `needs_resolve()` is true (stub), extract
+    /// the stub, resolve it, cache the result, then run `then`. If absent, call
+    /// the resolver to fetch the ICB, cache it, then run `then`. If another task
+    /// is already resolving this inode (`InFlight`), wait for it.
     ///
     /// Returns `Err(R::Error)` if resolution fails. On error the `InFlight`
     /// entry is removed so subsequent calls can retry.
@@ -198,58 +211,81 @@ impl<R: IcbResolver> AsyncICache<R> {
 
         let mut then_fn = Some(then);
 
-        // Fast path: already Available
+        // Fast path: Available and fully resolved
         {
             let hit = self
                 .inode_table
                 .read_async(&ino, |_, s| match s {
-                    IcbState::Available(icb) => {
+                    IcbState::Available(icb) if !icb.needs_resolve() => {
                         let t = then_fn.take().unwrap_or_else(|| unreachable!());
                         Some(t(icb))
                     }
-                    IcbState::InFlight(_) => None,
+                    _ => None,
                 })
                 .await;
             if let Some(Some(r)) = hit {
                 return Ok(r);
             }
-            // InFlight or absent -- fall through
         }
 
-        // Try to become the resolver, or wait on existing InFlight
+        // Slow path: missing, InFlight, or stub needing resolution
         loop {
             match self.inode_table.entry_async(ino).await {
                 Entry::Occupied(mut occ) => match occ.get_mut() {
-                    IcbState::Available(icb) => {
+                    IcbState::Available(icb) if !icb.needs_resolve() => {
                         let t = then_fn.take().unwrap_or_else(|| unreachable!());
                         return Ok(t(icb));
+                    }
+                    IcbState::Available(_) => {
+                        // Stub needing resolution — extract stub, replace with InFlight
+                        let (tx, rx) = watch::channel(());
+                        let old = std::mem::replace(occ.get_mut(), IcbState::InFlight(rx));
+                        let stub = match old {
+                            IcbState::Available(icb) => icb,
+                            _ => unreachable!(),
+                        };
+                        drop(occ); // release shard lock before awaiting
+
+                        match self.resolver.resolve(ino, Some(stub), self).await {
+                            Ok(icb) => {
+                                let t = then_fn.take().unwrap_or_else(|| unreachable!());
+                                let result = t(&icb);
+                                self.inode_table
+                                    .upsert_async(ino, IcbState::Available(icb))
+                                    .await;
+                                drop(tx);
+                                return Ok(result);
+                            }
+                            Err(e) => {
+                                self.inode_table.remove_async(&ino).await;
+                                drop(tx);
+                                return Err(e);
+                            }
+                        }
                     }
                     IcbState::InFlight(rx) => {
                         let mut rx = rx.clone();
                         drop(occ);
                         let _ = rx.changed().await;
-                        // Loop back to re-check
                     }
                 },
                 Entry::Vacant(vac) => {
-                    // We win the race -- install InFlight and resolve
                     let (tx, rx) = watch::channel(());
                     vac.insert_entry(IcbState::InFlight(rx));
 
-                    match self.resolver.resolve(ino).await {
+                    match self.resolver.resolve(ino, None, self).await {
                         Ok(icb) => {
                             let t = then_fn.take().unwrap_or_else(|| unreachable!());
                             let result = t(&icb);
                             self.inode_table
                                 .upsert_async(ino, IcbState::Available(icb))
                                 .await;
-                            drop(tx); // wake all waiters
+                            drop(tx);
                             return Ok(result);
                         }
                         Err(e) => {
-                            // Remove the InFlight entry
                             self.inode_table.remove_async(&ino).await;
-                            drop(tx); // wake all waiters -- they'll see entry missing
+                            drop(tx);
                             return Err(e);
                         }
                     }
@@ -308,6 +344,17 @@ impl<R: IcbResolver> AsyncICache<R> {
         None
     }
 
+    /// Synchronous mutable access to an `Available` entry.
+    /// Does **not** wait for `InFlight`. Intended for initialization.
+    pub fn get_icb_mut_sync<T>(&self, ino: Inode, f: impl FnOnce(&mut R::Icb) -> T) -> Option<T> {
+        self.inode_table
+            .update_sync(&ino, |_, state| match state {
+                IcbState::Available(icb) => Some(f(icb)),
+                IcbState::InFlight(_) => None,
+            })
+            .flatten()
+    }
+
     /// Iterate over all `Available` entries (skips `InFlight`).
     pub fn for_each(&self, mut f: impl FnMut(&Inode, &R::Icb)) {
         self.inode_table.iter_sync(|ino, state| {
@@ -330,11 +377,16 @@ mod tests {
     struct TestIcb {
         rc: u64,
         path: PathBuf,
+        resolved: bool,
     }
 
     impl IcbLike for TestIcb {
         fn new_root(path: PathBuf) -> Self {
-            Self { rc: 1, path }
+            Self {
+                rc: 1,
+                path,
+                resolved: true,
+            }
         }
         fn rc(&self) -> u64 {
             self.rc
@@ -343,7 +395,7 @@ mod tests {
             &mut self.rc
         }
         fn needs_resolve(&self) -> bool {
-            false
+            !self.resolved
         }
     }
 
@@ -380,6 +432,8 @@ mod tests {
         fn resolve(
             &self,
             ino: Inode,
+            _stub: Option<Self::Icb>,
+            _cache: &AsyncICache<Self>,
         ) -> impl Future<Output = Result<Self::Icb, Self::Error>> + Send {
             let result = self
                 .responses
@@ -419,6 +473,7 @@ mod tests {
             TestIcb {
                 rc: 1,
                 path: "/test".into(),
+                resolved: true,
             },
         );
         let cache = Arc::new(test_cache_with(resolver));
@@ -474,6 +529,7 @@ mod tests {
             TestIcb {
                 rc: 1,
                 path: "/loaded".into(),
+                resolved: true,
             },
         );
         let cache = test_cache_with(resolver);
@@ -497,6 +553,7 @@ mod tests {
                 TestIcb {
                     rc: 1,
                     path: "/foo".into(),
+                    resolved: true,
                 },
             )
             .await;
@@ -513,6 +570,7 @@ mod tests {
                 || TestIcb {
                     rc: 0,
                     path: "/new".into(),
+                    resolved: true,
                 },
                 |icb| {
                     *icb.rc_mut() += 1;
@@ -532,6 +590,7 @@ mod tests {
                 TestIcb {
                     rc: 5,
                     path: "/existing".into(),
+                    resolved: true,
                 },
             )
             .await;
@@ -554,6 +613,7 @@ mod tests {
             TestIcb {
                 rc: 1,
                 path: "/resolved".into(),
+                resolved: true,
             },
         );
         let cache = Arc::new(test_cache_with(resolver));
@@ -588,6 +648,7 @@ mod tests {
                 TestIcb {
                     rc: 1,
                     path: "/a".into(),
+                    resolved: true,
                 },
             )
             .await;
@@ -604,6 +665,7 @@ mod tests {
                 TestIcb {
                     rc: 5,
                     path: "/a".into(),
+                    resolved: true,
                 },
             )
             .await;
@@ -624,6 +686,7 @@ mod tests {
                 TestIcb {
                     rc: 3,
                     path: "/a".into(),
+                    resolved: true,
                 },
             )
             .await;
@@ -650,6 +713,7 @@ mod tests {
                 TestIcb {
                     rc: 1,
                     path: "/a".into(),
+                    resolved: true,
                 },
             )
             .await;
@@ -659,6 +723,7 @@ mod tests {
                 TestIcb {
                     rc: 1,
                     path: "/b".into(),
+                    resolved: true,
                 },
             )
             .await;
@@ -716,6 +781,7 @@ mod tests {
                 TestIcb {
                     rc: 1,
                     path: "/fast".into(),
+                    resolved: true,
                 },
             )
             .await;
@@ -742,6 +808,7 @@ mod tests {
                 TestIcb {
                     rc: 1,
                     path: "/existing".into(),
+                    resolved: true,
                 },
             )
             .await;
@@ -758,6 +825,7 @@ mod tests {
             TestIcb {
                 rc: 1,
                 path: "/resolved".into(),
+                resolved: true,
             },
         );
         let cache = test_cache_with(resolver);
@@ -792,6 +860,8 @@ mod tests {
         fn resolve(
             &self,
             _ino: Inode,
+            _stub: Option<Self::Icb>,
+            _cache: &AsyncICache<Self>,
         ) -> impl Future<Output = Result<Self::Icb, Self::Error>> + Send {
             self.count.fetch_add(1, Ordering::SeqCst);
             async {
@@ -799,6 +869,7 @@ mod tests {
                 Ok(TestIcb {
                     rc: 1,
                     path: "/coalesced".into(),
+                    resolved: true,
                 })
             }
         }
@@ -839,5 +910,35 @@ mod tests {
             1,
             "should coalesce to 1 resolve call"
         );
+    }
+
+    #[tokio::test]
+    async fn get_or_resolve_resolves_stub_entry() {
+        let resolver = TestResolver::new();
+        resolver.add(
+            42,
+            TestIcb {
+                rc: 1,
+                path: "/resolved".into(),
+                resolved: true,
+            },
+        );
+        let cache = test_cache_with(resolver);
+
+        // Insert unresolved stub
+        cache
+            .insert_icb(
+                42,
+                TestIcb {
+                    rc: 0,
+                    path: "/stub".into(),
+                    resolved: false,
+                },
+            )
+            .await;
+
+        // get_or_resolve should trigger resolution because needs_resolve() == true
+        let path: Result<PathBuf, String> = cache.get_or_resolve(42, |icb| icb.path.clone()).await;
+        assert_eq!(path, Ok(PathBuf::from("/resolved")));
     }
 }

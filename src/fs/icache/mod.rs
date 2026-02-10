@@ -1,14 +1,11 @@
 //! Generic directory cache and inode management primitives.
 
-#[cfg_attr(not(test), expect(dead_code))]
 pub mod async_cache;
 pub mod bridge;
 mod cache;
 mod inode_factory;
 
-#[expect(unused_imports)]
 pub use async_cache::AsyncICache;
-#[expect(unused_imports)]
 pub use async_cache::IcbResolver;
 pub use cache::ICache;
 pub use inode_factory::InodeFactory;
