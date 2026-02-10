@@ -1,4 +1,4 @@
-//! Generic inode table with reference counting and file handle allocation.
+//! Generic inode table with reference counting.
 
 use std::collections::HashMap;
 
