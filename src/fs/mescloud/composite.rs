@@ -38,10 +38,6 @@ where
     pub slots: Vec<ChildSlot<Inner>>,
 }
 
-#[expect(
-    dead_code,
-    reason = "will be used when MesaFS/OrgFs are refactored to use CompositeFs"
-)]
 impl<R, Inner> CompositeFs<R, Inner>
 where
     R: IcbResolver<Icb = InodeControlBlock>,
