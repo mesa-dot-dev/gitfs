@@ -96,12 +96,30 @@ impl IcbResolver for RepoResolver {
                 },
             };
 
+            let children = match content {
+                Content::Dir(d) => Some(
+                    d.entries
+                        .into_iter()
+                        .filter_map(|e| {
+                            let (name, kind) = match e {
+                                MesaDirEntry::File(f) => (f.name?, DirEntryType::RegularFile),
+                                // TODO(MES-712): return DirEntryType::Symlink once readlink is wired up.
+                                MesaDirEntry::Symlink(s) => (s.name?, DirEntryType::RegularFile),
+                                MesaDirEntry::Dir(d) => (d.name?, DirEntryType::Directory),
+                            };
+                            Some((name, kind))
+                        })
+                        .collect(),
+                ),
+                Content::File(_) | Content::Symlink(_) => None,
+            };
+
             Ok(InodeControlBlock {
                 parent: stub.parent,
                 path: stub.path,
                 rc: stub.rc,
                 attr: Some(attr),
-                children: None,
+                children,
             })
         }
     }
