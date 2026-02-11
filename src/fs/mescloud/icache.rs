@@ -7,7 +7,7 @@ use std::time::SystemTime;
 
 use futures::StreamExt as _;
 use scc::HashMap as ConcurrentHashMap;
-use tracing::trace;
+use tracing::{trace, warn};
 
 use crate::fs::icache::{AsyncICache, IcbLike, IcbResolver, InodeFactory};
 use crate::fs::r#trait::{
@@ -258,7 +258,7 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     pub fn spawn_prefetch_readdir(&self, inodes: impl IntoIterator<Item = Inode>)
     where
         R: 'static,
-        R::Error: 'static,
+        R::Error: std::fmt::Display + 'static,
     {
         let inodes: Vec<_> = inodes.into_iter().collect();
         if inodes.is_empty() {
@@ -274,8 +274,8 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
                 .for_each_concurrent(Self::MAX_READDIR_PREFETCH_CONCURRENCY, |ino| {
                     let cache = cache.clone();
                     async move {
-                        if cache.prefetch_readdir(ino).await.is_err() {
-                            trace!(ino, "prefetch_readdir: failed (will retry on access)");
+                        if let Err(e) = cache.prefetch_readdir(ino).await {
+                            warn!(ino, error = %e, "prefetch_readdir: failed (will retry on access)");
                         }
                     }
                 })
@@ -380,31 +380,44 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     pub async fn ensure_child_ino(&self, parent: Inode, name: &OsStr) -> Inode {
         use scc::hash_map::Entry;
 
-        let key = (parent, name.to_os_string());
-        match self.inner.child_index.entry_async(key).await {
-            Entry::Occupied(occ) => {
-                let ino = *occ.get();
-                trace!(parent, ?name, ino, "ensure_child_ino: cache hit");
-                ino
-            }
-            Entry::Vacant(vac) => {
-                let ino = self.inner.inode_factory.allocate();
-                vac.insert_entry(ino);
-                self.inner
-                    .cache
-                    .insert_icb(
+        loop {
+            let key = (parent, name.to_os_string());
+            match self.inner.child_index.entry_async(key).await {
+                Entry::Occupied(occ) => {
+                    let ino = *occ.get();
+                    if self.inner.cache.contains(ino) {
+                        trace!(parent, ?name, ino, "ensure_child_ino: cache hit");
+                        return ino;
+                    }
+                    // Stale: inode was evicted (e.g. failed prefetch with rc=0).
+                    // Remove the stale mapping and loop to reallocate.
+                    warn!(
+                        parent,
+                        ?name,
                         ino,
-                        InodeControlBlock {
-                            rc: 0,
-                            path: name.into(),
-                            parent: Some(parent),
-                            attr: None,
-                            children: None,
-                        },
-                    )
-                    .await;
-                trace!(parent, ?name, ino, "ensure_child_ino: allocated new inode");
-                ino
+                        "ensure_child_ino: stale child_index entry, reallocating"
+                    );
+                    drop(occ.remove_entry());
+                }
+                Entry::Vacant(vac) => {
+                    let ino = self.inner.inode_factory.allocate();
+                    vac.insert_entry(ino);
+                    self.inner
+                        .cache
+                        .insert_icb(
+                            ino,
+                            InodeControlBlock {
+                                rc: 0,
+                                path: name.into(),
+                                parent: Some(parent),
+                                attr: None,
+                                children: None,
+                            },
+                        )
+                        .await;
+                    trace!(parent, ?name, ino, "ensure_child_ino: allocated new inode");
+                    return ino;
+                }
             }
         }
     }
