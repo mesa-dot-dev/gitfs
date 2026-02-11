@@ -206,11 +206,18 @@ where
 
     /// Propagate forget to the inner filesystem, evict from icache, and clean
     /// up bridge mappings. Returns `true` if the inode was evicted.
+    ///
+    /// Child-root inodes (those in `child_inodes`) do NOT propagate forget to
+    /// the inner filesystem: the inner root's `rc=1` is an initialization
+    /// invariant unrelated to outer FUSE lookup counts. Propagating would
+    /// evict the inner root, breaking all subsequent operations on that child.
     #[must_use]
     #[instrument(name = "CompositeFs::delegated_forget", skip(self))]
     pub async fn delegated_forget(&mut self, ino: Inode, nlookups: u64) -> bool {
         let slot_idx = self.slot_for_inode(ino);
-        if let Some(idx) = slot_idx
+        let is_child_root = self.child_inodes.contains_key(&ino);
+        if !is_child_root
+            && let Some(idx) = slot_idx
             && let Some(&inner_ino) = self.slots[idx].bridge.inode_map_get_by_left(ino)
         {
             self.slots[idx].inner.forget(inner_ino, nlookups).await;
