@@ -434,4 +434,20 @@ mod tests {
             "child of different parent should survive"
         );
     }
+
+    #[tokio::test]
+    async fn ensure_child_ino_concurrent_same_name_returns_same_ino() {
+        let cache = test_mescloud_cache();
+        let parent = 1; // root
+
+        let futs: Vec<_> = (0..50)
+            .map(|_| cache.ensure_child_ino(parent, OsStr::new("same_child")))
+            .collect();
+        let results = futures::future::join_all(futs).await;
+
+        let first = results[0];
+        for (i, &ino) in results.iter().enumerate() {
+            assert_eq!(ino, first, "concurrent call {i} returned different inode");
+        }
+    }
 }
