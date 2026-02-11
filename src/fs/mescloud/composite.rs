@@ -24,7 +24,7 @@ pub(super) struct ChildSlot<Inner> {
 /// Layered filesystem that presents multiple child filesystems under a single
 /// inode namespace.
 ///
-/// MesaCloud's filesystem is a hierarchy of compositions:
+/// `MesaCloud`'s filesystem is a hierarchy of compositions:
 ///
 /// ```text
 /// MesaFS  (CompositeFs<_, OrgFs>)
