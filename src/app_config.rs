@@ -333,6 +333,39 @@ impl Default for DaemonConfig {
     }
 }
 
+/// The Mesa telemetry endpoint.
+#[allow(clippy::allow_attributes)]
+#[allow(dead_code)]
+const MESA_TELEMETRY_ENDPOINT: &str = "https://telemetry.priv.mesa.dev";
+
+/// Telemetry configuration for exporting OpenTelemetry traces.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct TelemetryConfig {
+    /// Whether to send telemetry data to Mesa's servers.
+    pub vendor: bool,
+
+    /// Custom collector URL for forwarding telemetry to the user's own servers.
+    pub collector_url: Option<String>,
+}
+
+impl TelemetryConfig {
+    /// Returns the list of OTLP endpoints to export traces to.
+    #[must_use]
+    #[allow(clippy::allow_attributes)]
+    #[allow(dead_code)]
+    pub fn endpoints(&self) -> Vec<String> {
+        let mut endpoints = Vec::new();
+        if self.vendor {
+            endpoints.push(MESA_TELEMETRY_ENDPOINT.to_owned());
+        }
+        if let Some(ref url) = self.collector_url {
+            endpoints.push(url.clone());
+        }
+        endpoints
+    }
+}
+
 /// Application configuration structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -349,6 +382,9 @@ pub struct Config {
 
     #[serde(default)]
     pub daemon: DaemonConfig,
+
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
 
     /// The mount point for the filesystem.
     #[serde(default = "default_mount_point")]
@@ -369,6 +405,7 @@ struct DangerousConfig<'a> {
     pub organizations: HashMap<&'a str, DangerousOrganizationConfig<'a>>,
     pub cache: &'a CacheConfig,
     pub daemon: &'a DaemonConfig,
+    pub telemetry: &'a TelemetryConfig,
     pub mount_point: &'a Path,
     pub uid: u32,
     pub gid: u32,
@@ -388,6 +425,7 @@ impl<'a> From<&'a Config> for DangerousConfig<'a> {
                 .collect(),
             cache: &config.cache,
             daemon: &config.daemon,
+            telemetry: &config.telemetry,
             mount_point: &config.mount_point,
             uid: config.uid,
             gid: config.gid,
@@ -401,6 +439,7 @@ impl Default for Config {
             organizations: default_organizations(),
             cache: CacheConfig::default(),
             daemon: DaemonConfig::default(),
+            telemetry: TelemetryConfig::default(),
             mount_point: default_mount_point(),
             uid: current_uid(),
             gid: current_gid(),
@@ -540,5 +579,92 @@ impl Config {
         std::fs::create_dir_all(path.parent().ok_or(ConfigError::NoParentDir)?)?;
         std::fs::write(path, toml_str)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn telemetry_config_defaults_to_disabled() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(!config.telemetry.vendor);
+        assert!(config.telemetry.collector_url.is_none());
+    }
+
+    #[test]
+    fn telemetry_config_parses_vendor_only() {
+        let config: Config = toml::from_str(
+            r"
+            [telemetry]
+            vendor = true
+            ",
+        )
+        .unwrap();
+        assert!(config.telemetry.vendor);
+        assert!(config.telemetry.collector_url.is_none());
+    }
+
+    #[test]
+    fn telemetry_config_parses_collector_url_only() {
+        let config: Config = toml::from_str(
+            r#"
+            [telemetry]
+            collector-url = "https://my-collector.example.com"
+            "#,
+        )
+        .unwrap();
+        assert!(!config.telemetry.vendor);
+        assert_eq!(
+            config.telemetry.collector_url.as_deref(),
+            Some("https://my-collector.example.com")
+        );
+    }
+
+    #[test]
+    fn telemetry_config_parses_both() {
+        let config: Config = toml::from_str(
+            r#"
+            [telemetry]
+            vendor = true
+            collector-url = "https://my-collector.example.com"
+            "#,
+        )
+        .unwrap();
+        assert!(config.telemetry.vendor);
+        assert_eq!(
+            config.telemetry.collector_url.as_deref(),
+            Some("https://my-collector.example.com")
+        );
+    }
+
+    #[test]
+    fn telemetry_endpoints_empty_when_disabled() {
+        let config = TelemetryConfig::default();
+        assert!(config.endpoints().is_empty());
+    }
+
+    #[test]
+    fn telemetry_endpoints_includes_vendor() {
+        let config = TelemetryConfig {
+            vendor: true,
+            collector_url: None,
+        };
+        let endpoints = config.endpoints();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0], MESA_TELEMETRY_ENDPOINT);
+    }
+
+    #[test]
+    fn telemetry_endpoints_includes_both() {
+        let config = TelemetryConfig {
+            vendor: true,
+            collector_url: Some("https://custom.example.com".to_owned()),
+        };
+        let endpoints = config.endpoints();
+        assert_eq!(endpoints.len(), 2);
+        assert!(endpoints.contains(&MESA_TELEMETRY_ENDPOINT.to_owned()));
+        assert!(endpoints.contains(&"https://custom.example.com".to_owned()));
     }
 }
