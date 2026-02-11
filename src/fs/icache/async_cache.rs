@@ -479,13 +479,16 @@ impl<R: IcbResolver> AsyncICache<R> {
     }
 
     /// Iterate over all `Available` entries (skips `InFlight`).
-    pub fn for_each(&self, mut f: impl FnMut(&Inode, &R::Icb)) {
-        self.inode_table.iter_sync(|ino, state| {
-            if let IcbState::Available(icb) = state {
-                f(ino, icb);
-            }
-            true // continue iteration
-        });
+    /// Async-safe iteration using `iter_async` to avoid contention on single-threaded runtimes.
+    pub async fn for_each(&self, mut f: impl FnMut(&Inode, &R::Icb)) {
+        self.inode_table
+            .iter_async(|ino, state| {
+                if let IcbState::Available(icb) = state {
+                    f(ino, icb);
+                }
+                true // continue iteration
+            })
+            .await;
     }
 }
 
@@ -901,9 +904,11 @@ mod tests {
             .await;
 
         let mut seen = std::collections::HashSet::new();
-        cache.for_each(|ino, _icb| {
-            seen.insert(*ino);
-        });
+        cache
+            .for_each(|ino, _icb| {
+                seen.insert(*ino);
+            })
+            .await;
         assert_eq!(seen.len(), 3, "should see all 3 entries");
         assert!(seen.contains(&1), "should contain root");
         assert!(seen.contains(&2), "should contain inode 2");
@@ -921,9 +926,11 @@ mod tests {
             .await;
 
         let mut count = 0;
-        cache.for_each(|_, _| {
-            count += 1;
-        });
+        cache
+            .for_each(|_, _| {
+                count += 1;
+            })
+            .await;
         assert_eq!(count, 1, "only root, not the InFlight entry");
     }
 

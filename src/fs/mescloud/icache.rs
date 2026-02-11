@@ -197,11 +197,13 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     /// Returns the number of evicted entries.
     pub async fn evict_zero_rc_children(&self, parent: Inode) -> usize {
         let mut to_evict = Vec::new();
-        self.inner.for_each(|&ino, icb| {
-            if icb.rc == 0 && icb.parent == Some(parent) {
-                to_evict.push(ino);
-            }
-        });
+        self.inner
+            .for_each(|&ino, icb| {
+                if icb.rc == 0 && icb.parent == Some(parent) {
+                    to_evict.push(ino);
+                }
+            })
+            .await;
         let count = to_evict.len();
         for ino in to_evict {
             self.inner.forget(ino, 0).await;
@@ -215,11 +217,13 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     pub async fn ensure_child_ino(&self, parent: Inode, name: &OsStr) -> Inode {
         // Search for existing child by parent + name
         let mut existing_ino = None;
-        self.inner.for_each(|&ino, icb| {
-            if icb.parent == Some(parent) && icb.path.as_os_str() == name {
-                existing_ino = Some(ino);
-            }
-        });
+        self.inner
+            .for_each(|&ino, icb| {
+                if icb.parent == Some(parent) && icb.path.as_os_str() == name {
+                    existing_ino = Some(ino);
+                }
+            })
+            .await;
 
         if let Some(ino) = existing_ino {
             return ino;
