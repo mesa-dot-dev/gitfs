@@ -337,6 +337,12 @@ impl OrgFs {
             )
             .await;
 
+        warn!(
+            ino,
+            idx,
+            "register_repo_slot: resetting bridge for orphaned slot; \
+             inner filesystem will not receive forget for stale inode mappings"
+        );
         self.composite.slots[idx].bridge = HashMapBridge::new();
         self.composite.slots[idx]
             .bridge

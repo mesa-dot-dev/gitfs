@@ -217,6 +217,13 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     /// Find an existing child by (parent, name) or allocate a new inode.
     /// If new, inserts a stub ICB (parent+path set, attr=None, children=None, rc=0).
     /// Does NOT bump rc. Returns the inode number.
+    ///
+    /// # Safety invariant
+    ///
+    /// The `for_each` scan and `insert_icb` are **not** atomic. If two callers
+    /// race with the same `(parent, name)`, both may allocate distinct inodes
+    /// for the same logical child. This is currently safe because all callers
+    /// go through `&mut self` on the owning `Fs` implementation.
     pub async fn ensure_child_ino(&self, parent: Inode, name: &OsStr) -> Inode {
         // Search for existing child by parent + name
         let mut existing_ino = None;

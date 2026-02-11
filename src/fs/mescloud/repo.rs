@@ -139,6 +139,10 @@ async fn build_repo_path(
     cache: &AsyncICache<RepoResolver>,
     root_ino: Inode,
 ) -> Option<String> {
+    /// Maximum parent-chain depth before bailing out. Prevents infinite loops
+    /// if a bug creates a cycle in the parent pointers.
+    const MAX_DEPTH: usize = 1024;
+
     let parent = parent?;
     if parent == root_ino {
         return name.to_str().map(String::from);
@@ -146,12 +150,19 @@ async fn build_repo_path(
 
     let mut components = vec![name.to_path_buf()];
     let mut current = parent;
-    while current != root_ino {
+    for _ in 0..MAX_DEPTH {
+        if current == root_ino {
+            break;
+        }
         let (path, next_parent) = cache
             .get_icb(current, |icb| (icb.path.clone(), icb.parent))
             .await?;
         components.push(path);
         current = next_parent?;
+    }
+    if current != root_ino {
+        tracing::warn!("build_repo_path: exceeded MAX_DEPTH={MAX_DEPTH}, possible parent cycle");
+        return None;
     }
     components.reverse();
     let joined: PathBuf = components.iter().collect();
@@ -216,19 +227,32 @@ impl RepoFs {
     /// Returns `None` for the root inode (the repo top-level maps to `path=None` in the
     /// mesa content API).
     async fn path_of_inode(&self, ino: Inode) -> Option<String> {
+        /// Maximum parent-chain depth before bailing out.
+        const MAX_DEPTH: usize = 1024;
+
         if ino == Self::ROOT_INO {
             return None;
         }
 
         let mut components = Vec::new();
         let mut current = ino;
-        while current != Self::ROOT_INO {
+        for _ in 0..MAX_DEPTH {
+            if current == Self::ROOT_INO {
+                break;
+            }
             let (path, parent) = self
                 .icache
                 .get_icb(current, |icb| (icb.path.clone(), icb.parent))
                 .await?;
             components.push(path);
             current = parent?;
+        }
+        if current != Self::ROOT_INO {
+            tracing::warn!(
+                ino,
+                "path_of_inode: exceeded MAX_DEPTH={MAX_DEPTH}, possible parent cycle"
+            );
+            return None;
         }
         components.reverse();
         let joined: PathBuf = components.iter().collect();
