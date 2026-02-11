@@ -58,8 +58,6 @@ fn main() {
         std::process::exit(1);
     });
 
-    updates::check_for_updates();
-
     let args = Args::parse();
     let config = Config::load_or_create(args.config_path.as_deref()).unwrap_or_else(|e| {
         error!("Failed to load configuration: {e}");
