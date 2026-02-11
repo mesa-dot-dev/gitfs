@@ -318,9 +318,13 @@ impl Fs for RepoFs {
         let mut entries = Vec::with_capacity(children.len());
         for (name, kind) in &children {
             let child_ino = self.icache.ensure_child_ino(ino, OsStr::new(name)).await;
-            let now = SystemTime::now();
-            let attr = match kind {
-                DirEntryType::Directory => FileAttr::Directory {
+            // Only cache directory attrs in readdir. File attrs are left as
+            // None so that lookup triggers the resolver to fetch the real file
+            // size. Caching placeholder file attrs (size=0) would poison
+            // needs_resolve(), preventing resolution on subsequent lookups.
+            if *kind == DirEntryType::Directory {
+                let now = SystemTime::now();
+                let attr = FileAttr::Directory {
                     common: mescloud_icache::make_common_file_attr(
                         child_ino,
                         0o755,
@@ -329,26 +333,9 @@ impl Fs for RepoFs {
                         self.icache.fs_owner(),
                         self.icache.block_size(),
                     ),
-                },
-                DirEntryType::RegularFile
-                | DirEntryType::Symlink
-                | DirEntryType::CharDevice
-                | DirEntryType::BlockDevice
-                | DirEntryType::NamedPipe
-                | DirEntryType::Socket => FileAttr::RegularFile {
-                    common: mescloud_icache::make_common_file_attr(
-                        child_ino,
-                        0o644,
-                        now,
-                        now,
-                        self.icache.fs_owner(),
-                        self.icache.block_size(),
-                    ),
-                    size: 0,
-                    blocks: 0,
-                },
-            };
-            self.icache.cache_attr(child_ino, attr).await;
+                };
+                self.icache.cache_attr(child_ino, attr).await;
+            }
             entries.push(DirEntry {
                 ino: child_ino,
                 name: name.clone().into(),
