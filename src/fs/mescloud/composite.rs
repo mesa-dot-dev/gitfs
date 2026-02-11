@@ -209,7 +209,8 @@ where
     #[must_use]
     #[instrument(name = "CompositeFs::delegated_forget", skip(self))]
     pub async fn delegated_forget(&mut self, ino: Inode, nlookups: u64) -> bool {
-        if let Some(idx) = self.slot_for_inode(ino)
+        let slot_idx = self.slot_for_inode(ino);
+        if let Some(idx) = slot_idx
             && let Some(&inner_ino) = self.slots[idx].bridge.inode_map_get_by_left(ino)
         {
             self.slots[idx].inner.forget(inner_ino, nlookups).await;
@@ -217,8 +218,8 @@ where
         if self.icache.forget(ino, nlookups).await.is_some() {
             self.child_inodes.remove(&ino);
             self.inode_to_slot.remove(&ino);
-            for slot in &mut self.slots {
-                slot.bridge.remove_inode_by_left(ino);
+            if let Some(idx) = slot_idx {
+                self.slots[idx].bridge.remove_inode_by_left(ino);
             }
             true
         } else {
