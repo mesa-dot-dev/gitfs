@@ -265,7 +265,6 @@ impl Fs for RepoFs {
             .get_or_resolve(ino, |icb| icb.attr)
             .await?
             .ok_or(LookupError::InodeNotFound)?;
-        self.icache.cache_attr(ino, attr).await;
 
         let rc = self
             .icache
