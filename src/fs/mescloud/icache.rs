@@ -5,7 +5,9 @@ use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use futures::StreamExt as _;
 use scc::HashMap as ConcurrentHashMap;
+use tracing::trace;
 
 use crate::fs::icache::{AsyncICache, IcbLike, IcbResolver, InodeFactory};
 use crate::fs::r#trait::{
@@ -194,6 +196,99 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         R::Error: 'static,
     {
         self.inner.cache.spawn_prefetch(inodes);
+    }
+
+    /// Maximum concurrent readdir prefetches.
+    const MAX_READDIR_PREFETCH_CONCURRENCY: usize = 4;
+
+    /// Perform readdir-equivalent work for a directory: resolve its ICB,
+    /// allocate inodes for children, cache directory attrs, and trigger
+    /// deeper prefetch for subdirectory children.
+    ///
+    /// This is the "true readdir prefetch" -- when the user later calls
+    /// `readdir(ino)`, all the expensive work is already done.
+    pub async fn prefetch_readdir(&self, ino: Inode) -> Result<(), R::Error>
+    where
+        R: 'static,
+        R::Error: 'static,
+    {
+        let children = self
+            .inner
+            .cache
+            .get_or_resolve(ino, |icb| icb.children.clone())
+            .await?;
+
+        let Some(children) = children else {
+            return Ok(()); // Not a directory
+        };
+
+        let mut subdir_inodes = Vec::new();
+        let now = SystemTime::now();
+
+        for (name, kind) in &children {
+            let child_ino = self.ensure_child_ino(ino, OsStr::new(name)).await;
+            if *kind == DirEntryType::Directory {
+                let attr = FileAttr::Directory {
+                    common: make_common_file_attr(
+                        child_ino,
+                        0o755,
+                        now,
+                        now,
+                        self.inner.fs_owner,
+                        self.inner.block_size,
+                    ),
+                };
+                self.cache_attr(child_ino, attr).await;
+                subdir_inodes.push(child_ino);
+            }
+        }
+
+        let subdir_count = subdir_inodes.len();
+
+        // Trigger deeper prefetch: resolve subdirectory ICBs (one more level)
+        if !subdir_inodes.is_empty() {
+            self.inner.cache.spawn_prefetch(subdir_inodes);
+        }
+
+        trace!(
+            ino,
+            child_count = children.len(),
+            subdir_count,
+            "prefetch_readdir: completed"
+        );
+
+        Ok(())
+    }
+
+    /// Fire-and-forget: spawn background tasks that perform full readdir
+    /// prefetch for the given directory inodes.
+    #[expect(dead_code, reason = "wired up in Task 5")]
+    pub fn spawn_prefetch_readdir(&self, inodes: impl IntoIterator<Item = Inode>)
+    where
+        R: 'static,
+        R::Error: 'static,
+    {
+        let inodes: Vec<_> = inodes.into_iter().collect();
+        if inodes.is_empty() {
+            return;
+        }
+        trace!(
+            count = inodes.len(),
+            "spawn_prefetch_readdir: dispatching background task"
+        );
+        let cache = self.clone();
+        tokio::spawn(async move {
+            futures::stream::iter(inodes)
+                .for_each_concurrent(Self::MAX_READDIR_PREFETCH_CONCURRENCY, |ino| {
+                    let cache = cache.clone();
+                    async move {
+                        if cache.prefetch_readdir(ino).await.is_err() {
+                            trace!(ino, "prefetch_readdir: failed (will retry on access)");
+                        }
+                    }
+                })
+                .await;
+        });
     }
 
     // -- Domain-specific --
@@ -598,5 +693,105 @@ mod tests {
         assert!(cache.contains(foo_ino), "current child 'foo' preserved");
         assert!(!cache.contains(bar_ino), "stale child 'bar' evicted");
         assert!(cache.contains(baz_ino), "current child 'baz' preserved");
+    }
+
+    struct PrefetchTestResolver {
+        listings: std::sync::Mutex<std::collections::HashMap<Inode, Vec<(String, DirEntryType)>>>,
+    }
+
+    impl PrefetchTestResolver {
+        fn new() -> Self {
+            Self {
+                listings: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+
+        fn add_dir(&self, ino: Inode, children: Vec<(String, DirEntryType)>) {
+            self.listings.lock().unwrap().insert(ino, children);
+        }
+    }
+
+    impl IcbResolver for PrefetchTestResolver {
+        type Icb = InodeControlBlock;
+        type Error = super::super::common::LookupError;
+
+        fn resolve(
+            &self,
+            ino: Inode,
+            stub: Option<InodeControlBlock>,
+            _cache: &AsyncICache<Self>,
+        ) -> impl Future<Output = Result<InodeControlBlock, Self::Error>> + Send
+        where
+            Self: Sized,
+        {
+            let listings = self.listings.lock().unwrap().clone();
+            async move {
+                let stub = stub.ok_or(super::super::common::LookupError::InodeNotFound)?;
+                let children = listings.get(&ino).cloned();
+                let now = SystemTime::now();
+                let attr = if children.is_some() {
+                    FileAttr::Directory {
+                        common: make_common_file_attr(ino, 0o755, now, now, (0, 0), 4096),
+                    }
+                } else {
+                    FileAttr::RegularFile {
+                        common: make_common_file_attr(ino, 0o644, now, now, (0, 0), 4096),
+                        size: 42,
+                        blocks: 1,
+                    }
+                };
+                Ok(InodeControlBlock {
+                    parent: stub.parent,
+                    path: stub.path,
+                    rc: stub.rc,
+                    attr: Some(attr),
+                    children,
+                })
+            }
+        }
+    }
+
+    fn test_prefetch_cache(resolver: PrefetchTestResolver) -> MescloudICache<PrefetchTestResolver> {
+        MescloudICache::new(resolver, 1, (0, 0), 4096)
+    }
+
+    #[tokio::test]
+    async fn prefetch_readdir_allocates_child_inodes_and_caches_dir_attrs() {
+        let resolver = PrefetchTestResolver::new();
+        resolver.add_dir(
+            1,
+            vec![
+                ("src".to_owned(), DirEntryType::Directory),
+                ("README.md".to_owned(), DirEntryType::RegularFile),
+            ],
+        );
+
+        let cache = test_prefetch_cache(resolver);
+
+        cache.prefetch_readdir(1).await.unwrap();
+
+        // Children should have inodes allocated
+        let src_ino = cache.ensure_child_ino(1, OsStr::new("src")).await;
+        let readme_ino = cache.ensure_child_ino(1, OsStr::new("README.md")).await;
+
+        assert!(cache.contains(src_ino), "src should exist in cache");
+        assert!(
+            cache.contains(readme_ino),
+            "README.md should exist in cache"
+        );
+
+        // Directory children should have cached attr
+        let src_attr = cache.get_attr(src_ino).await;
+        assert!(
+            matches!(src_attr, Some(FileAttr::Directory { .. })),
+            "src should have directory attr cached"
+        );
+
+        // File children should NOT have cached attr (avoids poisoning needs_resolve)
+        let readme_attr = cache.get_attr(readme_ino).await;
+        assert!(
+            readme_attr.is_none(),
+            "file children should not have attr cached by prefetch"
+        );
     }
 }
