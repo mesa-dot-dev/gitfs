@@ -197,21 +197,20 @@ impl OrgFs {
     }
 
     /// Classify an inode by its role.
-    fn inode_role(&self, ino: Inode) -> InodeRole {
+    fn inode_role(&self, ino: Inode) -> Option<InodeRole> {
         if ino == Self::ROOT_INO {
-            return InodeRole::OrgRoot;
+            return Some(InodeRole::OrgRoot);
         }
         if self.owner_inodes.contains_key(&ino) {
-            return InodeRole::OwnerDir;
+            return Some(InodeRole::OwnerDir);
         }
         if self.composite.child_inodes.contains_key(&ino) {
-            return InodeRole::RepoOwned;
+            return Some(InodeRole::RepoOwned);
         }
         if self.composite.slot_for_inode(ino).is_some() {
-            return InodeRole::RepoOwned;
+            return Some(InodeRole::RepoOwned);
         }
-        debug_assert!(false, "inode {ino} not found in any repo slot");
-        InodeRole::OrgRoot
+        None
     }
 
     /// Ensure an inode + `RepoFs` exists for the given repo name.
@@ -388,7 +387,8 @@ impl Fs for OrgFs {
 
     #[instrument(name = "OrgFs::lookup", skip(self), fields(org = %self.name))]
     async fn lookup(&mut self, parent: Inode, name: &OsStr) -> Result<FileAttr, LookupError> {
-        match self.inode_role(parent) {
+        let role = self.inode_role(parent).ok_or(LookupError::InodeNotFound)?;
+        match role {
             InodeRole::OrgRoot => {
                 // TODO(MES-674): Cleanup "special" casing for github.
                 let name_str = name.to_str().ok_or(LookupError::InodeNotFound)?;
@@ -470,7 +470,8 @@ impl Fs for OrgFs {
 
     #[instrument(name = "OrgFs::readdir", skip(self), fields(org = %self.name))]
     async fn readdir(&mut self, ino: Inode) -> Result<&[DirEntry], ReadDirError> {
-        match self.inode_role(ino) {
+        let role = self.inode_role(ino).ok_or(ReadDirError::InodeNotFound)?;
+        match role {
             InodeRole::OrgRoot => {
                 // TODO(MES-674): Cleanup "special" casing for github.
                 if self.is_github() {

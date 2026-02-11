@@ -138,18 +138,17 @@ impl MesaFS {
     }
 
     /// Classify an inode by its role.
-    fn inode_role(&self, ino: Inode) -> InodeRole {
+    fn inode_role(&self, ino: Inode) -> Option<InodeRole> {
         if ino == Self::ROOT_NODE_INO {
-            return InodeRole::Root;
+            return Some(InodeRole::Root);
         }
         if self.composite.child_inodes.contains_key(&ino) {
-            return InodeRole::OrgOwned;
+            return Some(InodeRole::OrgOwned);
         }
         if self.composite.slot_for_inode(ino).is_some() {
-            return InodeRole::OrgOwned;
+            return Some(InodeRole::OrgOwned);
         }
-        debug_assert!(false, "inode {ino} not found in any org slot");
-        InodeRole::Root
+        None
     }
 
     /// Ensure a mesa-level inode exists for the org at `org_idx`.
@@ -252,7 +251,8 @@ impl Fs for MesaFS {
 
     #[instrument(name = "MesaFS::lookup", skip(self))]
     async fn lookup(&mut self, parent: Inode, name: &OsStr) -> Result<FileAttr, LookupError> {
-        match self.inode_role(parent) {
+        let role = self.inode_role(parent).ok_or(LookupError::InodeNotFound)?;
+        match role {
             InodeRole::Root => {
                 let org_name = name.to_str().ok_or(LookupError::InodeNotFound)?;
                 let org_idx = self
@@ -288,7 +288,8 @@ impl Fs for MesaFS {
 
     #[instrument(name = "MesaFS::readdir", skip(self))]
     async fn readdir(&mut self, ino: Inode) -> Result<&[DirEntry], ReadDirError> {
-        match self.inode_role(ino) {
+        let role = self.inode_role(ino).ok_or(ReadDirError::InodeNotFound)?;
+        match role {
             InodeRole::Root => {
                 let org_info: Vec<(usize, String)> = self
                     .composite
