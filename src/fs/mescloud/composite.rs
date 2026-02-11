@@ -218,7 +218,7 @@ where
         let is_child_root = self.child_inodes.contains_key(&ino);
         if !is_child_root
             && let Some(idx) = slot_idx
-            && let Some(&inner_ino) = self.slots[idx].bridge.inode_map_get_by_left(ino)
+            && let Some(inner_ino) = self.slots[idx].bridge.inode_map_get_by_left(ino)
         {
             self.slots[idx].inner.forget(inner_ino, nlookups).await;
         }

@@ -231,7 +231,7 @@ impl MesaFS {
 
         // Reset bridge (may have stale mappings from a previous eviction cycle)
         // and seed: mesa org-root <-> OrgFs::ROOT_INO.
-        self.composite.slots[org_idx].bridge = HashMapBridge::new();
+        self.composite.slots[org_idx].bridge.reset();
         self.composite.slots[org_idx]
             .bridge
             .insert_inode(ino, OrgFs::ROOT_INO);

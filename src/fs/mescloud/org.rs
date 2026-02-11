@@ -298,7 +298,7 @@ impl OrgFs {
             self.composite.icache.fs_owner(),
         );
 
-        let mut bridge = HashMapBridge::new();
+        let bridge = HashMapBridge::new();
         bridge.insert_inode(ino, RepoFs::ROOT_INO);
 
         let idx = self.composite.slots.len();
@@ -343,7 +343,7 @@ impl OrgFs {
             "register_repo_slot: resetting bridge for orphaned slot; \
              inner filesystem will not receive forget for stale inode mappings"
         );
-        self.composite.slots[idx].bridge = HashMapBridge::new();
+        self.composite.slots[idx].bridge.reset();
         self.composite.slots[idx]
             .bridge
             .insert_inode(ino, RepoFs::ROOT_INO);
