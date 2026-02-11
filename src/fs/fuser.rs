@@ -145,7 +145,7 @@ where
     }
 }
 
-impl<F: Fs> fuser::Filesystem for FuserAdapter<F>
+impl<F: Fs + Send> fuser::Filesystem for FuserAdapter<F>
 where
     F::LookupError: Into<i32>,
     F::GetAttrError: Into<i32>,
@@ -154,6 +154,15 @@ where
     F::ReaddirError: Into<i32>,
     F::ReleaseError: Into<i32>,
 {
+    fn init(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _config: &mut fuser::KernelConfig,
+    ) -> Result<(), libc::c_int> {
+        self.runtime.block_on(self.fs.init());
+        Ok(())
+    }
+
     #[instrument(name = "FuserAdapter::lookup", skip(self, _req, reply))]
     fn lookup(
         &mut self,

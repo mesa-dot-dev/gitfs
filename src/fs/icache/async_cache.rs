@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use futures::future::join_all;
+use futures::StreamExt as _;
 use scc::HashMap as ConcurrentHashMap;
 use tokio::sync::watch;
 
@@ -503,20 +503,25 @@ impl<R: IcbResolver> AsyncICache<R> {
             .flatten()
     }
 
+    /// Maximum number of concurrent resolver RPCs during prefetch.
+    /// Bounds the fan-out so a large directory doesn't overwhelm the backend.
+    const MAX_PREFETCH_CONCURRENCY: usize = 8;
+
     /// Concurrently resolve multiple inodes, best-effort.
     ///
     /// Each inode is resolved via [`get_or_resolve`] which handles
     /// `InFlight`-coalescing and stub-upgrade logic. Errors are silently
     /// ignored because prefetch is a performance optimization: a failure
     /// simply means the subsequent access will pay the full API latency.
+    ///
+    /// Concurrency is bounded to [`MAX_PREFETCH_CONCURRENCY`](Self::MAX_PREFETCH_CONCURRENCY)
+    /// to avoid overwhelming the backend with a burst of RPCs.
     pub async fn prefetch(&self, inodes: impl IntoIterator<Item = Inode>) {
-        let futs: Vec<_> = inodes
-            .into_iter()
-            .map(|ino| async move {
+        futures::stream::iter(inodes)
+            .for_each_concurrent(Self::MAX_PREFETCH_CONCURRENCY, |ino| async move {
                 drop(self.get_or_resolve(ino, |_| ()).await);
             })
-            .collect();
-        join_all(futs).await;
+            .await;
     }
 
     /// Fire-and-forget variant of [`prefetch`](Self::prefetch).

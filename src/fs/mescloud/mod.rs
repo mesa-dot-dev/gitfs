@@ -260,6 +260,17 @@ impl Fs for MesaFS {
     type ReaddirError = ReadDirError;
     type ReleaseError = ReleaseError;
 
+    #[instrument(name = "MesaFS::init", skip(self))]
+    async fn init(&mut self) {
+        for slot in &mut self.composite.slots {
+            if slot.inner.name() == "github" {
+                continue;
+            }
+            trace!(org = slot.inner.name(), "prefetching org repo listing");
+            drop(slot.inner.readdir(OrgFs::ROOT_INO).await);
+        }
+    }
+
     #[instrument(name = "MesaFS::lookup", skip(self))]
     async fn lookup(&mut self, parent: Inode, name: &OsStr) -> Result<FileAttr, LookupError> {
         let role = self.inode_role(parent).ok_or(LookupError::InodeNotFound)?;

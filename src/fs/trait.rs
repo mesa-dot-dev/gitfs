@@ -328,6 +328,10 @@ pub trait Fs {
     type ReaddirError: std::error::Error;
     type ReleaseError: std::error::Error;
 
+    /// Called once after mount, before any FUSE operations.
+    /// Override to perform startup work like prefetching.
+    async fn init(&mut self) {}
+
     /// For each lookup call made by the kernel, it expects the icache to be updated with the
     /// returned `FileAttr`.
     async fn lookup(&mut self, parent: Inode, name: &OsStr) -> Result<FileAttr, Self::LookupError>;
