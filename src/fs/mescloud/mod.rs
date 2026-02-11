@@ -260,7 +260,12 @@ impl Fs for MesaFS {
 
                 trace!(org = org_name, "lookup: matched org");
                 let (ino, attr) = self.ensure_org_inode(org_idx).await;
-                let rc = self.composite.icache.inc_rc(ino).await.unwrap_or(0);
+                let rc = self
+                    .composite
+                    .icache
+                    .inc_rc(ino)
+                    .await
+                    .ok_or(LookupError::InodeNotFound)?;
                 trace!(ino, org = org_name, rc, "lookup: resolved org inode");
                 Ok(attr)
             }

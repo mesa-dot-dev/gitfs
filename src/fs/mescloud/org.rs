@@ -358,7 +358,11 @@ impl Fs for OrgFs {
                     // name is an owner like "torvalds" — create lazily, no API validation.
                     trace!(owner = name_str, "lookup: resolving github owner dir");
                     let (ino, attr) = self.ensure_owner_inode(name_str).await;
-                    self.composite.icache.inc_rc(ino).await;
+                    self.composite
+                        .icache
+                        .inc_rc(ino)
+                        .await
+                        .ok_or(LookupError::InodeNotFound)?;
                     Ok(attr)
                 } else {
                     // Children of org root are repos.
@@ -370,7 +374,12 @@ impl Fs for OrgFs {
                     let (ino, attr) = self
                         .ensure_repo_inode(name_str, name_str, &repo.default_branch, Self::ROOT_INO)
                         .await;
-                    let rc = self.composite.icache.inc_rc(ino).await.unwrap_or(0);
+                    let rc = self
+                        .composite
+                        .icache
+                        .inc_rc(ino)
+                        .await
+                        .ok_or(LookupError::InodeNotFound)?;
                     trace!(ino, repo = name_str, rc, "lookup: resolved repo inode");
                     Ok(attr)
                 }
@@ -400,7 +409,11 @@ impl Fs for OrgFs {
                 let (ino, attr) = self
                     .ensure_repo_inode(&encoded, repo_name_str, &repo.default_branch, parent)
                     .await;
-                self.composite.icache.inc_rc(ino).await;
+                self.composite
+                    .icache
+                    .inc_rc(ino)
+                    .await
+                    .ok_or(LookupError::InodeNotFound)?;
                 Ok(attr)
             }
             InodeRole::RepoOwned => self.composite.delegated_lookup(parent, name).await,

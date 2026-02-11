@@ -323,7 +323,14 @@ impl<R: IcbResolver> AsyncICache<R> {
     }
 
     /// Increment rc. **Awaits** `InFlight`.
+    ///
     /// Returns `None` if the inode does not exist or was evicted concurrently.
+    /// This can happen when a concurrent `forget` removes the entry between the
+    /// caller's insert/cache and this `inc_rc` call, or when a concurrent
+    /// `get_or_resolve` swaps the entry to `InFlight` and the entry is then
+    /// evicted on resolution failure. Callers in FUSE `lookup` paths should
+    /// treat `None` as a lookup failure to avoid ref-count leaks (the kernel
+    /// would hold a reference the cache no longer tracks).
     #[instrument(name = "AsyncICache::inc_rc", skip(self))]
     pub async fn inc_rc(&self, ino: Inode) -> Option<u64> {
         loop {
