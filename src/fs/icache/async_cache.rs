@@ -517,11 +517,18 @@ impl<R: IcbResolver> AsyncICache<R> {
     /// Concurrency is bounded to [`MAX_PREFETCH_CONCURRENCY`](Self::MAX_PREFETCH_CONCURRENCY)
     /// to avoid overwhelming the backend with a burst of RPCs.
     pub async fn prefetch(&self, inodes: impl IntoIterator<Item = Inode>) {
+        let inodes: Vec<_> = inodes.into_iter().collect();
+        trace!(count = inodes.len(), ?inodes, "prefetch: starting batch");
         futures::stream::iter(inodes)
             .for_each_concurrent(Self::MAX_PREFETCH_CONCURRENCY, |ino| async move {
-                drop(self.get_or_resolve(ino, |_| ()).await);
+                if self.get_or_resolve(ino, |_| ()).await.is_err() {
+                    trace!(ino, "prefetch: resolution failed (will retry on access)");
+                } else {
+                    trace!(ino, "prefetch: resolved successfully");
+                }
             })
             .await;
+        trace!("prefetch: batch complete");
     }
 
     /// Fire-and-forget variant of [`prefetch`](Self::prefetch).
@@ -538,6 +545,11 @@ impl<R: IcbResolver> AsyncICache<R> {
         if inodes.is_empty() {
             return;
         }
+        trace!(
+            count = inodes.len(),
+            ?inodes,
+            "spawn_prefetch: dispatching background task"
+        );
         let cache = self.clone();
         tokio::spawn(async move {
             cache.prefetch(inodes).await;

@@ -5,13 +5,14 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::future::Future;
-use std::{collections::HashMap, ffi::OsStr, path::PathBuf, time::SystemTime};
+use std::{ffi::OsStr, path::PathBuf, time::SystemTime};
 
 use base64::Engine as _;
 use bytes::Bytes;
 use mesa_dev::MesaClient;
 use mesa_dev::low_level::content::{Content, DirEntry as MesaDirEntry};
 use num_traits::cast::ToPrimitive as _;
+use scc::HashMap as ConcurrentHashMap;
 use tracing::{Instrument as _, instrument, trace, warn};
 
 use crate::fs::icache::{AsyncICache, FileTable, IcbResolver};
@@ -189,8 +190,7 @@ pub struct RepoFs {
 
     icache: MescloudICache<RepoResolver>,
     file_table: FileTable,
-    readdir_buf: Vec<DirEntry>,
-    open_files: HashMap<FileHandle, Inode>,
+    open_files: ConcurrentHashMap<FileHandle, Inode>,
 }
 
 impl RepoFs {
@@ -220,8 +220,7 @@ impl RepoFs {
             ref_,
             icache: MescloudICache::new(resolver, Self::ROOT_INO, fs_owner, Self::BLOCK_SIZE),
             file_table: FileTable::new(),
-            readdir_buf: Vec::new(),
-            open_files: HashMap::new(),
+            open_files: ConcurrentHashMap::new(),
         }
     }
 
@@ -292,7 +291,7 @@ impl Fs for RepoFs {
     type ReleaseError = ReleaseError;
 
     #[instrument(name = "RepoFs::lookup", skip(self), fields(repo = %self.repo_name))]
-    async fn lookup(&mut self, parent: Inode, name: &OsStr) -> Result<FileAttr, LookupError> {
+    async fn lookup(&self, parent: Inode, name: &OsStr) -> Result<FileAttr, LookupError> {
         debug_assert!(
             self.icache.contains(parent),
             "lookup: parent inode {parent} not in inode table"
@@ -315,11 +314,7 @@ impl Fs for RepoFs {
     }
 
     #[instrument(name = "RepoFs::getattr", skip(self), fields(repo = %self.repo_name))]
-    async fn getattr(
-        &mut self,
-        ino: Inode,
-        _fh: Option<FileHandle>,
-    ) -> Result<FileAttr, GetAttrError> {
+    async fn getattr(&self, ino: Inode, _fh: Option<FileHandle>) -> Result<FileAttr, GetAttrError> {
         self.icache.get_attr(ino).await.ok_or_else(|| {
             warn!(ino, "getattr on unknown inode");
             GetAttrError::InodeNotFound
@@ -327,7 +322,7 @@ impl Fs for RepoFs {
     }
 
     #[instrument(name = "RepoFs::readdir", skip(self), fields(repo = %self.repo_name))]
-    async fn readdir(&mut self, ino: Inode) -> Result<&[DirEntry], ReadDirError> {
+    async fn readdir(&self, ino: Inode) -> Result<Vec<DirEntry>, ReadDirError> {
         debug_assert!(
             self.icache.contains(ino),
             "readdir: inode {ino} not in inode table"
@@ -407,12 +402,11 @@ impl Fs for RepoFs {
             self.icache.spawn_prefetch_readdir(subdir_inodes);
         }
 
-        self.readdir_buf = entries;
-        Ok(&self.readdir_buf)
+        Ok(entries)
     }
 
     #[instrument(name = "RepoFs::open", skip(self), fields(repo = %self.repo_name))]
-    async fn open(&mut self, ino: Inode, _flags: OpenFlags) -> Result<OpenFile, OpenError> {
+    async fn open(&self, ino: Inode, _flags: OpenFlags) -> Result<OpenFile, OpenError> {
         if !self.icache.contains(ino) {
             warn!(ino, "open on unknown inode");
             return Err(OpenError::InodeNotFound);
@@ -425,7 +419,7 @@ impl Fs for RepoFs {
             "open: inode {ino} has non-file cached attr"
         );
         let fh = self.file_table.allocate();
-        self.open_files.insert(fh, ino);
+        let _ = self.open_files.insert_async(fh, ino).await;
         trace!(ino, fh, "assigned file handle");
         Ok(OpenFile {
             handle: fh,
@@ -435,7 +429,7 @@ impl Fs for RepoFs {
 
     #[instrument(name = "RepoFs::read", skip(self), fields(repo = %self.repo_name))]
     async fn read(
-        &mut self,
+        &self,
         ino: Inode,
         fh: FileHandle,
         offset: u64,
@@ -443,10 +437,14 @@ impl Fs for RepoFs {
         _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
     ) -> Result<Bytes, ReadError> {
-        let &file_ino = self.open_files.get(&fh).ok_or_else(|| {
-            warn!(fh, "read on unknown file handle");
-            ReadError::FileNotOpen
-        })?;
+        let file_ino = self
+            .open_files
+            .read_async(&fh, |_, &file_ino| file_ino)
+            .await
+            .ok_or_else(|| {
+                warn!(fh, "read on unknown file handle");
+                ReadError::FileNotOpen
+            })?;
         debug_assert!(
             file_ino == ino,
             "read: file handle {fh} maps to inode {file_ino}, but caller passed inode {ino}"
@@ -497,13 +495,13 @@ impl Fs for RepoFs {
 
     #[instrument(name = "RepoFs::release", skip(self), fields(repo = %self.repo_name))]
     async fn release(
-        &mut self,
+        &self,
         ino: Inode,
         fh: FileHandle,
         _flags: OpenFlags,
         _flush: bool,
     ) -> Result<(), ReleaseError> {
-        let released_ino = self.open_files.remove(&fh).ok_or_else(|| {
+        let (_, released_ino) = self.open_files.remove_async(&fh).await.ok_or_else(|| {
             warn!(fh, "release on unknown file handle");
             ReleaseError::FileNotOpen
         })?;
@@ -516,7 +514,7 @@ impl Fs for RepoFs {
     }
 
     #[instrument(name = "RepoFs::forget", skip(self), fields(repo = %self.repo_name))]
-    async fn forget(&mut self, ino: Inode, nlookups: u64) {
+    async fn forget(&self, ino: Inode, nlookups: u64) {
         debug_assert!(
             self.icache.contains(ino),
             "forget: inode {ino} not in inode table"
@@ -525,7 +523,7 @@ impl Fs for RepoFs {
         self.icache.forget(ino, nlookups).await;
     }
 
-    async fn statfs(&mut self) -> Result<FilesystemStats, std::io::Error> {
+    async fn statfs(&self) -> Result<FilesystemStats, std::io::Error> {
         Ok(self.icache.statfs())
     }
 }

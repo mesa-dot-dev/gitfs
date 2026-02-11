@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::future::Future;
 use std::time::SystemTime;
@@ -6,6 +5,7 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use futures::TryStreamExt as _;
 use mesa_dev::MesaClient;
+use scc::HashMap as ConcurrentHashMap;
 use secrecy::SecretString;
 use tracing::{Instrument as _, instrument, trace, warn};
 
@@ -93,7 +93,7 @@ pub struct OrgFs {
     client: MesaClient,
     composite: CompositeFs<OrgResolver, RepoFs>,
     /// Maps org-level owner-dir inodes to owner name (github only).
-    owner_inodes: HashMap<Inode, String>,
+    owner_inodes: ConcurrentHashMap<Inode, String>,
 }
 
 impl OrgFs {
@@ -121,37 +121,42 @@ impl OrgFs {
 
     /// Ensure an inode exists for a virtual owner directory (github only). Does NOT bump rc.
     /// TODO(MES-674): Cleanup "special" casing for github.
-    async fn ensure_owner_inode(&mut self, owner: &str) -> (Inode, FileAttr) {
+    async fn ensure_owner_inode(&self, owner: &str) -> (Inode, FileAttr) {
         // Check existing
-        let mut stale_ino = None;
-        for (&ino, existing_owner) in &self.owner_inodes {
-            if existing_owner == owner {
-                if let Some(attr) = self.composite.icache.get_attr(ino).await {
-                    return (ino, attr);
+        let mut existing_ino_found = None;
+        self.owner_inodes
+            .any_async(|&ino, existing_owner| {
+                if existing_owner == owner {
+                    existing_ino_found = Some(ino);
+                    true
+                } else {
+                    false
                 }
-                if self.composite.icache.contains(ino) {
-                    // ICB exists but attr missing — rebuild and cache
-                    let now = SystemTime::now();
-                    let attr = FileAttr::Directory {
-                        common: mescloud_icache::make_common_file_attr(
-                            ino,
-                            0o755,
-                            now,
-                            now,
-                            self.composite.icache.fs_owner(),
-                            self.composite.icache.block_size(),
-                        ),
-                    };
-                    self.composite.icache.cache_attr(ino, attr).await;
-                    return (ino, attr);
-                }
-                // ICB was evicted — mark for cleanup
-                stale_ino = Some(ino);
-                break;
+            })
+            .await;
+
+        if let Some(existing_ino) = existing_ino_found {
+            if let Some(attr) = self.composite.icache.get_attr(existing_ino).await {
+                return (existing_ino, attr);
             }
-        }
-        if let Some(ino) = stale_ino {
-            self.owner_inodes.remove(&ino);
+            if self.composite.icache.contains(existing_ino) {
+                // ICB exists but attr missing — rebuild and cache
+                let now = SystemTime::now();
+                let attr = FileAttr::Directory {
+                    common: mescloud_icache::make_common_file_attr(
+                        existing_ino,
+                        0o755,
+                        now,
+                        now,
+                        self.composite.icache.fs_owner(),
+                        self.composite.icache.block_size(),
+                    ),
+                };
+                self.composite.icache.cache_attr(existing_ino, attr).await;
+                return (existing_ino, attr);
+            }
+            // ICB was evicted — mark for cleanup
+            self.owner_inodes.remove_async(&existing_ino).await;
         }
 
         // Allocate new
@@ -170,7 +175,7 @@ impl OrgFs {
                 },
             )
             .await;
-        self.owner_inodes.insert(ino, owner.to_owned());
+        drop(self.owner_inodes.insert_async(ino, owner.to_owned()).await);
         let attr = FileAttr::Directory {
             common: mescloud_icache::make_common_file_attr(
                 ino,
@@ -197,12 +202,11 @@ impl OrgFs {
             composite: CompositeFs {
                 icache: MescloudICache::new(resolver, Self::ROOT_INO, fs_owner, Self::BLOCK_SIZE),
                 file_table: FileTable::new(),
-                readdir_buf: Vec::new(),
-                child_inodes: HashMap::new(),
-                inode_to_slot: HashMap::new(),
-                slots: Vec::new(),
+                child_inodes: ConcurrentHashMap::new(),
+                inode_to_slot: ConcurrentHashMap::new(),
+                slots: tokio::sync::RwLock::new(Vec::new()),
             },
-            owner_inodes: HashMap::new(),
+            owner_inodes: ConcurrentHashMap::new(),
         }
     }
 
@@ -211,10 +215,15 @@ impl OrgFs {
         if ino == Self::ROOT_INO {
             return Some(InodeRole::OrgRoot);
         }
-        if self.owner_inodes.contains_key(&ino) {
+        if self.owner_inodes.read_sync(&ino, |_, _| ()).is_some() {
             return Some(InodeRole::OwnerDir);
         }
-        if self.composite.child_inodes.contains_key(&ino) {
+        if self
+            .composite
+            .child_inodes
+            .read_sync(&ino, |_, _| ())
+            .is_some()
+        {
             return Some(InodeRole::RepoOwned);
         }
         if self.composite.slot_for_inode(ino).is_some() {
@@ -230,15 +239,28 @@ impl OrgFs {
     /// - `display_name`: name shown in filesystem ("linux" for github, same as `repo_name` otherwise)
     /// - `parent_ino`: owner-dir inode for github, `ROOT_INO` otherwise
     async fn ensure_repo_inode(
-        &mut self,
+        &self,
         repo_name: &str,
         display_name: &str,
         default_branch: &str,
         parent_ino: Inode,
     ) -> (Inode, FileAttr) {
         // Check existing repos.
-        for (&ino, &idx) in &self.composite.child_inodes {
-            if self.composite.slots[idx].inner.repo_name() == repo_name {
+        {
+            let slots = self.composite.slots.read().await;
+            let mut found = None;
+            self.composite
+                .child_inodes
+                .any_async(|&ino, &idx| {
+                    if slots[idx].inner.repo_name() == repo_name {
+                        found = Some((ino, idx));
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .await;
+            if let Some((ino, _)) = found {
                 if let Some(attr) = self.composite.icache.get_attr(ino).await {
                     let rc = self
                         .composite
@@ -256,19 +278,15 @@ impl OrgFs {
                 );
                 return self.make_repo_dir_attr(ino).await;
             }
+
+            // Check for orphaned slot (slot exists but not in child_inodes).
+            if let Some(idx) = slots.iter().position(|s| s.inner.repo_name() == repo_name) {
+                drop(slots);
+                return self.register_repo_slot(idx, display_name, parent_ino).await;
+            }
         }
 
-        // Check for orphaned slot (slot exists but not in child_inodes).
-        if let Some(idx) = self
-            .composite
-            .slots
-            .iter()
-            .position(|s| s.inner.repo_name() == repo_name)
-        {
-            return self.register_repo_slot(idx, display_name, parent_ino).await;
-        }
-
-        // Allocate truly new slot.
+        // Allocate truly new slot. Need write lock.
         let ino = self.composite.icache.allocate_inode();
         trace!(
             ino,
@@ -298,16 +316,19 @@ impl OrgFs {
             self.composite.icache.fs_owner(),
         );
 
-        let mut bridge = HashMapBridge::new();
+        let bridge = HashMapBridge::new();
         bridge.insert_inode(ino, RepoFs::ROOT_INO);
 
-        let idx = self.composite.slots.len();
-        self.composite.slots.push(ChildSlot {
+        let mut slots = self.composite.slots.write().await;
+        let idx = slots.len();
+        slots.push(ChildSlot {
             inner: repo,
             bridge,
         });
-        self.composite.child_inodes.insert(ino, idx);
-        self.composite.inode_to_slot.insert(ino, idx);
+        drop(slots);
+
+        let _ = self.composite.child_inodes.insert_async(ino, idx).await;
+        let _ = self.composite.inode_to_slot.insert_async(ino, idx).await;
 
         self.make_repo_dir_attr(ino).await
     }
@@ -315,7 +336,7 @@ impl OrgFs {
     /// Allocate a new inode, register it in an existing (orphaned) slot, and
     /// return `(ino, attr)`.
     async fn register_repo_slot(
-        &mut self,
+        &self,
         idx: usize,
         display_name: &str,
         parent_ino: Inode,
@@ -343,12 +364,19 @@ impl OrgFs {
             "register_repo_slot: resetting bridge for orphaned slot; \
              inner filesystem will not receive forget for stale inode mappings"
         );
-        self.composite.slots[idx].bridge = HashMapBridge::new();
-        self.composite.slots[idx]
-            .bridge
-            .insert_inode(ino, RepoFs::ROOT_INO);
-        self.composite.child_inodes.insert(ino, idx);
-        self.composite.inode_to_slot.insert(ino, idx);
+        let slots = self.composite.slots.read().await;
+        // Reset bridge by replacing its internal state via insert_inode
+        // (HashMapBridge doesn't expose a reset method, so we create a new one
+        // and write through the RwLock. Since ChildSlot's bridge uses interior
+        // mutability, we need write lock to replace the bridge itself.)
+        drop(slots);
+        {
+            let mut slots = self.composite.slots.write().await;
+            slots[idx].bridge = HashMapBridge::new();
+            slots[idx].bridge.insert_inode(ino, RepoFs::ROOT_INO);
+        }
+        let _ = self.composite.child_inodes.insert_async(ino, idx).await;
+        let _ = self.composite.inode_to_slot.insert_async(ino, idx).await;
 
         self.make_repo_dir_attr(ino).await
     }
@@ -402,7 +430,7 @@ impl Fs for OrgFs {
     type ReleaseError = ReleaseError;
 
     #[instrument(name = "OrgFs::lookup", skip(self), fields(org = %self.name))]
-    async fn lookup(&mut self, parent: Inode, name: &OsStr) -> Result<FileAttr, LookupError> {
+    async fn lookup(&self, parent: Inode, name: &OsStr) -> Result<FileAttr, LookupError> {
         let role = self.inode_role(parent).ok_or(LookupError::InodeNotFound)?;
         match role {
             InodeRole::OrgRoot => {
@@ -444,9 +472,9 @@ impl Fs for OrgFs {
                 // Parent is an owner dir, name is a repo like "linux".
                 let owner = self
                     .owner_inodes
-                    .get(&parent)
-                    .ok_or(LookupError::InodeNotFound)?
-                    .clone();
+                    .read_async(&parent, |_, v| v.clone())
+                    .await
+                    .ok_or(LookupError::InodeNotFound)?;
                 let repo_name_str = name.to_str().ok_or(LookupError::InodeNotFound)?;
                 let full_decoded = format!("{owner}/{repo_name_str}");
                 let encoded = Self::encode_github_repo_name(&full_decoded);
@@ -476,16 +504,12 @@ impl Fs for OrgFs {
     }
 
     #[instrument(name = "OrgFs::getattr", skip(self), fields(org = %self.name))]
-    async fn getattr(
-        &mut self,
-        ino: Inode,
-        _fh: Option<FileHandle>,
-    ) -> Result<FileAttr, GetAttrError> {
+    async fn getattr(&self, ino: Inode, _fh: Option<FileHandle>) -> Result<FileAttr, GetAttrError> {
         self.composite.delegated_getattr(ino).await
     }
 
     #[instrument(name = "OrgFs::readdir", skip(self), fields(org = %self.name))]
-    async fn readdir(&mut self, ino: Inode) -> Result<&[DirEntry], ReadDirError> {
+    async fn readdir(&self, ino: Inode) -> Result<Vec<DirEntry>, ReadDirError> {
         let role = self.inode_role(ino).ok_or(ReadDirError::InodeNotFound)?;
         match role {
             InodeRole::OrgRoot => {
@@ -526,20 +550,24 @@ impl Fs for OrgFs {
                     });
                 }
 
-                let prefetch_count = entries
-                    .iter()
-                    .filter_map(|e| self.composite.child_inodes.get(&e.ino).copied())
-                    .inspect(|&idx| self.composite.slots[idx].inner.prefetch_root())
-                    .count();
-                if prefetch_count > 0 {
-                    trace!(
-                        count = prefetch_count,
-                        "readdir: prefetching repo root directories"
-                    );
+                {
+                    let slots = self.composite.slots.read().await;
+                    let prefetch_count = entries
+                        .iter()
+                        .filter_map(|e| {
+                            self.composite.child_inodes.read_sync(&e.ino, |_, &idx| idx)
+                        })
+                        .inspect(|&idx| slots[idx].inner.prefetch_root())
+                        .count();
+                    if prefetch_count > 0 {
+                        trace!(
+                            count = prefetch_count,
+                            "readdir: prefetching repo root directories"
+                        );
+                    }
                 }
 
-                self.composite.readdir_buf = entries;
-                Ok(&self.composite.readdir_buf)
+                Ok(entries)
             }
             InodeRole::OwnerDir if self.is_github() => {
                 // TODO(MES-674): Cleanup "special" casing for github.
@@ -551,13 +579,13 @@ impl Fs for OrgFs {
     }
 
     #[instrument(name = "OrgFs::open", skip(self), fields(org = %self.name))]
-    async fn open(&mut self, ino: Inode, flags: OpenFlags) -> Result<OpenFile, OpenError> {
+    async fn open(&self, ino: Inode, flags: OpenFlags) -> Result<OpenFile, OpenError> {
         self.composite.delegated_open(ino, flags).await
     }
 
     #[instrument(name = "OrgFs::read", skip(self), fields(org = %self.name))]
     async fn read(
-        &mut self,
+        &self,
         ino: Inode,
         fh: FileHandle,
         offset: u64,
@@ -572,7 +600,7 @@ impl Fs for OrgFs {
 
     #[instrument(name = "OrgFs::release", skip(self), fields(org = %self.name))]
     async fn release(
-        &mut self,
+        &self,
         ino: Inode,
         fh: FileHandle,
         flags: OpenFlags,
@@ -584,14 +612,14 @@ impl Fs for OrgFs {
     }
 
     #[instrument(name = "OrgFs::forget", skip(self), fields(org = %self.name))]
-    async fn forget(&mut self, ino: Inode, nlookups: u64) {
+    async fn forget(&self, ino: Inode, nlookups: u64) {
         let evicted = self.composite.delegated_forget(ino, nlookups).await;
         if evicted {
-            self.owner_inodes.remove(&ino);
+            self.owner_inodes.remove_async(&ino).await;
         }
     }
 
-    async fn statfs(&mut self) -> Result<FilesystemStats, std::io::Error> {
+    async fn statfs(&self) -> Result<FilesystemStats, std::io::Error> {
         Ok(self.composite.delegated_statfs())
     }
 }
