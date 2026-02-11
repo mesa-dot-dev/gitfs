@@ -119,6 +119,7 @@ impl MesaFS {
                 file_table: FileTable::new(),
                 readdir_buf: Vec::new(),
                 child_inodes: HashMap::new(),
+                inode_to_slot: HashMap::new(),
                 slots: orgs
                     .map(|org_conf| {
                         let client = MesaClient::builder()
@@ -137,14 +138,14 @@ impl MesaFS {
     }
 
     /// Classify an inode by its role.
-    async fn inode_role(&self, ino: Inode) -> InodeRole {
+    fn inode_role(&self, ino: Inode) -> InodeRole {
         if ino == Self::ROOT_NODE_INO {
             return InodeRole::Root;
         }
         if self.composite.child_inodes.contains_key(&ino) {
             return InodeRole::OrgOwned;
         }
-        if self.composite.slot_for_inode(ino).await.is_some() {
+        if self.composite.slot_for_inode(ino).is_some() {
             return InodeRole::OrgOwned;
         }
         debug_assert!(false, "inode {ino} not found in any org slot");
@@ -216,8 +217,11 @@ impl MesaFS {
             .await;
 
         self.composite.child_inodes.insert(ino, org_idx);
+        self.composite.inode_to_slot.insert(ino, org_idx);
 
-        // Seed bridge: mesa org-root <-> OrgFs::ROOT_INO.
+        // Reset bridge (may have stale mappings from a previous eviction cycle)
+        // and seed: mesa org-root <-> OrgFs::ROOT_INO.
+        self.composite.slots[org_idx].bridge = HashMapBridge::new();
         self.composite.slots[org_idx]
             .bridge
             .insert_inode(ino, OrgFs::ROOT_INO);
@@ -248,7 +252,7 @@ impl Fs for MesaFS {
 
     #[instrument(name = "MesaFS::lookup", skip(self))]
     async fn lookup(&mut self, parent: Inode, name: &OsStr) -> Result<FileAttr, LookupError> {
-        match self.inode_role(parent).await {
+        match self.inode_role(parent) {
             InodeRole::Root => {
                 let org_name = name.to_str().ok_or(LookupError::InodeNotFound)?;
                 let org_idx = self
@@ -284,7 +288,7 @@ impl Fs for MesaFS {
 
     #[instrument(name = "MesaFS::readdir", skip(self))]
     async fn readdir(&mut self, ino: Inode) -> Result<&[DirEntry], ReadDirError> {
-        match self.inode_role(ino).await {
+        match self.inode_role(ino) {
             InodeRole::Root => {
                 let org_info: Vec<(usize, String)> = self
                     .composite

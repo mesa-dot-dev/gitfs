@@ -11,7 +11,7 @@ pub use file_table::FileTable;
 pub use inode_factory::InodeFactory;
 
 /// Common interface for inode control block types usable with `ICache`.
-pub trait IcbLike {
+pub trait IcbLike: Clone {
     /// Create an ICB with rc=1, the given path, and no children.
     fn new_root(path: std::path::PathBuf) -> Self;
     fn rc(&self) -> u64;

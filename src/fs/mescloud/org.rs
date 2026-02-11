@@ -189,6 +189,7 @@ impl OrgFs {
                 file_table: FileTable::new(),
                 readdir_buf: Vec::new(),
                 child_inodes: HashMap::new(),
+                inode_to_slot: HashMap::new(),
                 slots: Vec::new(),
             },
             owner_inodes: HashMap::new(),
@@ -196,7 +197,7 @@ impl OrgFs {
     }
 
     /// Classify an inode by its role.
-    async fn inode_role(&self, ino: Inode) -> InodeRole {
+    fn inode_role(&self, ino: Inode) -> InodeRole {
         if ino == Self::ROOT_INO {
             return InodeRole::OrgRoot;
         }
@@ -206,7 +207,7 @@ impl OrgFs {
         if self.composite.child_inodes.contains_key(&ino) {
             return InodeRole::RepoOwned;
         }
-        if self.composite.slot_for_inode(ino).await.is_some() {
+        if self.composite.slot_for_inode(ino).is_some() {
             return InodeRole::RepoOwned;
         }
         debug_assert!(false, "inode {ino} not found in any repo slot");
@@ -239,29 +240,26 @@ impl OrgFs {
                     trace!(ino, repo = repo_name, rc, "ensure_repo_inode: reusing");
                     return (ino, attr);
                 }
-                // Attr missing — rebuild.
                 warn!(
                     ino,
                     repo = repo_name,
                     "ensure_repo_inode: attr missing, rebuilding"
                 );
-                let now = SystemTime::now();
-                let attr = FileAttr::Directory {
-                    common: mescloud_icache::make_common_file_attr(
-                        ino,
-                        0o755,
-                        now,
-                        now,
-                        self.composite.icache.fs_owner(),
-                        self.composite.icache.block_size(),
-                    ),
-                };
-                self.composite.icache.cache_attr(ino, attr).await;
-                return (ino, attr);
+                return self.make_repo_dir_attr(ino).await;
             }
         }
 
-        // Allocate new.
+        // Check for orphaned slot (slot exists but not in child_inodes).
+        if let Some(idx) = self
+            .composite
+            .slots
+            .iter()
+            .position(|s| s.inner.repo_name() == repo_name)
+        {
+            return self.register_repo_slot(idx, display_name, parent_ino).await;
+        }
+
+        // Allocate truly new slot.
         let ino = self.composite.icache.allocate_inode();
         trace!(
             ino,
@@ -269,7 +267,6 @@ impl OrgFs {
             "ensure_repo_inode: allocated new inode"
         );
 
-        let now = SystemTime::now();
         self.composite
             .icache
             .insert_icb(
@@ -301,7 +298,49 @@ impl OrgFs {
             bridge,
         });
         self.composite.child_inodes.insert(ino, idx);
+        self.composite.inode_to_slot.insert(ino, idx);
 
+        self.make_repo_dir_attr(ino).await
+    }
+
+    /// Allocate a new inode, register it in an existing (orphaned) slot, and
+    /// return `(ino, attr)`.
+    async fn register_repo_slot(
+        &mut self,
+        idx: usize,
+        display_name: &str,
+        parent_ino: Inode,
+    ) -> (Inode, FileAttr) {
+        let ino = self.composite.icache.allocate_inode();
+        trace!(ino, idx, "register_repo_slot: reusing orphaned slot");
+
+        self.composite
+            .icache
+            .insert_icb(
+                ino,
+                InodeControlBlock {
+                    rc: 0,
+                    path: display_name.into(),
+                    parent: Some(parent_ino),
+                    attr: None,
+                    children: None,
+                },
+            )
+            .await;
+
+        self.composite.slots[idx].bridge = HashMapBridge::new();
+        self.composite.slots[idx]
+            .bridge
+            .insert_inode(ino, RepoFs::ROOT_INO);
+        self.composite.child_inodes.insert(ino, idx);
+        self.composite.inode_to_slot.insert(ino, idx);
+
+        self.make_repo_dir_attr(ino).await
+    }
+
+    /// Build and cache a directory attr for `ino`, returning `(ino, attr)`.
+    async fn make_repo_dir_attr(&self, ino: Inode) -> (Inode, FileAttr) {
+        let now = SystemTime::now();
         let attr = FileAttr::Directory {
             common: mescloud_icache::make_common_file_attr(
                 ino,
@@ -349,7 +388,7 @@ impl Fs for OrgFs {
 
     #[instrument(name = "OrgFs::lookup", skip(self), fields(org = %self.name))]
     async fn lookup(&mut self, parent: Inode, name: &OsStr) -> Result<FileAttr, LookupError> {
-        match self.inode_role(parent).await {
+        match self.inode_role(parent) {
             InodeRole::OrgRoot => {
                 // TODO(MES-674): Cleanup "special" casing for github.
                 let name_str = name.to_str().ok_or(LookupError::InodeNotFound)?;
@@ -431,7 +470,7 @@ impl Fs for OrgFs {
 
     #[instrument(name = "OrgFs::readdir", skip(self), fields(org = %self.name))]
     async fn readdir(&mut self, ino: Inode) -> Result<&[DirEntry], ReadDirError> {
-        match self.inode_role(ino).await {
+        match self.inode_role(ino) {
             InodeRole::OrgRoot => {
                 // TODO(MES-674): Cleanup "special" casing for github.
                 if self.is_github() {

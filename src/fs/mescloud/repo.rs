@@ -58,6 +58,11 @@ impl IcbResolver for RepoResolver {
             let stub = stub.unwrap_or_else(|| unreachable!("RepoResolver requires a stub ICB"));
             let file_path = build_repo_path(stub.parent, &stub.path, cache, RepoFs::ROOT_INO).await;
 
+            // Non-root inodes must have a resolvable path.
+            if stub.parent.is_some() && file_path.is_none() {
+                return Err(LookupError::InodeNotFound);
+            }
+
             let content = client
                 .org(&org_name)
                 .repos()
@@ -309,6 +314,8 @@ impl Fs for RepoFs {
             "readdir: resolved directory listing from icache"
         );
 
+        self.icache.evict_zero_rc_children(ino).await;
+
         let mut entries = Vec::with_capacity(children.len());
         for (name, kind) in &children {
             let child_ino = self.icache.ensure_child_ino(ino, OsStr::new(name)).await;
@@ -403,6 +410,12 @@ impl Fs for RepoFs {
         );
 
         let file_path = self.path_of_inode(ino).await;
+
+        // Non-root inodes must have a resolvable path.
+        if ino != Self::ROOT_INO && file_path.is_none() {
+            warn!(ino, "read: path_of_inode returned None for non-root inode");
+            return Err(ReadError::InodeNotFound);
+        }
 
         let content = self
             .client

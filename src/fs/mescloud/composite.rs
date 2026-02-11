@@ -45,6 +45,8 @@ where
     pub readdir_buf: Vec<DirEntry>,
     /// Maps outer inode to index into `slots` for child-root inodes.
     pub child_inodes: HashMap<Inode, usize>,
+    /// Maps every translated outer inode to its owning slot index.
+    pub inode_to_slot: HashMap<Inode, usize>,
     pub slots: Vec<ChildSlot<Inner>>,
 }
 
@@ -62,24 +64,10 @@ where
         + Send
         + Sync,
 {
-    /// Walk the parent chain to find which child slot owns an inode.
+    /// Look up which child slot owns an inode via direct map.
     #[instrument(name = "CompositeFs::slot_for_inode", skip(self))]
-    pub async fn slot_for_inode(&self, ino: Inode) -> Option<usize> {
-        if let Some(&idx) = self.child_inodes.get(&ino) {
-            return Some(idx);
-        }
-        let mut current = ino;
-        loop {
-            let parent = self
-                .icache
-                .get_icb(current, |icb| icb.parent)
-                .await
-                .flatten()?;
-            if let Some(&idx) = self.child_inodes.get(&parent) {
-                return Some(idx);
-            }
-            current = parent;
-        }
+    pub fn slot_for_inode(&self, ino: Inode) -> Option<usize> {
+        self.inode_to_slot.get(&ino).copied()
     }
 
     /// Allocate an outer file handle and map it through the bridge.
@@ -103,6 +91,7 @@ where
         let outer_ino = self.slots[slot_idx]
             .bridge
             .backward_or_insert_inode(inner_ino, || self.icache.allocate_inode());
+        self.inode_to_slot.insert(outer_ino, slot_idx);
         self.icache
             .entry_or_insert_icb(
                 outer_ino,
@@ -135,7 +124,7 @@ where
         ino: Inode,
         flags: OpenFlags,
     ) -> Result<OpenFile, OpenError> {
-        let idx = self.slot_for_inode(ino).await.ok_or_else(|| {
+        let idx = self.slot_for_inode(ino).ok_or_else(|| {
             warn!(ino, "open on inode not belonging to any child");
             OpenError::InodeNotFound
         })?;
@@ -168,7 +157,7 @@ where
         flags: OpenFlags,
         lock_owner: Option<LockOwner>,
     ) -> Result<Bytes, ReadError> {
-        let idx = self.slot_for_inode(ino).await.ok_or_else(|| {
+        let idx = self.slot_for_inode(ino).ok_or_else(|| {
             warn!(ino, "read on inode not belonging to any child");
             ReadError::InodeNotFound
         })?;
@@ -195,7 +184,7 @@ where
         flags: OpenFlags,
         flush: bool,
     ) -> Result<(), ReleaseError> {
-        let idx = self.slot_for_inode(ino).await.ok_or_else(|| {
+        let idx = self.slot_for_inode(ino).ok_or_else(|| {
             warn!(ino, "release on inode not belonging to any child");
             ReleaseError::FileNotOpen
         })?;
@@ -220,13 +209,14 @@ where
     #[must_use]
     #[instrument(name = "CompositeFs::delegated_forget", skip(self))]
     pub async fn delegated_forget(&mut self, ino: Inode, nlookups: u64) -> bool {
-        if let Some(idx) = self.slot_for_inode(ino).await
+        if let Some(idx) = self.slot_for_inode(ino)
             && let Some(&inner_ino) = self.slots[idx].bridge.inode_map_get_by_left(ino)
         {
             self.slots[idx].inner.forget(inner_ino, nlookups).await;
         }
         if self.icache.forget(ino, nlookups).await.is_some() {
             self.child_inodes.remove(&ino);
+            self.inode_to_slot.remove(&ino);
             for slot in &mut self.slots {
                 slot.bridge.remove_inode_by_left(ino);
             }
@@ -251,7 +241,6 @@ where
     ) -> Result<FileAttr, LookupError> {
         let idx = self
             .slot_for_inode(parent)
-            .await
             .ok_or(LookupError::InodeNotFound)?;
         let inner_parent = self.slots[idx]
             .bridge
@@ -277,13 +266,13 @@ where
     pub async fn delegated_readdir(&mut self, ino: Inode) -> Result<&[DirEntry], ReadDirError> {
         let idx = self
             .slot_for_inode(ino)
-            .await
             .ok_or(ReadDirError::InodeNotFound)?;
         let inner_ino = self.slots[idx]
             .bridge
             .forward_or_insert_inode(ino, || unreachable!("readdir: ino should be mapped"));
         let inner_entries = self.slots[idx].inner.readdir(inner_ino).await?;
         let inner_entries: Vec<DirEntry> = inner_entries.to_vec();
+        self.icache.evict_zero_rc_children(ino).await;
         let mut outer_entries = Vec::with_capacity(inner_entries.len());
         for entry in &inner_entries {
             let outer_child_ino = self

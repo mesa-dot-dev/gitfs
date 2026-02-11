@@ -9,6 +9,7 @@ use crate::fs::r#trait::{
 };
 
 /// Inode control block for mescloud filesystem layers.
+#[derive(Clone)]
 pub struct InodeControlBlock {
     pub parent: Option<Inode>,
     pub rc: u64,
@@ -191,6 +192,22 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         }
     }
 
+    /// Evict all `Available` children of `parent` that have `rc == 0`.
+    /// Returns the number of evicted entries.
+    pub async fn evict_zero_rc_children(&self, parent: Inode) -> usize {
+        let mut to_evict = Vec::new();
+        self.inner.for_each(|&ino, icb| {
+            if icb.rc == 0 && icb.parent == Some(parent) {
+                to_evict.push(ino);
+            }
+        });
+        let count = to_evict.len();
+        for ino in to_evict {
+            self.inner.forget(ino, 0).await;
+        }
+        count
+    }
+
     /// Find an existing child by (parent, name) or allocate a new inode.
     /// If new, inserts a stub ICB (parent+path set, attr=None, children=None, rc=0).
     /// Does NOT bump rc. Returns the inode number.
@@ -227,7 +244,10 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+
     use super::*;
+    use crate::fs::icache::async_cache::AsyncICache;
     use crate::fs::r#trait::DirEntryType;
 
     fn dummy_dir_attr(ino: Inode) -> FileAttr {
@@ -304,5 +324,99 @@ mod tests {
             children: Some(vec![]),
         };
         assert!(!icb.needs_resolve());
+    }
+
+    struct NoOpResolver;
+
+    impl IcbResolver for NoOpResolver {
+        type Icb = InodeControlBlock;
+        type Error = std::convert::Infallible;
+
+        #[expect(
+            clippy::manual_async_fn,
+            reason = "must match IcbResolver trait signature"
+        )]
+        fn resolve(
+            &self,
+            _ino: Inode,
+            _stub: Option<InodeControlBlock>,
+            _cache: &AsyncICache<Self>,
+        ) -> impl Future<Output = Result<InodeControlBlock, Self::Error>> + Send {
+            async { unreachable!("NoOpResolver should not be called") }
+        }
+    }
+
+    fn test_mescloud_cache() -> MescloudICache<NoOpResolver> {
+        MescloudICache::new(NoOpResolver, 1, (0, 0), 4096)
+    }
+
+    #[tokio::test]
+    async fn evict_zero_rc_children_removes_stubs() {
+        let cache = test_mescloud_cache();
+
+        // Insert stubs as children of root (ino=1) with rc=0
+        cache
+            .insert_icb(
+                10,
+                InodeControlBlock {
+                    rc: 0,
+                    path: "child_a".into(),
+                    parent: Some(1),
+                    attr: None,
+                    children: None,
+                },
+            )
+            .await;
+        cache
+            .insert_icb(
+                11,
+                InodeControlBlock {
+                    rc: 0,
+                    path: "child_b".into(),
+                    parent: Some(1),
+                    attr: None,
+                    children: None,
+                },
+            )
+            .await;
+
+        // Insert a child with rc > 0 — should survive
+        cache
+            .insert_icb(
+                12,
+                InodeControlBlock {
+                    rc: 1,
+                    path: "active".into(),
+                    parent: Some(1),
+                    attr: None,
+                    children: None,
+                },
+            )
+            .await;
+
+        // Insert a stub under a different parent — should survive
+        cache
+            .insert_icb(
+                20,
+                InodeControlBlock {
+                    rc: 0,
+                    path: "other".into(),
+                    parent: Some(12),
+                    attr: None,
+                    children: None,
+                },
+            )
+            .await;
+
+        let evicted = cache.evict_zero_rc_children(1).await;
+        assert_eq!(evicted, 2, "should evict 2 zero-rc children of root");
+
+        assert!(!cache.contains(10), "child_a should be evicted");
+        assert!(!cache.contains(11), "child_b should be evicted");
+        assert!(cache.contains(12), "active child should survive");
+        assert!(
+            cache.contains(20),
+            "child of different parent should survive"
+        );
     }
 }
