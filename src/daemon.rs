@@ -184,6 +184,9 @@ pub async fn run(
     config: app_config::Config,
     handle: tokio::runtime::Handle,
 ) -> Result<(), std::io::Error> {
+    // Fire-and-forget: errors are logged inside check_for_updates().
+    tokio::spawn(crate::updates::check_for_updates());
+
     // Spawn the cache if it doesn't exist.
     tokio::fs::create_dir_all(&config.cache.path).await?;
 

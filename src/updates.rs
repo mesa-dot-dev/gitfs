@@ -11,24 +11,26 @@ const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Check GitHub for the latest stable release and warn if this binary is outdated.
 ///
 /// This function never fails the application — it logs errors and returns.
-pub fn check_for_updates() {
+pub async fn check_for_updates() {
     let short_sha = &BUILD_SHA[..7.min(BUILD_SHA.len())];
     let running_version = format!("{PKG_VERSION}+{short_sha}");
 
-    let releases = match self_update::backends::github::ReleaseList::configure()
-        .repo_owner("mesa-dot-dev")
-        .repo_name("git-fs")
-        .build()
+    let releases = match tokio::task::spawn_blocking(|| {
+        self_update::backends::github::ReleaseList::configure()
+            .repo_owner("mesa-dot-dev")
+            .repo_name("git-fs")
+            .build()
+            .and_then(self_update::backends::github::ReleaseList::fetch)
+    })
+    .await
     {
-        Ok(list) => match list.fetch() {
-            Ok(releases) => releases,
-            Err(e) => {
-                error!("Could not check for updates: {e}");
-                return;
-            }
-        },
+        Ok(Ok(releases)) => releases,
+        Ok(Err(e)) => {
+            error!("Could not check for updates: {e}");
+            return;
+        }
         Err(e) => {
-            error!("Could not configure update check: {e}");
+            error!("Update check task failed: {e}");
             return;
         }
     };
