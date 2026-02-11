@@ -239,6 +239,26 @@ impl<R: IcbResolver> AsyncICache<R> {
         }
     }
 
+    /// Write an ICB back to the table only if the entry still exists.
+    ///
+    /// If the entry was evicted (vacant) during resolution, the result is
+    /// silently dropped — this prevents resurrecting entries that a concurrent
+    /// `forget` has already removed.
+    async fn write_back_if_present(&self, ino: Inode, icb: R::Icb) {
+        use scc::hash_map::Entry;
+        match self.inode_table.entry_async(ino).await {
+            Entry::Occupied(mut occ) => {
+                *occ.get_mut() = IcbState::Available(icb);
+            }
+            Entry::Vacant(_) => {
+                tracing::debug!(
+                    ino,
+                    "resolved inode was evicted during resolution, dropping result"
+                );
+            }
+        }
+    }
+
     /// Look up `ino`. If `Available` and fully resolved, run `then` and return
     /// `Ok(T)`. If `Available` but `needs_resolve()` is true (stub), extract
     /// the stub, resolve it, cache the result, then run `then`. If absent, call
@@ -302,17 +322,13 @@ impl<R: IcbResolver> AsyncICache<R> {
                                     unreachable!("then_fn consumed more than once")
                                 });
                                 let result = t(&icb);
-                                self.inode_table
-                                    .upsert_async(ino, IcbState::Available(icb))
-                                    .await;
+                                self.write_back_if_present(ino, icb).await;
                                 drop(tx);
                                 return Ok(result);
                             }
                             Err(e) => {
                                 if fallback.rc() > 0 {
-                                    self.inode_table
-                                        .upsert_async(ino, IcbState::Available(fallback))
-                                        .await;
+                                    self.write_back_if_present(ino, fallback).await;
                                 } else {
                                     self.inode_table.remove_async(&ino).await;
                                 }
@@ -337,9 +353,7 @@ impl<R: IcbResolver> AsyncICache<R> {
                                 .take()
                                 .unwrap_or_else(|| unreachable!("then_fn consumed more than once"));
                             let result = t(&icb);
-                            self.inode_table
-                                .upsert_async(ino, IcbState::Available(icb))
-                                .await;
+                            self.write_back_if_present(ino, icb).await;
                             drop(tx);
                             return Ok(result);
                         }
@@ -1206,5 +1220,98 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("task panicked: {e}"));
         assert_eq!(result, None, "evicted entry should return None");
+    }
+
+    /// Resolver that pauses mid-resolution via a `Notify`, allowing the test
+    /// to interleave a `forget` while the resolve future is suspended.
+    struct SlowResolver {
+        /// Signalled by the resolver once it has started (so the test knows
+        /// resolution is in progress).
+        started: Arc<tokio::sync::Notify>,
+        /// The resolver waits on this before returning (the test signals it
+        /// after calling `forget`).
+        proceed: Arc<tokio::sync::Notify>,
+    }
+
+    impl IcbResolver for SlowResolver {
+        type Icb = TestIcb;
+        type Error = String;
+
+        fn resolve(
+            &self,
+            _ino: Inode,
+            _stub: Option<Self::Icb>,
+            _cache: &AsyncICache<Self>,
+        ) -> impl Future<Output = Result<Self::Icb, Self::Error>> + Send {
+            let started = Arc::clone(&self.started);
+            let proceed = Arc::clone(&self.proceed);
+            async move {
+                started.notify_one();
+                proceed.notified().await;
+                Ok(TestIcb {
+                    rc: 1,
+                    path: "/slow-resolved".into(),
+                    resolved: true,
+                })
+            }
+        }
+    }
+
+    /// Regression test: an entry evicted by `forget` during an in-progress
+    /// `get_or_resolve` must NOT be resurrected when resolution completes.
+    #[tokio::test]
+    async fn get_or_resolve_does_not_resurrect_evicted_entry() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
+
+        let cache = Arc::new(AsyncICache::new(
+            SlowResolver {
+                started: Arc::clone(&started),
+                proceed: Arc::clone(&proceed),
+            },
+            1,
+            "/root",
+        ));
+
+        let ino: Inode = 42;
+
+        // Insert a stub with rc=1 (simulates a looked-up, unresolved entry).
+        cache
+            .insert_icb(
+                ino,
+                TestIcb {
+                    rc: 1,
+                    path: "/stub".into(),
+                    resolved: false,
+                },
+            )
+            .await;
+
+        // Spawn get_or_resolve which will trigger slow resolution.
+        let cache2 = Arc::clone(&cache);
+        let resolve_handle =
+            tokio::spawn(async move { cache2.get_or_resolve(ino, |icb| icb.path.clone()).await });
+
+        // Wait until the resolver has started (entry is now InFlight).
+        started.notified().await;
+
+        // Evict the entry while resolution is in progress.
+        // forget waits for InFlight, so we need to complete resolution for
+        // forget to proceed. Instead, remove the InFlight entry directly to
+        // simulate a concurrent eviction (e.g., by another path that already
+        // removed the entry).
+        cache.inode_table.remove_async(&ino).await;
+
+        // Let the resolver finish.
+        proceed.notify_one();
+
+        // Wait for get_or_resolve to complete.
+        drop(resolve_handle.await.expect("task panicked"));
+
+        // The entry must NOT have been resurrected by write_back_if_present.
+        assert!(
+            !cache.contains(ino),
+            "evicted entry must not be resurrected after resolution completes"
+        );
     }
 }
