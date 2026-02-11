@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 
 use bytes::Bytes;
-use tracing::{trace, warn};
+use tracing::{instrument, trace, warn};
 
 use crate::fs::icache::bridge::HashMapBridge;
 use crate::fs::icache::{FileTable, IcbResolver};
@@ -53,6 +53,7 @@ where
         + Sync,
 {
     /// Walk the parent chain to find which child slot owns an inode.
+    #[instrument(name = "CompositeFs::slot_for_inode", skip(self))]
     pub async fn slot_for_inode(&self, ino: Inode) -> Option<usize> {
         if let Some(&idx) = self.child_inodes.get(&ino) {
             return Some(idx);
@@ -81,6 +82,7 @@ where
 
     /// Translate an inner inode to an outer inode, allocating if needed.
     /// Also inserts a stub ICB into the outer icache when the inode is new.
+    #[instrument(name = "CompositeFs::translate_inner_ino", skip(self, name))]
     pub async fn translate_inner_ino(
         &mut self,
         slot_idx: usize,
@@ -108,6 +110,7 @@ where
     }
 
     /// Get cached file attributes for an inode.
+    #[instrument(name = "CompositeFs::delegated_getattr", skip(self))]
     pub async fn delegated_getattr(&self, ino: Inode) -> Result<FileAttr, GetAttrError> {
         self.icache.get_attr(ino).await.ok_or_else(|| {
             warn!(ino, "getattr on unknown inode");
@@ -116,6 +119,7 @@ where
     }
 
     /// Find slot, forward inode, delegate to inner, allocate outer file handle.
+    #[instrument(name = "CompositeFs::delegated_open", skip(self))]
     pub async fn delegated_open(
         &mut self,
         ino: Inode,
@@ -144,6 +148,7 @@ where
 
     /// Find slot, forward inode and file handle, delegate read to inner.
     #[expect(clippy::too_many_arguments, reason = "mirrors fuser read API")]
+    #[instrument(name = "CompositeFs::delegated_read", skip(self))]
     pub async fn delegated_read(
         &mut self,
         ino: Inode,
@@ -172,6 +177,7 @@ where
 
     /// Find slot, forward inode and file handle, delegate release to inner,
     /// then clean up the file handle mapping.
+    #[instrument(name = "CompositeFs::delegated_release", skip(self))]
     pub async fn delegated_release(
         &mut self,
         ino: Inode,
@@ -202,6 +208,7 @@ where
     /// Propagate forget to the inner filesystem, evict from icache, and clean
     /// up bridge mappings. Returns `true` if the inode was evicted.
     #[must_use]
+    #[instrument(name = "CompositeFs::delegated_forget", skip(self))]
     pub async fn delegated_forget(&mut self, ino: Inode, nlookups: u64) -> bool {
         if let Some(idx) = self.slot_for_inode(ino).await
             && let Some(&inner_ino) = self.slots[idx].bridge.inode_map_get_by_left(ino)
@@ -226,6 +233,7 @@ where
     }
 
     /// Delegation branch for lookup when the parent is owned by a child slot.
+    #[instrument(name = "CompositeFs::delegated_lookup", skip(self, name))]
     pub async fn delegated_lookup(
         &mut self,
         parent: Inode,
@@ -249,6 +257,7 @@ where
     }
 
     /// Delegation branch for readdir when the inode is owned by a child slot.
+    #[instrument(name = "CompositeFs::delegated_readdir", skip(self))]
     pub async fn delegated_readdir(&mut self, ino: Inode) -> Result<&[DirEntry], ReadDirError> {
         let idx = self
             .slot_for_inode(ino)

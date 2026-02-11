@@ -5,7 +5,7 @@ use std::future::Future;
 use scc::HashMap as ConcurrentHashMap;
 use tokio::sync::watch;
 
-use tracing::{trace, warn};
+use tracing::{instrument, trace, warn};
 
 use crate::fs::r#trait::Inode;
 
@@ -82,6 +82,7 @@ impl<R: IcbResolver> AsyncICache<R> {
     /// Wait until `ino` is `Available`.
     /// Returns `true` if the entry exists and is Available,
     /// `false` if the entry does not exist.
+    #[instrument(name = "AsyncICache::wait_for_available", skip(self))]
     async fn wait_for_available(&self, ino: Inode) -> bool {
         let rx = self
             .inode_table
@@ -118,6 +119,7 @@ impl<R: IcbResolver> AsyncICache<R> {
 
     /// Read an ICB via closure. **Awaits** if `InFlight`.
     /// Returns `None` if `ino` doesn't exist.
+    #[instrument(name = "AsyncICache::get_icb", skip(self, f))]
     pub async fn get_icb<T>(&self, ino: Inode, f: impl FnOnce(&R::Icb) -> T) -> Option<T> {
         if !self.wait_for_available(ino).await {
             return None;
@@ -133,6 +135,7 @@ impl<R: IcbResolver> AsyncICache<R> {
 
     /// Mutate an ICB via closure. **Awaits** if `InFlight`.
     /// Returns `None` if `ino` doesn't exist.
+    #[instrument(name = "AsyncICache::get_icb_mut", skip(self, f))]
     pub async fn get_icb_mut<T>(&self, ino: Inode, f: impl FnOnce(&mut R::Icb) -> T) -> Option<T> {
         if !self.wait_for_available(ino).await {
             return None;
@@ -147,6 +150,7 @@ impl<R: IcbResolver> AsyncICache<R> {
     }
 
     /// Insert an ICB directly as `Available` (overwrites any existing entry).
+    #[instrument(name = "AsyncICache::insert_icb", skip(self, icb))]
     pub async fn insert_icb(&self, ino: Inode, icb: R::Icb) {
         self.inode_table
             .upsert_async(ino, IcbState::Available(icb))
@@ -158,6 +162,7 @@ impl<R: IcbResolver> AsyncICache<R> {
     ///
     /// Both `factory` and `then` are `FnOnce` — wrapped in `Option` internally
     /// to satisfy the borrow checker across the await-loop.
+    #[instrument(name = "AsyncICache::entry_or_insert_icb", skip(self, factory, then))]
     pub async fn entry_or_insert_icb<T>(
         &self,
         ino: Inode,
@@ -202,6 +207,7 @@ impl<R: IcbResolver> AsyncICache<R> {
     ///
     /// Returns `Err(R::Error)` if resolution fails. On error the `InFlight`
     /// entry is removed so subsequent calls can retry.
+    #[instrument(name = "AsyncICache::get_or_resolve", skip(self, then))]
     pub async fn get_or_resolve<T>(
         &self,
         ino: Inode,
@@ -294,6 +300,7 @@ impl<R: IcbResolver> AsyncICache<R> {
     }
 
     /// Increment rc. **Awaits** `InFlight`. Panics if inode is missing.
+    #[instrument(name = "AsyncICache::inc_rc", skip(self))]
     pub async fn inc_rc(&self, ino: Inode) -> u64 {
         self.wait_for_available(ino).await;
         self.inode_table
@@ -310,6 +317,7 @@ impl<R: IcbResolver> AsyncICache<R> {
 
     /// Decrement rc by `nlookups`. If rc drops to zero, evicts and returns
     /// the ICB. **Awaits** `InFlight` entries.
+    #[instrument(name = "AsyncICache::forget", skip(self))]
     pub async fn forget(&self, ino: Inode, nlookups: u64) -> Option<R::Icb> {
         if !self.wait_for_available(ino).await {
             warn!(ino, "forget on unknown inode");

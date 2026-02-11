@@ -6,7 +6,7 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use mesa_dev::MesaClient;
 use secrecy::ExposeSecret as _;
-use tracing::{instrument, trace, warn};
+use tracing::{Instrument as _, instrument, trace, warn};
 
 use crate::fs::icache::bridge::HashMapBridge;
 use crate::fs::icache::{AsyncICache, FileTable, IcbResolver};
@@ -77,6 +77,7 @@ impl IcbResolver for MesaResolver {
                 ..stub
             })
         }
+        .instrument(tracing::info_span!("MesaResolver::resolve", ino))
     }
 }
 

@@ -10,7 +10,7 @@ use bytes::Bytes;
 use mesa_dev::MesaClient;
 use mesa_dev::low_level::content::{Content, DirEntry as MesaDirEntry};
 use num_traits::cast::ToPrimitive as _;
-use tracing::{instrument, trace, warn};
+use tracing::{Instrument as _, instrument, trace, warn};
 
 use crate::fs::icache::{AsyncICache, FileTable, IcbResolver};
 use crate::fs::r#trait::{
@@ -63,7 +63,7 @@ impl IcbResolver for RepoResolver {
                 .repos()
                 .at(&repo_name)
                 .content()
-                .get(Some(ref_.as_str()), file_path.as_deref(), None)
+                .get(Some(ref_.as_str()), file_path.as_deref(), Some(1u64))
                 .await
                 .map_err(MesaApiError::from)?;
 
@@ -122,6 +122,7 @@ impl IcbResolver for RepoResolver {
                 children,
             })
         }
+        .instrument(tracing::info_span!("RepoResolver::resolve", ino))
     }
 }
 

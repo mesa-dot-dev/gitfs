@@ -7,7 +7,7 @@ use bytes::Bytes;
 use futures::TryStreamExt as _;
 use mesa_dev::MesaClient;
 use secrecy::SecretString;
-use tracing::{instrument, trace, warn};
+use tracing::{Instrument as _, instrument, trace, warn};
 
 pub use super::common::{
     GetAttrError, LookupError, OpenError, ReadDirError, ReadError, ReleaseError,
@@ -64,6 +64,7 @@ impl IcbResolver for OrgResolver {
                 ..stub
             })
         }
+        .instrument(tracing::info_span!("OrgResolver::resolve", ino))
     }
 }
 
