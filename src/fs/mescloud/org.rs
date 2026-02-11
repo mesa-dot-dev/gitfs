@@ -123,25 +123,35 @@ impl OrgFs {
     /// TODO(MES-674): Cleanup "special" casing for github.
     async fn ensure_owner_inode(&mut self, owner: &str) -> (Inode, FileAttr) {
         // Check existing
+        let mut stale_ino = None;
         for (&ino, existing_owner) in &self.owner_inodes {
             if existing_owner == owner {
                 if let Some(attr) = self.composite.icache.get_attr(ino).await {
                     return (ino, attr);
                 }
-                let now = SystemTime::now();
-                let attr = FileAttr::Directory {
-                    common: mescloud_icache::make_common_file_attr(
-                        ino,
-                        0o755,
-                        now,
-                        now,
-                        self.composite.icache.fs_owner(),
-                        self.composite.icache.block_size(),
-                    ),
-                };
-                self.composite.icache.cache_attr(ino, attr).await;
-                return (ino, attr);
+                if self.composite.icache.contains(ino) {
+                    // ICB exists but attr missing — rebuild and cache
+                    let now = SystemTime::now();
+                    let attr = FileAttr::Directory {
+                        common: mescloud_icache::make_common_file_attr(
+                            ino,
+                            0o755,
+                            now,
+                            now,
+                            self.composite.icache.fs_owner(),
+                            self.composite.icache.block_size(),
+                        ),
+                    };
+                    self.composite.icache.cache_attr(ino, attr).await;
+                    return (ino, attr);
+                }
+                // ICB was evicted — mark for cleanup
+                stale_ino = Some(ino);
+                break;
             }
+        }
+        if let Some(ino) = stale_ino {
+            self.owner_inodes.remove(&ino);
         }
 
         // Allocate new

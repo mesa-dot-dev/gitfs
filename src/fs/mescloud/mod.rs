@@ -156,12 +156,14 @@ impl MesaFS {
     /// Does NOT bump rc.
     async fn ensure_org_inode(&mut self, org_idx: usize) -> (Inode, FileAttr) {
         // Check if an inode already exists.
-        if let Some((&existing_ino, _)) = self
+        let existing_ino = self
             .composite
             .child_inodes
             .iter()
             .find(|&(_, &idx)| idx == org_idx)
-        {
+            .map(|(&ino, _)| ino);
+
+        if let Some(existing_ino) = existing_ino {
             if let Some(attr) = self.composite.icache.get_attr(existing_ino).await {
                 let rc = self
                     .composite
@@ -175,24 +177,33 @@ impl MesaFS {
                 );
                 return (existing_ino, attr);
             }
-            // Attr missing — rebuild.
+            if self.composite.icache.contains(existing_ino) {
+                // ICB exists but attr missing — rebuild and cache.
+                warn!(
+                    ino = existing_ino,
+                    org_idx, "ensure_org_inode: attr missing, rebuilding"
+                );
+                let now = SystemTime::now();
+                let attr = FileAttr::Directory {
+                    common: mescloud_icache::make_common_file_attr(
+                        existing_ino,
+                        0o755,
+                        now,
+                        now,
+                        self.composite.icache.fs_owner(),
+                        self.composite.icache.block_size(),
+                    ),
+                };
+                self.composite.icache.cache_attr(existing_ino, attr).await;
+                return (existing_ino, attr);
+            }
+            // ICB was evicted — clean up stale tracking entries.
             warn!(
                 ino = existing_ino,
-                org_idx, "ensure_org_inode: attr missing, rebuilding"
+                org_idx, "ensure_org_inode: ICB evicted, cleaning up stale entry"
             );
-            let now = SystemTime::now();
-            let attr = FileAttr::Directory {
-                common: mescloud_icache::make_common_file_attr(
-                    existing_ino,
-                    0o755,
-                    now,
-                    now,
-                    self.composite.icache.fs_owner(),
-                    self.composite.icache.block_size(),
-                ),
-            };
-            self.composite.icache.cache_attr(existing_ino, attr).await;
-            return (existing_ino, attr);
+            self.composite.child_inodes.remove(&existing_ino);
+            self.composite.inode_to_slot.remove(&existing_ino);
         }
 
         // Allocate new.
