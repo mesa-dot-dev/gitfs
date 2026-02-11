@@ -271,7 +271,7 @@ impl RepoFs {
     /// subsequent readdir hits cache.
     pub(crate) fn prefetch_root(&self) {
         trace!(repo = %self.repo_name, "prefetch_root: warming root directory cache");
-        self.icache.spawn_prefetch([Self::ROOT_INO]);
+        self.icache.spawn_prefetch_readdir([Self::ROOT_INO]);
     }
 }
 
@@ -386,21 +386,18 @@ impl Fs for RepoFs {
             });
         }
 
-        let subdir_entries: Vec<(Inode, &str)> = entries
+        let subdir_inodes: Vec<Inode> = entries
             .iter()
             .filter(|e| e.kind == DirEntryType::Directory)
-            .map(|e| (e.ino, e.name.to_str().unwrap_or("<non-utf8>")))
+            .map(|e| e.ino)
             .collect();
-        if !subdir_entries.is_empty() {
-            let names: Vec<&str> = subdir_entries.iter().map(|(_, n)| *n).collect();
+        if !subdir_inodes.is_empty() {
             trace!(
                 ino,
-                subdir_count = subdir_entries.len(),
-                ?names,
-                "readdir: prefetching subdirectory children"
+                subdir_count = subdir_inodes.len(),
+                "readdir: prefetching subdirectory readdirs"
             );
-            let subdir_inodes: Vec<Inode> = subdir_entries.iter().map(|(ino, _)| *ino).collect();
-            self.icache.spawn_prefetch(subdir_inodes);
+            self.icache.spawn_prefetch_readdir(subdir_inodes);
         }
 
         self.readdir_buf = entries;

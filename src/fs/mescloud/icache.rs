@@ -190,14 +190,6 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         self.inner.cache.get_or_resolve(ino, then).await
     }
 
-    pub fn spawn_prefetch(&self, inodes: impl IntoIterator<Item = Inode>)
-    where
-        R: 'static,
-        R::Error: 'static,
-    {
-        self.inner.cache.spawn_prefetch(inodes);
-    }
-
     /// Maximum concurrent readdir prefetches.
     const MAX_READDIR_PREFETCH_CONCURRENCY: usize = 4;
 
@@ -262,7 +254,6 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
 
     /// Fire-and-forget: spawn background tasks that perform full readdir
     /// prefetch for the given directory inodes.
-    #[expect(dead_code, reason = "wired up in Task 5")]
     pub fn spawn_prefetch_readdir(&self, inodes: impl IntoIterator<Item = Inode>)
     where
         R: 'static,
