@@ -330,30 +330,6 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         }
     }
 
-    /// Evict all `Available` children of `parent` that have `rc == 0`.
-    /// Returns the list of evicted inode numbers so callers can clean up
-    /// associated state (e.g., bridge mappings, slot tracking).
-    #[cfg(test)]
-    pub async fn evict_zero_rc_children(&self, parent: Inode) -> Vec<Inode> {
-        let mut to_evict = Vec::new();
-        self.inner
-            .cache
-            .for_each(|&ino, icb| {
-                if icb.rc == 0 && icb.parent == Some(parent) {
-                    to_evict.push((ino, icb.path.as_os_str().to_os_string()));
-                }
-            })
-            .await;
-        let mut evicted = Vec::new();
-        for (ino, name) in to_evict {
-            if self.inner.cache.forget(ino, 0).await.is_some() {
-                self.inner.child_index.remove_async(&(parent, name)).await;
-                evicted.push(ino);
-            }
-        }
-        evicted
-    }
-
     /// Evict rc=0 children of `parent` that are NOT in `current_names`.
     /// Preserves prefetched children that are still part of the directory listing.
     /// Returns the list of evicted inode numbers so callers can clean up
@@ -558,80 +534,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evict_zero_rc_children_removes_stubs() {
-        let cache = test_mescloud_cache();
-
-        // Insert stubs as children of root (ino=1) with rc=0
-        cache
-            .insert_icb(
-                10,
-                InodeControlBlock {
-                    rc: 0,
-                    path: "child_a".into(),
-                    parent: Some(1),
-                    attr: None,
-                    children: None,
-                },
-            )
-            .await;
-        cache
-            .insert_icb(
-                11,
-                InodeControlBlock {
-                    rc: 0,
-                    path: "child_b".into(),
-                    parent: Some(1),
-                    attr: None,
-                    children: None,
-                },
-            )
-            .await;
-
-        // Insert a child with rc > 0 — should survive
-        cache
-            .insert_icb(
-                12,
-                InodeControlBlock {
-                    rc: 1,
-                    path: "active".into(),
-                    parent: Some(1),
-                    attr: None,
-                    children: None,
-                },
-            )
-            .await;
-
-        // Insert a stub under a different parent — should survive
-        cache
-            .insert_icb(
-                20,
-                InodeControlBlock {
-                    rc: 0,
-                    path: "other".into(),
-                    parent: Some(12),
-                    attr: None,
-                    children: None,
-                },
-            )
-            .await;
-
-        let evicted = cache.evict_zero_rc_children(1).await;
-        assert_eq!(evicted.len(), 2, "should evict 2 zero-rc children of root");
-
-        assert!(!cache.contains(10), "child_a should be evicted");
-        assert!(!cache.contains(11), "child_b should be evicted");
-        assert!(cache.contains(12), "active child should survive");
-        assert!(
-            cache.contains(20),
-            "child of different parent should survive"
-        );
-    }
-
-    #[tokio::test]
     async fn evict_cleans_child_index() {
         let cache = test_mescloud_cache();
         let ino1 = cache.ensure_child_ino(1, OsStr::new("temp")).await;
-        let evicted = cache.evict_zero_rc_children(1).await;
+        // Use evict_stale_children with empty set (evicts all rc=0 children)
+        let evicted = cache.evict_stale_children(1, &HashSet::new()).await;
         assert!(evicted.contains(&ino1));
         let ino2 = cache.ensure_child_ino(1, OsStr::new("temp")).await;
         assert_ne!(
