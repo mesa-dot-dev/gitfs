@@ -2,6 +2,8 @@
 //!
 //! This module directly accesses the mesa repo through the Rust SDK, on a per-repo basis.
 
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::future::Future;
 use std::{collections::HashMap, ffi::OsStr, path::PathBuf, time::SystemTime};
 
@@ -57,6 +59,12 @@ impl IcbResolver for RepoResolver {
         async move {
             let stub = stub.ok_or(LookupError::InodeNotFound)?;
             let file_path = build_repo_path(stub.parent, &stub.path, cache, RepoFs::ROOT_INO).await;
+
+            trace!(
+                ino,
+                path = file_path.as_deref().unwrap_or("<root>"),
+                "resolver: fetching content"
+            );
 
             // Non-root inodes must have a resolvable path.
             if stub.parent.is_some() && file_path.is_none() {
@@ -262,6 +270,7 @@ impl RepoFs {
     /// Spawn a background task to prefetch the root directory listing so
     /// subsequent readdir hits cache.
     pub(crate) fn prefetch_root(&self) {
+        trace!(repo = %self.repo_name, "prefetch_root: warming root directory cache");
         self.icache.spawn_prefetch([Self::ROOT_INO]);
     }
 }
@@ -343,7 +352,11 @@ impl Fs for RepoFs {
             "readdir: resolved directory listing from icache"
         );
 
-        self.icache.evict_zero_rc_children(ino).await;
+        let current_names: HashSet<OsString> = children
+            .iter()
+            .map(|(name, _)| OsString::from(name))
+            .collect();
+        self.icache.evict_stale_children(ino, &current_names).await;
 
         let mut entries = Vec::with_capacity(children.len());
         for (name, kind) in &children {
@@ -373,17 +386,20 @@ impl Fs for RepoFs {
             });
         }
 
-        let subdir_inodes: Vec<Inode> = entries
+        let subdir_entries: Vec<(Inode, &str)> = entries
             .iter()
             .filter(|e| e.kind == DirEntryType::Directory)
-            .map(|e| e.ino)
+            .map(|e| (e.ino, e.name.to_str().unwrap_or("<non-utf8>")))
             .collect();
-        if !subdir_inodes.is_empty() {
+        if !subdir_entries.is_empty() {
+            let names: Vec<&str> = subdir_entries.iter().map(|(_, n)| *n).collect();
             trace!(
                 ino,
-                subdir_count = subdir_inodes.len(),
+                subdir_count = subdir_entries.len(),
+                ?names,
                 "readdir: prefetching subdirectory children"
             );
+            let subdir_inodes: Vec<Inode> = subdir_entries.iter().map(|(ino, _)| *ino).collect();
             self.icache.spawn_prefetch(subdir_inodes);
         }
 

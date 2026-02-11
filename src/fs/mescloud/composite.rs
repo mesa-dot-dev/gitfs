@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::ffi::OsStr;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 
 use bytes::Bytes;
 use tracing::{instrument, trace, warn};
@@ -280,7 +280,9 @@ where
             .forward_or_insert_inode(ino, || unreachable!("readdir: ino should be mapped"));
         let inner_entries = self.slots[idx].inner.readdir(inner_ino).await?;
         let inner_entries: Vec<DirEntry> = inner_entries.to_vec();
-        let evicted = self.icache.evict_zero_rc_children(ino).await;
+        let current_names: HashSet<OsString> =
+            inner_entries.iter().map(|e| e.name.clone()).collect();
+        let evicted = self.icache.evict_stale_children(ino, &current_names).await;
         for evicted_ino in evicted {
             if let Some(slot) = self.inode_to_slot.remove(&evicted_ino) {
                 self.slots[slot].bridge.remove_inode_by_left(evicted_ino);

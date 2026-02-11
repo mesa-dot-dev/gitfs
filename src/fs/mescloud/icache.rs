@@ -1,5 +1,6 @@
 //! Mescloud-specific inode control block, helpers, and directory cache wrapper.
 
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -246,12 +247,44 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     /// Evict all `Available` children of `parent` that have `rc == 0`.
     /// Returns the list of evicted inode numbers so callers can clean up
     /// associated state (e.g., bridge mappings, slot tracking).
+    #[cfg(test)]
     pub async fn evict_zero_rc_children(&self, parent: Inode) -> Vec<Inode> {
         let mut to_evict = Vec::new();
         self.inner
             .cache
             .for_each(|&ino, icb| {
                 if icb.rc == 0 && icb.parent == Some(parent) {
+                    to_evict.push((ino, icb.path.as_os_str().to_os_string()));
+                }
+            })
+            .await;
+        let mut evicted = Vec::new();
+        for (ino, name) in to_evict {
+            if self.inner.cache.forget(ino, 0).await.is_some() {
+                self.inner.child_index.remove_async(&(parent, name)).await;
+                evicted.push(ino);
+            }
+        }
+        evicted
+    }
+
+    /// Evict rc=0 children of `parent` that are NOT in `current_names`.
+    /// Preserves prefetched children that are still part of the directory listing.
+    /// Returns the list of evicted inode numbers so callers can clean up
+    /// associated state (e.g., bridge mappings, slot tracking).
+    pub async fn evict_stale_children(
+        &self,
+        parent: Inode,
+        current_names: &HashSet<OsString>,
+    ) -> Vec<Inode> {
+        let mut to_evict = Vec::new();
+        self.inner
+            .cache
+            .for_each(|&ino, icb| {
+                if icb.rc == 0
+                    && icb.parent == Some(parent)
+                    && !current_names.contains(icb.path.as_os_str())
+                {
                     to_evict.push((ino, icb.path.as_os_str().to_os_string()));
                 }
             })
@@ -539,5 +572,31 @@ mod tests {
         assert!(evicted.is_some());
         let ino2 = cache.ensure_child_ino(1, OsStr::new("ephemeral")).await;
         assert_ne!(ino, ino2, "child_index should have been cleaned up");
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::similar_names,
+        reason = "bar_ino/baz_ino distinction is intentional"
+    )]
+    async fn evict_stale_children_preserves_current() {
+        use std::collections::HashSet;
+
+        let cache = test_mescloud_cache();
+
+        // Insert children of root via ensure_child_ino (populates child_index)
+        let foo_ino = cache.ensure_child_ino(1, OsStr::new("foo")).await;
+        let bar_ino = cache.ensure_child_ino(1, OsStr::new("bar")).await;
+        let baz_ino = cache.ensure_child_ino(1, OsStr::new("baz")).await;
+
+        // "foo" and "baz" are in the current listing; "bar" is stale
+        let current: HashSet<OsString> =
+            ["foo", "baz"].iter().copied().map(OsString::from).collect();
+        let evicted = cache.evict_stale_children(1, &current).await;
+
+        assert_eq!(evicted, vec![bar_ino], "only stale 'bar' should be evicted");
+        assert!(cache.contains(foo_ino), "current child 'foo' preserved");
+        assert!(!cache.contains(bar_ino), "stale child 'bar' evicted");
+        assert!(cache.contains(baz_ino), "current child 'baz' preserved");
     }
 }
