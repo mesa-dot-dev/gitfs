@@ -65,8 +65,17 @@ impl HashMapBridge {
 
     /// Rewrite the `ino` field in a [`FileAttr`] from right (inner) to left (outer) namespace.
     pub fn attr_backward(&self, attr: FileAttr) -> FileAttr {
-        let backward =
-            |ino: Inode| -> Inode { self.inode_map.get_by_right(&ino).copied().unwrap_or(ino) };
+        let backward = |ino: Inode| -> Inode {
+            if let Some(&left) = self.inode_map.get_by_right(&ino) {
+                left
+            } else {
+                tracing::warn!(
+                    inner_ino = ino,
+                    "attr_backward: no bridge mapping, using raw inner inode"
+                );
+                ino
+            }
+        };
         rewrite_attr_ino(attr, backward)
     }
 
