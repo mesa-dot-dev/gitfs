@@ -356,7 +356,14 @@ impl Fs for RepoFs {
             .iter()
             .map(|(name, _)| OsString::from(name))
             .collect();
-        self.icache.evict_stale_children(ino, &current_names).await;
+        let evicted = self.icache.evict_stale_children(ino, &current_names).await;
+        if !evicted.is_empty() {
+            trace!(
+                ino,
+                evicted_count = evicted.len(),
+                "readdir: evicted stale children"
+            );
+        }
 
         let mut entries = Vec::with_capacity(children.len());
         for (name, kind) in &children {

@@ -283,6 +283,13 @@ where
         let current_names: HashSet<OsString> =
             inner_entries.iter().map(|e| e.name.clone()).collect();
         let evicted = self.icache.evict_stale_children(ino, &current_names).await;
+        if !evicted.is_empty() {
+            trace!(
+                ino,
+                evicted_count = evicted.len(),
+                "delegated_readdir: evicted stale children"
+            );
+        }
         for evicted_ino in evicted {
             if let Some(slot) = self.inode_to_slot.remove(&evicted_ino) {
                 self.slots[slot].bridge.remove_inode_by_left(evicted_ino);

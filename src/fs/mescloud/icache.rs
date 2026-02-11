@@ -174,6 +174,7 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         if let Some(ref icb) = evicted
             && let Some(parent) = icb.parent
         {
+            trace!(ino, parent, path = %icb.path.display(), "forget: cleaning up child_index");
             self.inner
                 .child_index
                 .remove_async(&(parent, icb.path.as_os_str().to_os_string()))
@@ -358,6 +359,14 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
                 evicted.push(ino);
             }
         }
+        if !evicted.is_empty() {
+            trace!(
+                parent,
+                evicted_count = evicted.len(),
+                current_count = current_names.len(),
+                "evict_stale_children: removed stale entries"
+            );
+        }
         evicted
     }
 
@@ -373,7 +382,11 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
 
         let key = (parent, name.to_os_string());
         match self.inner.child_index.entry_async(key).await {
-            Entry::Occupied(occ) => *occ.get(),
+            Entry::Occupied(occ) => {
+                let ino = *occ.get();
+                trace!(parent, ?name, ino, "ensure_child_ino: cache hit");
+                ino
+            }
             Entry::Vacant(vac) => {
                 let ino = self.inner.inode_factory.allocate();
                 vac.insert_entry(ino);
@@ -390,6 +403,7 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
                         },
                     )
                     .await;
+                trace!(parent, ?name, ino, "ensure_child_ino: allocated new inode");
                 ino
             }
         }
