@@ -50,27 +50,34 @@ enum Command {
 
 /// Main entry point for the application.
 fn main() {
-    let trc_handle = Trc::default().init().unwrap_or_else(|e| {
-        eprintln!(
-            "Failed to initialize logging. Without logging, we can't provide any useful error \
-             messages, so we have to exit: {e}"
-        );
-        std::process::exit(1);
-    });
-
     let args = Args::parse();
+
+    // Load config first so telemetry settings are available for tracing init.
+    // Errors use eprintln since tracing isn't initialized yet.
     let config = Config::load_or_create(args.config_path.as_deref()).unwrap_or_else(|e| {
-        error!("Failed to load configuration: {e}");
+        eprintln!("Failed to load configuration: {e}");
         std::process::exit(1);
     });
     if let Err(error_messages) = config.validate() {
-        error!("Configuration is invalid.");
+        eprintln!("Configuration is invalid.");
         for msg in &error_messages {
-            error!(" - {msg}");
+            eprintln!(" - {msg}");
         }
-
         std::process::exit(1);
     }
+
+    let trc_handle = Trc::default()
+        .with_telemetry(&config.telemetry)
+        .init()
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "Failed to initialize logging. Without logging, we can't provide any useful error \
+                 messages, so we have to exit: {e}"
+            );
+            std::process::exit(1);
+        });
+
+    updates::check_for_updates();
 
     match args.command.unwrap_or(Command::Run { daemonize: false }) {
         Command::Run { daemonize } => {
@@ -81,8 +88,6 @@ fn main() {
 
             if daemonize {
                 debug!(config = ?config, "Initializing daemon with configuration...");
-                // It is safe to unwrap this Config.validate() guarantees that pid_file's parent
-                // exists.
                 // Safe: Config.validate() guarantees pid_file's parent exists.
                 let pid_file_parent = config.daemon.pid_file.parent().unwrap_or_else(|| {
                     unreachable!("Config.validate() ensures pid_file has a parent")

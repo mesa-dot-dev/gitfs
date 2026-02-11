@@ -119,10 +119,6 @@ impl Default for Trc {
 impl Trc {
     /// Configure OTLP telemetry endpoints from the application config.
     #[must_use]
-    #[expect(
-        dead_code,
-        reason = "used once main.rs wires telemetry config into Trc"
-    )]
     pub fn with_telemetry(mut self, telemetry: &TelemetryConfig) -> Self {
         self.otlp_endpoints = telemetry.endpoints();
         self
