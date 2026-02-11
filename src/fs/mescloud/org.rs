@@ -526,6 +526,18 @@ impl Fs for OrgFs {
                     });
                 }
 
+                let prefetch_count = entries
+                    .iter()
+                    .filter_map(|e| self.composite.child_inodes.get(&e.ino).copied())
+                    .inspect(|&idx| self.composite.slots[idx].inner.prefetch_root())
+                    .count();
+                if prefetch_count > 0 {
+                    trace!(
+                        count = prefetch_count,
+                        "readdir: prefetching repo root directories"
+                    );
+                }
+
                 self.composite.readdir_buf = entries;
                 Ok(&self.composite.readdir_buf)
             }

@@ -1,7 +1,9 @@
 //! Async inode cache with InFlight/Available state machine.
 
 use std::future::Future;
+use std::sync::Arc;
 
+use futures::future::join_all;
 use scc::HashMap as ConcurrentHashMap;
 use tokio::sync::watch;
 
@@ -60,13 +62,28 @@ pub trait IcbResolver: Send + Sync {
         Self: Sized;
 }
 
+/// Shared interior of [`AsyncICache`], behind an `Arc` so the cache can be
+/// cheaply cloned for fire-and-forget background work (e.g. `spawn_prefetch`).
+struct AsyncICacheInner<R: IcbResolver> {
+    resolver: R,
+    inode_table: ConcurrentHashMap<Inode, IcbState<R::Icb>>,
+}
+
 /// Async, concurrency-safe inode cache.
 ///
 /// All methods take `&self` — internal synchronization is provided by
-/// `scc::HashMap` (sharded lock-free map).
+/// `scc::HashMap` (sharded lock-free map). The cache is cheaply cloneable
+/// (via `Arc`) so that prefetch work can be spawned in the background.
 pub struct AsyncICache<R: IcbResolver> {
-    resolver: R,
-    inode_table: ConcurrentHashMap<Inode, IcbState<R::Icb>>,
+    inner: Arc<AsyncICacheInner<R>>,
+}
+
+impl<R: IcbResolver> Clone for AsyncICache<R> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 impl<R: IcbResolver> AsyncICache<R> {
@@ -79,14 +96,16 @@ impl<R: IcbResolver> AsyncICache<R> {
             IcbState::Available(R::Icb::new_root(root_path.into())),
         ));
         Self {
-            resolver,
-            inode_table: table,
+            inner: Arc::new(AsyncICacheInner {
+                resolver,
+                inode_table: table,
+            }),
         }
     }
 
     /// Number of entries (`InFlight` + `Available`) in the table.
     pub fn inode_count(&self) -> usize {
-        self.inode_table.len()
+        self.inner.inode_table.len()
     }
 
     /// Wait until `ino` is `Available`.
@@ -96,6 +115,7 @@ impl<R: IcbResolver> AsyncICache<R> {
     async fn wait_for_available(&self, ino: Inode) -> bool {
         loop {
             let rx = self
+                .inner
                 .inode_table
                 .read_async(&ino, |_, s| match s {
                     IcbState::InFlight(rx) => Some(rx.clone()),
@@ -123,7 +143,7 @@ impl<R: IcbResolver> AsyncICache<R> {
     /// This is a non-blocking, synchronous check. It does **not** wait for
     /// `InFlight` entries to resolve.
     pub fn contains(&self, ino: Inode) -> bool {
-        self.inode_table.contains_sync(&ino)
+        self.inner.inode_table.contains_sync(&ino)
     }
 
     /// Read an ICB via closure. **Awaits** if `InFlight`.
@@ -142,6 +162,7 @@ impl<R: IcbResolver> AsyncICache<R> {
                 return None;
             }
             let result = self
+                .inner
                 .inode_table
                 .read_async(&ino, |_, state| match state {
                     IcbState::Available(icb) => Some(f(icb)),
@@ -169,6 +190,7 @@ impl<R: IcbResolver> AsyncICache<R> {
                 return None;
             }
             let result = self
+                .inner
                 .inode_table
                 .update_async(&ino, |_, state| match state {
                     IcbState::Available(icb) => Some(f(icb)),
@@ -190,7 +212,7 @@ impl<R: IcbResolver> AsyncICache<R> {
         use scc::hash_map::Entry;
         let mut icb = Some(icb);
         loop {
-            match self.inode_table.entry_async(ino).await {
+            match self.inner.inode_table.entry_async(ino).await {
                 Entry::Vacant(vac) => {
                     let val = icb
                         .take()
@@ -233,7 +255,7 @@ impl<R: IcbResolver> AsyncICache<R> {
         let mut then_fn = Some(then);
 
         loop {
-            match self.inode_table.entry_async(ino).await {
+            match self.inner.inode_table.entry_async(ino).await {
                 Entry::Occupied(mut occ) => match occ.get_mut() {
                     IcbState::Available(icb) => {
                         let t = then_fn
@@ -270,7 +292,7 @@ impl<R: IcbResolver> AsyncICache<R> {
     /// `forget` has already removed.
     async fn write_back_if_present(&self, ino: Inode, icb: R::Icb) {
         use scc::hash_map::Entry;
-        match self.inode_table.entry_async(ino).await {
+        match self.inner.inode_table.entry_async(ino).await {
             Entry::Occupied(mut occ) => {
                 *occ.get_mut() = IcbState::Available(icb);
             }
@@ -304,6 +326,7 @@ impl<R: IcbResolver> AsyncICache<R> {
         // Fast path: Available and fully resolved
         {
             let hit = self
+                .inner
                 .inode_table
                 .read_async(&ino, |_, s| match s {
                     IcbState::Available(icb) if !icb.needs_resolve() => {
@@ -322,7 +345,7 @@ impl<R: IcbResolver> AsyncICache<R> {
 
         // Slow path: missing, InFlight, or stub needing resolution
         loop {
-            match self.inode_table.entry_async(ino).await {
+            match self.inner.inode_table.entry_async(ino).await {
                 Entry::Occupied(mut occ) => match occ.get_mut() {
                     IcbState::Available(icb) if !icb.needs_resolve() => {
                         let t = then_fn
@@ -340,7 +363,7 @@ impl<R: IcbResolver> AsyncICache<R> {
                         let fallback = stub.clone();
                         drop(occ); // release shard lock before awaiting
 
-                        match self.resolver.resolve(ino, Some(stub), self).await {
+                        match self.inner.resolver.resolve(ino, Some(stub), self).await {
                             Ok(icb) => {
                                 let t = then_fn.take().unwrap_or_else(|| {
                                     unreachable!("then_fn consumed more than once")
@@ -354,7 +377,7 @@ impl<R: IcbResolver> AsyncICache<R> {
                                 if fallback.rc() > 0 {
                                     self.write_back_if_present(ino, fallback).await;
                                 } else {
-                                    self.inode_table.remove_async(&ino).await;
+                                    self.inner.inode_table.remove_async(&ino).await;
                                 }
                                 drop(tx);
                                 return Err(e);
@@ -371,7 +394,7 @@ impl<R: IcbResolver> AsyncICache<R> {
                     let (tx, rx) = watch::channel(());
                     vac.insert_entry(IcbState::InFlight(rx));
 
-                    match self.resolver.resolve(ino, None, self).await {
+                    match self.inner.resolver.resolve(ino, None, self).await {
                         Ok(icb) => {
                             let t = then_fn
                                 .take()
@@ -382,7 +405,7 @@ impl<R: IcbResolver> AsyncICache<R> {
                             return Ok(result);
                         }
                         Err(e) => {
-                            self.inode_table.remove_async(&ino).await;
+                            self.inner.inode_table.remove_async(&ino).await;
                             drop(tx);
                             return Err(e);
                         }
@@ -409,6 +432,7 @@ impl<R: IcbResolver> AsyncICache<R> {
                 return None;
             }
             let result = self
+                .inner
                 .inode_table
                 .update_async(&ino, |_, state| match state {
                     IcbState::Available(icb) => {
@@ -441,7 +465,7 @@ impl<R: IcbResolver> AsyncICache<R> {
         use scc::hash_map::Entry;
 
         loop {
-            match self.inode_table.entry_async(ino).await {
+            match self.inner.inode_table.entry_async(ino).await {
                 Entry::Occupied(mut occ) => match occ.get_mut() {
                     IcbState::Available(icb) => {
                         if icb.rc() <= nlookups {
@@ -470,7 +494,8 @@ impl<R: IcbResolver> AsyncICache<R> {
     /// Synchronous mutable access to an `Available` entry.
     /// Does **not** wait for `InFlight`. Intended for initialization.
     pub fn get_icb_mut_sync<T>(&self, ino: Inode, f: impl FnOnce(&mut R::Icb) -> T) -> Option<T> {
-        self.inode_table
+        self.inner
+            .inode_table
             .update_sync(&ino, |_, state| match state {
                 IcbState::Available(icb) => Some(f(icb)),
                 IcbState::InFlight(_) => None,
@@ -478,10 +503,47 @@ impl<R: IcbResolver> AsyncICache<R> {
             .flatten()
     }
 
+    /// Concurrently resolve multiple inodes, best-effort.
+    ///
+    /// Each inode is resolved via [`get_or_resolve`] which handles
+    /// `InFlight`-coalescing and stub-upgrade logic. Errors are silently
+    /// ignored because prefetch is a performance optimization: a failure
+    /// simply means the subsequent access will pay the full API latency.
+    pub async fn prefetch(&self, inodes: impl IntoIterator<Item = Inode>) {
+        let futs: Vec<_> = inodes
+            .into_iter()
+            .map(|ino| async move {
+                drop(self.get_or_resolve(ino, |_| ()).await);
+            })
+            .collect();
+        join_all(futs).await;
+    }
+
+    /// Fire-and-forget variant of [`prefetch`](Self::prefetch).
+    ///
+    /// Spawns the prefetch work on the tokio runtime and returns immediately,
+    /// so the caller is never blocked waiting for API responses.
+    pub fn spawn_prefetch(&self, inodes: impl IntoIterator<Item = Inode>)
+    where
+        R: 'static,
+        R::Icb: 'static,
+        R::Error: 'static,
+    {
+        let inodes: Vec<_> = inodes.into_iter().collect();
+        if inodes.is_empty() {
+            return;
+        }
+        let cache = self.clone();
+        tokio::spawn(async move {
+            cache.prefetch(inodes).await;
+        });
+    }
+
     /// Iterate over all `Available` entries (skips `InFlight`).
     /// Async-safe iteration using `iter_async` to avoid contention on single-threaded runtimes.
     pub async fn for_each(&self, mut f: impl FnMut(&Inode, &R::Icb)) {
-        self.inode_table
+        self.inner
+            .inode_table
             .iter_async(|ino, state| {
                 if let IcbState::Available(icb) = state {
                     f(ino, icb);
@@ -693,6 +755,7 @@ mod tests {
         let cache = Arc::new(test_cache());
         let (tx, rx) = watch::channel(());
         cache
+            .inner
             .inode_table
             .upsert_async(42, IcbState::InFlight(rx))
             .await;
@@ -717,6 +780,7 @@ mod tests {
 
         // Complete the InFlight from the resolver side (write directly)
         cache
+            .inner
             .inode_table
             .upsert_async(
                 42,
@@ -921,6 +985,7 @@ mod tests {
         // Directly insert an InFlight entry for testing iteration
         let (_tx, rx) = watch::channel(());
         cache
+            .inner
             .inode_table
             .upsert_async(42, IcbState::InFlight(rx))
             .await;
@@ -941,12 +1006,14 @@ mod tests {
         // Insert InFlight manually, then immediately complete before anyone waits
         let (tx, rx) = watch::channel(());
         cache
+            .inner
             .inode_table
             .upsert_async(42, IcbState::InFlight(rx))
             .await;
 
         // Complete before any waiter (simulate resolver by writing directly)
         cache
+            .inner
             .inode_table
             .upsert_async(
                 42,
@@ -1129,6 +1196,7 @@ mod tests {
         let cache = Arc::new(test_cache());
         let (tx, rx) = watch::channel(());
         cache
+            .inner
             .inode_table
             .upsert_async(42, IcbState::InFlight(rx))
             .await;
@@ -1141,6 +1209,7 @@ mod tests {
 
         // Simulate resolver completing (write directly to inode_table)
         cache
+            .inner
             .inode_table
             .upsert_async(
                 42,
@@ -1200,6 +1269,7 @@ mod tests {
         let cache = Arc::new(test_cache());
         let (tx, rx) = watch::channel(());
         cache
+            .inner
             .inode_table
             .upsert_async(42, IcbState::InFlight(rx))
             .await;
@@ -1209,6 +1279,7 @@ mod tests {
 
         // Simulate resolver completing by writing directly to inode_table
         cache
+            .inner
             .inode_table
             .upsert_async(
                 42,
@@ -1236,6 +1307,7 @@ mod tests {
         let cache = Arc::new(test_cache());
         let (tx, rx) = watch::channel(());
         cache
+            .inner
             .inode_table
             .upsert_async(42, IcbState::InFlight(rx))
             .await;
@@ -1244,7 +1316,7 @@ mod tests {
         let handle = tokio::spawn(async move { cache2.inc_rc(42).await });
 
         // Evict instead of completing
-        cache.inode_table.remove_async(&42).await;
+        cache.inner.inode_table.remove_async(&42).await;
         drop(tx);
 
         let result = handle
@@ -1300,6 +1372,7 @@ mod tests {
         // Phase 1: insert an InFlight entry.
         let (tx1, rx1) = watch::channel(());
         cache
+            .inner
             .inode_table
             .upsert_async(ino, IcbState::InFlight(rx1))
             .await;
@@ -1317,6 +1390,7 @@ mod tests {
         // re-entering InFlight for a second resolution).
         let (tx2, rx2) = watch::channel(());
         cache
+            .inner
             .inode_table
             .upsert_async(ino, IcbState::InFlight(rx2))
             .await;
@@ -1329,6 +1403,7 @@ mod tests {
 
         // Phase 2 complete: write the final resolved value.
         cache
+            .inner
             .inode_table
             .upsert_async(
                 ino,
@@ -1393,7 +1468,7 @@ mod tests {
         // forget to proceed. Instead, remove the InFlight entry directly to
         // simulate a concurrent eviction (e.g., by another path that already
         // removed the entry).
-        cache.inode_table.remove_async(&ino).await;
+        cache.inner.inode_table.remove_async(&ino).await;
 
         // Let the resolver finish.
         proceed.notify_one();
@@ -1406,5 +1481,129 @@ mod tests {
             !cache.contains(ino),
             "evicted entry must not be resurrected after resolution completes"
         );
+    }
+
+    #[tokio::test]
+    async fn prefetch_resolves_multiple_inodes() {
+        let resolver = TestResolver::new();
+        for ino in [10, 11, 12] {
+            resolver.add(
+                ino,
+                TestIcb {
+                    rc: 0,
+                    path: format!("/dir{ino}").into(),
+                    resolved: true,
+                },
+            );
+        }
+        let cache = test_cache_with(resolver);
+
+        for ino in [10, 11, 12] {
+            cache
+                .insert_icb(
+                    ino,
+                    TestIcb {
+                        rc: 0,
+                        path: format!("/dir{ino}").into(),
+                        resolved: false,
+                    },
+                )
+                .await;
+        }
+
+        cache.prefetch([10, 11, 12]).await;
+
+        for ino in [10, 11, 12] {
+            let is_resolved = cache.get_icb(ino, |icb| icb.resolved).await;
+            assert_eq!(
+                is_resolved,
+                Some(true),
+                "inode {ino} should be resolved after prefetch"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prefetch_skips_already_resolved() {
+        let cache = test_cache();
+        // Root (ino=1) is already resolved -- prefetch should be a no-op
+        cache.prefetch([1]).await;
+        let path = cache.get_icb(1, |icb| icb.path.clone()).await;
+        assert_eq!(path, Some(PathBuf::from("/root")));
+    }
+
+    #[tokio::test]
+    async fn prefetch_ignores_errors() {
+        let resolver = TestResolver::new();
+        resolver.add(
+            10,
+            TestIcb {
+                rc: 0,
+                path: "/ok".into(),
+                resolved: true,
+            },
+        );
+        resolver.add_err(11, "network error");
+        let cache = test_cache_with(resolver);
+
+        for (ino, path) in [(10, "/stub10"), (11, "/stub11")] {
+            cache
+                .insert_icb(
+                    ino,
+                    TestIcb {
+                        rc: 0,
+                        path: path.into(),
+                        resolved: false,
+                    },
+                )
+                .await;
+        }
+
+        cache.prefetch([10, 11]).await;
+
+        let is_resolved = cache.get_icb(10, |icb| icb.resolved).await;
+        assert_eq!(is_resolved, Some(true), "ino 10 should be resolved");
+        // ino 11 failed with rc=0 -> removed by get_or_resolve error path
+        assert!(
+            !cache.contains(11),
+            "ino 11 should be removed after error with rc=0"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefetch_does_not_modify_rc() {
+        let resolver = TestResolver::new();
+        resolver.add(
+            10,
+            TestIcb {
+                rc: 0,
+                path: "/dir".into(),
+                resolved: true,
+            },
+        );
+        let cache = test_cache_with(resolver);
+
+        cache
+            .insert_icb(
+                10,
+                TestIcb {
+                    rc: 0,
+                    path: "/stub".into(),
+                    resolved: false,
+                },
+            )
+            .await;
+
+        cache.prefetch([10]).await;
+
+        let rc = cache.get_icb(10, IcbLike::rc).await;
+        assert_eq!(rc, Some(0), "prefetch must not modify rc");
+    }
+
+    #[tokio::test]
+    async fn prefetch_empty_is_noop() {
+        let cache = test_cache();
+        cache.prefetch(std::iter::empty()).await;
+        assert_eq!(cache.inode_count(), 1, "empty prefetch changes nothing");
     }
 }

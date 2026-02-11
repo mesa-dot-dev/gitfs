@@ -258,6 +258,12 @@ impl RepoFs {
         let joined: PathBuf = components.iter().collect();
         joined.to_str().map(String::from)
     }
+
+    /// Spawn a background task to prefetch the root directory listing so
+    /// subsequent readdir hits cache.
+    pub(crate) fn prefetch_root(&self) {
+        self.icache.spawn_prefetch([Self::ROOT_INO]);
+    }
 }
 
 #[async_trait::async_trait]
@@ -365,6 +371,20 @@ impl Fs for RepoFs {
                 name: name.clone().into(),
                 kind: *kind,
             });
+        }
+
+        let subdir_inodes: Vec<Inode> = entries
+            .iter()
+            .filter(|e| e.kind == DirEntryType::Directory)
+            .map(|e| e.ino)
+            .collect();
+        if !subdir_inodes.is_empty() {
+            trace!(
+                ino,
+                subdir_count = subdir_inodes.len(),
+                "readdir: prefetching subdirectory children"
+            );
+            self.icache.spawn_prefetch(subdir_inodes);
         }
 
         self.readdir_buf = entries;

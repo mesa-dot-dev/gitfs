@@ -150,6 +150,14 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         self.inner.get_or_resolve(ino, then).await
     }
 
+    pub fn spawn_prefetch(&self, inodes: impl IntoIterator<Item = Inode>)
+    where
+        R: 'static,
+        R::Error: 'static,
+    {
+        self.inner.spawn_prefetch(inodes);
+    }
+
     // -- Domain-specific --
 
     /// Allocate a new inode number.
