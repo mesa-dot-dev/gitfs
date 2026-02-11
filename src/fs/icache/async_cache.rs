@@ -24,6 +24,16 @@ pub enum IcbState<I> {
     Available(I),
 }
 
+impl<I> IcbState<I> {
+    /// Consume `self`, returning the inner value if `Available`, or `None` if `InFlight`.
+    fn into_available(self) -> Option<I> {
+        match self {
+            Self::Available(inner) => Some(inner),
+            Self::InFlight(_) => None,
+        }
+    }
+}
+
 /// Trait for resolving an inode to its control block.
 ///
 /// Implementations act as a "promise" that an ICB will eventually be produced
@@ -903,6 +913,23 @@ mod tests {
             1,
             "should coalesce to 1 resolve call"
         );
+    }
+
+    #[test]
+    fn icb_state_into_available_returns_inner() {
+        let state = IcbState::Available(TestIcb {
+            rc: 1,
+            path: "/test".into(),
+            resolved: true,
+        });
+        assert!(state.into_available().is_some());
+    }
+
+    #[test]
+    fn icb_state_into_available_returns_none_for_inflight() {
+        let (_tx, rx) = watch::channel(());
+        let state: IcbState<TestIcb> = IcbState::InFlight(rx);
+        assert!(state.into_available().is_none());
     }
 
     #[tokio::test]
