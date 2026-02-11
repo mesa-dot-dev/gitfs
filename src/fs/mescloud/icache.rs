@@ -82,6 +82,7 @@ pub struct MescloudICache<R: IcbResolver<Icb = InodeControlBlock>> {
     inode_factory: InodeFactory,
     fs_owner: (u32, u32),
     block_size: u32,
+    child_ino_lock: tokio::sync::Mutex<()>,
 }
 
 impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
@@ -92,6 +93,7 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
             inode_factory: InodeFactory::new(root_ino + 1),
             fs_owner,
             block_size,
+            child_ino_lock: tokio::sync::Mutex::new(()),
         };
 
         // Set root directory attr synchronously during initialization
@@ -218,13 +220,11 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     /// If new, inserts a stub ICB (parent+path set, attr=None, children=None, rc=0).
     /// Does NOT bump rc. Returns the inode number.
     ///
-    /// # Safety invariant
-    ///
-    /// The `for_each` scan and `insert_icb` are **not** atomic. If two callers
-    /// race with the same `(parent, name)`, both may allocate distinct inodes
-    /// for the same logical child. This is currently safe because all callers
-    /// go through `&mut self` on the owning `Fs` implementation.
+    /// A `tokio::sync::Mutex` serializes access so that concurrent callers
+    /// with the same `(parent, name)` do not allocate duplicate inodes.
     pub async fn ensure_child_ino(&self, parent: Inode, name: &OsStr) -> Inode {
+        let _guard = self.child_ino_lock.lock().await;
+
         // Search for existing child by parent + name
         let mut existing_ino = None;
         self.inner
@@ -433,5 +433,21 @@ mod tests {
             cache.contains(20),
             "child of different parent should survive"
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_child_ino_concurrent_same_name_returns_same_ino() {
+        let cache = test_mescloud_cache();
+        let parent = 1; // root
+
+        let futs: Vec<_> = (0..50)
+            .map(|_| cache.ensure_child_ino(parent, OsStr::new("same_child")))
+            .collect();
+        let results = futures::future::join_all(futs).await;
+
+        let first = results[0];
+        for (i, &ino) in results.iter().enumerate() {
+            assert_eq!(ino, first, "concurrent call {i} returned different inode");
+        }
     }
 }

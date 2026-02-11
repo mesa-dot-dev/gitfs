@@ -758,6 +758,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "parking_lot",
  "rand",
  "reqwest",
  "reqwest-middleware",
