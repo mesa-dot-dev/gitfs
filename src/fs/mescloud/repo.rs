@@ -55,7 +55,7 @@ impl IcbResolver for RepoResolver {
         let block_size = self.block_size;
 
         async move {
-            let stub = stub.unwrap_or_else(|| unreachable!("RepoResolver requires a stub ICB"));
+            let stub = stub.ok_or(LookupError::InodeNotFound)?;
             let file_path = build_repo_path(stub.parent, &stub.path, cache, RepoFs::ROOT_INO).await;
 
             // Non-root inodes must have a resolvable path.
