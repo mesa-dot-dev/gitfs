@@ -3,9 +3,8 @@
 //! The tracing subscriber is built with a [`reload::Layer`] wrapping the fmt layer so that the
 //! output format can be switched at runtime (e.g. from pretty mode to ugly mode when daemonizing).
 
-#[cfg(feature = "__otlp_export")]
 use opentelemetry::trace::TracerProvider as _;
-#[cfg(feature = "__otlp_export")]
+use opentelemetry_otlp::WithExportConfig as _;
 use opentelemetry_sdk::Resource;
 use tracing_indicatif::IndicatifLayer;
 use tracing_subscriber::{
@@ -16,6 +15,7 @@ use tracing_subscriber::{
     util::{SubscriberInitExt as _, TryInitError},
 };
 
+use crate::app_config::TelemetryConfig;
 use crate::term;
 
 /// The type-erased fmt layer that lives inside the reload handle.
@@ -43,11 +43,9 @@ impl TrcMode {
 /// A handle that allows reconfiguring the tracing subscriber at runtime.
 pub struct TrcHandle {
     fmt_handle: FmtReloadHandle,
-    #[cfg(feature = "__otlp_export")]
     tracer_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
 }
 
-#[cfg(feature = "__otlp_export")]
 impl Drop for TrcHandle {
     fn drop(&mut self) {
         if let Some(provider) = self.tracer_provider.take()
@@ -94,6 +92,7 @@ impl TrcHandle {
 pub struct Trc {
     mode: TrcMode,
     env_filter: EnvFilter,
+    otlp_endpoints: Vec<String>,
 }
 
 impl Default for Trc {
@@ -104,29 +103,65 @@ impl Default for Trc {
 
         match maybe_env_filter {
             Ok(env_filter) => Self {
-                // If the user provided an env_filter, they probably know what they're doing and
-                // don't want any fancy formatting, spinners or bullshit like that. So we default
-                // to the ugly mode.
                 mode: TrcMode::Ugly { use_ansi },
                 env_filter,
+                otlp_endpoints: Vec::new(),
             },
             Err(_) => Self {
-                // If the user didn't provide an env_filter, we assume they just want a nice
-                // out-of-the-box experience, and default to 丑 mode with an info level filter.
                 mode: TrcMode::丑 { use_ansi },
                 env_filter: EnvFilter::new("info"),
+                otlp_endpoints: Vec::new(),
             },
         }
     }
 }
 
 impl Trc {
+    /// Configure OTLP telemetry endpoints from the application config.
+    #[must_use]
+    #[expect(
+        dead_code,
+        reason = "used once main.rs wires telemetry config into Trc"
+    )]
+    pub fn with_telemetry(mut self, telemetry: &TelemetryConfig) -> Self {
+        self.otlp_endpoints = telemetry.endpoints();
+        self
+    }
+
+    /// Build the OpenTelemetry tracer provider if any OTLP endpoints are configured.
+    fn build_otel_provider(&self) -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
+        if self.otlp_endpoints.is_empty() {
+            return None;
+        }
+
+        let resource = Resource::builder_empty()
+            .with_service_name("git-fs")
+            .build();
+        let mut builder =
+            opentelemetry_sdk::trace::SdkTracerProvider::builder().with_resource(resource);
+
+        for endpoint in &self.otlp_endpoints {
+            match opentelemetry_otlp::SpanExporter::builder()
+                .with_http()
+                .with_endpoint(endpoint)
+                .build()
+            {
+                Ok(exporter) => {
+                    builder = builder.with_batch_exporter(exporter);
+                }
+                Err(e) => {
+                    eprintln!("Failed to create OTLP exporter for {endpoint}: {e}");
+                }
+            }
+        }
+
+        Some(builder.build())
+    }
+
     /// Initialize the global tracing subscriber and return a handle for runtime reconfiguration.
     pub fn init(self) -> Result<TrcHandle, TryInitError> {
         let use_ansi = self.mode.use_ansi();
 
-        // Start with a plain ugly-mode layer as a placeholder. In 丑 mode this gets swapped
-        // out before `try_init` is called so the subscriber never actually uses it.
         let initial_layer: BoxedFmtLayer = Box::new(
             tracing_subscriber::fmt::layer()
                 .with_ansi(use_ansi)
@@ -134,12 +169,11 @@ impl Trc {
         );
 
         let (reload_layer, fmt_handle) = reload::Layer::new(initial_layer);
-        #[cfg(feature = "__otlp_export")]
-        let mut tracer_provider = None;
+        let provider = self.build_otel_provider();
 
         match self.mode {
             TrcMode::丑 { .. } => {
-                let indicatif_layer = IndicatifLayer::new();
+                let indicatif_layer = IndicatifLayer::new().with_max_progress_bars(24, None);
                 let pretty_with_indicatif: BoxedFmtLayer = Box::new(
                     tracing_subscriber::fmt::layer()
                         .with_ansi(use_ansi)
@@ -149,66 +183,37 @@ impl Trc {
                         .compact(),
                 );
 
-                // Replace the initial placeholder with the correct writer before init.
                 if let Err(e) = fmt_handle.reload(pretty_with_indicatif) {
                     eprintln!("Failed to configure 丑-mode writer: {e}");
                 }
 
+                let otel_layer = provider
+                    .as_ref()
+                    .map(|p| tracing_opentelemetry::layer().with_tracer(p.tracer("git-fs")));
+
                 tracing_subscriber::registry()
                     .with(reload_layer)
+                    .with(otel_layer)
                     .with(self.env_filter)
                     .with(indicatif_layer)
                     .try_init()?;
             }
             TrcMode::Ugly { .. } => {
-                #[cfg(feature = "__otlp_export")]
-                {
-                    let exporter = opentelemetry_otlp::SpanExporter::builder()
-                        .with_http()
-                        .build()
-                        .ok();
+                let otel_layer = provider
+                    .as_ref()
+                    .map(|p| tracing_opentelemetry::layer().with_tracer(p.tracer("git-fs")));
 
-                    if let Some(exporter) = exporter {
-                        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-                            .with_batch_exporter(exporter)
-                            .with_resource(
-                                Resource::builder_empty()
-                                    .with_service_name("git-fs")
-                                    .build(),
-                            )
-                            .build();
-                        let tracer = provider.tracer("git-fs");
-                        let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-
-                        tracing_subscriber::registry()
-                            .with(reload_layer)
-                            .with(otel_layer)
-                            .with(self.env_filter)
-                            .try_init()?;
-
-                        tracer_provider = Some(provider);
-                    } else {
-                        tracing_subscriber::registry()
-                            .with(reload_layer)
-                            .with(self.env_filter)
-                            .try_init()?;
-                    }
-                }
-
-                #[cfg(not(feature = "__otlp_export"))]
-                {
-                    tracing_subscriber::registry()
-                        .with(reload_layer)
-                        .with(self.env_filter)
-                        .try_init()?;
-                }
+                tracing_subscriber::registry()
+                    .with(reload_layer)
+                    .with(otel_layer)
+                    .with(self.env_filter)
+                    .try_init()?;
             }
         }
 
         Ok(TrcHandle {
             fmt_handle,
-            #[cfg(feature = "__otlp_export")]
-            tracer_provider,
+            tracer_provider: provider,
         })
     }
 }

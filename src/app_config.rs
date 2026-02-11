@@ -334,9 +334,7 @@ impl Default for DaemonConfig {
 }
 
 /// The Mesa telemetry endpoint.
-#[allow(clippy::allow_attributes)]
-#[allow(dead_code)]
-const MESA_TELEMETRY_ENDPOINT: &str = "https://telemetry.priv.mesa.dev";
+pub const MESA_TELEMETRY_ENDPOINT: &str = "https://telemetry.priv.mesa.dev";
 
 /// Telemetry configuration for exporting OpenTelemetry traces.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -352,8 +350,6 @@ pub struct TelemetryConfig {
 impl TelemetryConfig {
     /// Returns the list of OTLP endpoints to export traces to.
     #[must_use]
-    #[allow(clippy::allow_attributes)]
-    #[allow(dead_code)]
     pub fn endpoints(&self) -> Vec<String> {
         let mut endpoints = Vec::new();
         if self.vendor {
