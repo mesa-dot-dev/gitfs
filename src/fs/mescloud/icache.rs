@@ -1,7 +1,9 @@
 //! Mescloud-specific inode control block, helpers, and directory cache wrapper.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::time::SystemTime;
+
+use scc::HashMap as ConcurrentHashMap;
 
 use crate::fs::icache::{AsyncICache, IcbLike, IcbResolver, InodeFactory};
 use crate::fs::r#trait::{
@@ -80,6 +82,10 @@ pub fn make_common_file_attr(
 pub struct MescloudICache<R: IcbResolver<Icb = InodeControlBlock>> {
     inner: AsyncICache<R>,
     inode_factory: InodeFactory,
+    /// O(1) lookup from (parent inode, child name) to child inode.
+    /// Maintained alongside the inode table to avoid linear scans in
+    /// `ensure_child_ino` and to provide atomicity under concurrent access.
+    child_index: ConcurrentHashMap<(Inode, OsString), Inode>,
     fs_owner: (u32, u32),
     block_size: u32,
 }
@@ -90,6 +96,7 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         let cache = Self {
             inner: AsyncICache::new(resolver, root_ino, "/"),
             inode_factory: InodeFactory::new(root_ino + 1),
+            child_index: ConcurrentHashMap::new(),
             fs_owner,
             block_size,
         };
@@ -139,7 +146,15 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     }
 
     pub async fn forget(&self, ino: Inode, nlookups: u64) -> Option<InodeControlBlock> {
-        self.inner.forget(ino, nlookups).await
+        let evicted = self.inner.forget(ino, nlookups).await;
+        if let Some(ref icb) = evicted
+            && let Some(parent) = icb.parent
+        {
+            self.child_index
+                .remove_async(&(parent, icb.path.as_os_str().to_os_string()))
+                .await;
+        }
+        evicted
     }
 
     pub async fn get_or_resolve<T>(
@@ -209,13 +224,14 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         self.inner
             .for_each(|&ino, icb| {
                 if icb.rc == 0 && icb.parent == Some(parent) {
-                    to_evict.push(ino);
+                    to_evict.push((ino, icb.path.as_os_str().to_os_string()));
                 }
             })
             .await;
         let mut evicted = Vec::new();
-        for ino in to_evict {
+        for (ino, name) in to_evict {
             if self.inner.forget(ino, 0).await.is_some() {
+                self.child_index.remove_async(&(parent, name)).await;
                 evicted.push(ino);
             }
         }
@@ -226,48 +242,40 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     /// If new, inserts a stub ICB (parent+path set, attr=None, children=None, rc=0).
     /// Does NOT bump rc. Returns the inode number.
     ///
-    /// # Safety invariant
-    ///
-    /// The `for_each` scan and `insert_icb` are **not** atomic. If two callers
-    /// race with the same `(parent, name)`, both may allocate distinct inodes
-    /// for the same logical child. This is currently safe because all callers
-    /// go through `&mut self` on the owning `Fs` implementation.
+    /// Thread-safe: uses `child_index` with `entry_async` for atomic
+    /// check-and-insert, so concurrent callers for the same (parent, name)
+    /// always receive the same inode.
     pub async fn ensure_child_ino(&self, parent: Inode, name: &OsStr) -> Inode {
-        // Search for existing child by parent + name
-        let mut existing_ino = None;
-        self.inner
-            .for_each(|&ino, icb| {
-                if icb.parent == Some(parent) && icb.path.as_os_str() == name {
-                    existing_ino = Some(ino);
-                }
-            })
-            .await;
+        use scc::hash_map::Entry;
 
-        if let Some(ino) = existing_ino {
-            return ino;
+        let key = (parent, name.to_os_string());
+        match self.child_index.entry_async(key).await {
+            Entry::Occupied(occ) => *occ.get(),
+            Entry::Vacant(vac) => {
+                let ino = self.inode_factory.allocate();
+                vac.insert_entry(ino);
+                self.inner
+                    .insert_icb(
+                        ino,
+                        InodeControlBlock {
+                            rc: 0,
+                            path: name.into(),
+                            parent: Some(parent),
+                            attr: None,
+                            children: None,
+                        },
+                    )
+                    .await;
+                ino
+            }
         }
-
-        // Allocate new inode and insert stub
-        let ino = self.inode_factory.allocate();
-        self.inner
-            .insert_icb(
-                ino,
-                InodeControlBlock {
-                    rc: 0,
-                    path: name.into(),
-                    parent: Some(parent),
-                    attr: None,
-                    children: None,
-                },
-            )
-            .await;
-        ino
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::future::Future;
+    use std::sync::Arc;
 
     use super::*;
     use crate::fs::icache::async_cache::AsyncICache;
@@ -374,6 +382,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_child_ino_is_idempotent() {
+        let cache = test_mescloud_cache();
+        let ino1 = cache.ensure_child_ino(1, OsStr::new("foo")).await;
+        let ino2 = cache.ensure_child_ino(1, OsStr::new("foo")).await;
+        assert_eq!(ino1, ino2, "same (parent, name) must return same inode");
+    }
+
+    #[tokio::test]
+    async fn ensure_child_ino_concurrent_same_child() {
+        let cache = Arc::new(test_mescloud_cache());
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let c = Arc::clone(&cache);
+            handles.push(tokio::spawn(async move {
+                c.ensure_child_ino(1, OsStr::new("bar")).await
+            }));
+        }
+        let inodes: Vec<Inode> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|e| panic!("task panicked: {e}")))
+            .collect();
+        assert!(
+            inodes.iter().all(|&i| i == inodes[0]),
+            "all concurrent calls must return the same inode: {inodes:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn evict_zero_rc_children_removes_stubs() {
         let cache = test_mescloud_cache();
 
@@ -441,5 +478,28 @@ mod tests {
             cache.contains(20),
             "child of different parent should survive"
         );
+    }
+
+    #[tokio::test]
+    async fn evict_cleans_child_index() {
+        let cache = test_mescloud_cache();
+        let ino1 = cache.ensure_child_ino(1, OsStr::new("temp")).await;
+        let evicted = cache.evict_zero_rc_children(1).await;
+        assert!(evicted.contains(&ino1));
+        let ino2 = cache.ensure_child_ino(1, OsStr::new("temp")).await;
+        assert_ne!(
+            ino1, ino2,
+            "after eviction, a new inode should be allocated"
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_cleans_child_index() {
+        let cache = test_mescloud_cache();
+        let ino = cache.ensure_child_ino(1, OsStr::new("ephemeral")).await;
+        let evicted = cache.forget(ino, 0).await;
+        assert!(evicted.is_some());
+        let ino2 = cache.ensure_child_ino(1, OsStr::new("ephemeral")).await;
+        assert_ne!(ino, ino2, "child_index should have been cleaned up");
     }
 }
