@@ -94,27 +94,26 @@ impl<R: IcbResolver> AsyncICache<R> {
     /// `false` if the entry does not exist.
     #[instrument(name = "AsyncICache::wait_for_available", skip(self))]
     async fn wait_for_available(&self, ino: Inode) -> bool {
-        let rx = self
-            .inode_table
-            .read_async(&ino, |_, s| match s {
-                IcbState::InFlight(rx) => Some(rx.clone()),
-                IcbState::Available(_) => None,
-            })
-            .await;
+        loop {
+            let rx = self
+                .inode_table
+                .read_async(&ino, |_, s| match s {
+                    IcbState::InFlight(rx) => Some(rx.clone()),
+                    IcbState::Available(_) => None,
+                })
+                .await;
 
-        match rx {
-            None => false,      // key missing
-            Some(None) => true, // Available
-            Some(Some(mut rx)) => {
-                // Wait for the resolver to complete (or fail/drop sender).
-                // changed() returns Err(RecvError) when sender is dropped,
-                // which is fine — it means resolution finished.
-                let _ = rx.changed().await;
-                // Re-check: entry is now Available or was removed on error.
-                self.inode_table
-                    .read_async(&ino, |_, s| matches!(s, IcbState::Available(_)))
-                    .await
-                    .unwrap_or(false)
+            match rx {
+                None => return false,      // key missing
+                Some(None) => return true, // Available
+                Some(Some(mut rx)) => {
+                    // Wait for the resolver to complete (or fail/drop sender).
+                    // changed() returns Err(RecvError) when sender is dropped,
+                    // which is fine — it means resolution finished.
+                    let _ = rx.changed().await;
+                    // Loop back — the entry might be InFlight again if another
+                    // resolution cycle started between our wakeup and re-read.
+                }
             }
         }
     }
@@ -130,33 +129,58 @@ impl<R: IcbResolver> AsyncICache<R> {
     /// Read an ICB via closure. **Awaits** if `InFlight`.
     /// Returns `None` if `ino` doesn't exist.
     #[instrument(name = "AsyncICache::get_icb", skip(self, f))]
-    pub async fn get_icb<T>(&self, ino: Inode, f: impl FnOnce(&R::Icb) -> T) -> Option<T> {
-        if !self.wait_for_available(ino).await {
-            return None;
+    // `Sync` is required because `f` is held across `.await` points in the
+    // loop body; for the resulting future to be `Send`, the captured closure
+    // must be `Sync` (clippy::future_not_send).
+    pub async fn get_icb<T>(
+        &self,
+        ino: Inode,
+        f: impl Fn(&R::Icb) -> T + Send + Sync,
+    ) -> Option<T> {
+        loop {
+            if !self.wait_for_available(ino).await {
+                return None;
+            }
+            let result = self
+                .inode_table
+                .read_async(&ino, |_, state| match state {
+                    IcbState::Available(icb) => Some(f(icb)),
+                    IcbState::InFlight(_) => None,
+                })
+                .await;
+            match result {
+                Some(Some(val)) => return Some(val),
+                Some(None) => {}     // was InFlight, retry
+                None => return None, // key missing
+            }
         }
-        self.inode_table
-            .read_async(&ino, |_, state| match state {
-                IcbState::Available(icb) => Some(f(icb)),
-                IcbState::InFlight(_) => None,
-            })
-            .await
-            .flatten()
     }
 
     /// Mutate an ICB via closure. **Awaits** if `InFlight`.
     /// Returns `None` if `ino` doesn't exist.
     #[instrument(name = "AsyncICache::get_icb_mut", skip(self, f))]
-    pub async fn get_icb_mut<T>(&self, ino: Inode, f: impl FnOnce(&mut R::Icb) -> T) -> Option<T> {
-        if !self.wait_for_available(ino).await {
-            return None;
+    pub async fn get_icb_mut<T>(
+        &self,
+        ino: Inode,
+        mut f: impl FnMut(&mut R::Icb) -> T + Send,
+    ) -> Option<T> {
+        loop {
+            if !self.wait_for_available(ino).await {
+                return None;
+            }
+            let result = self
+                .inode_table
+                .update_async(&ino, |_, state| match state {
+                    IcbState::Available(icb) => Some(f(icb)),
+                    IcbState::InFlight(_) => None,
+                })
+                .await;
+            match result {
+                Some(Some(val)) => return Some(val),
+                Some(None) => {}     // was InFlight, retry
+                None => return None, // key missing
+            }
         }
-        self.inode_table
-            .update_async(&ino, |_, state| match state {
-                IcbState::Available(icb) => Some(f(icb)),
-                IcbState::InFlight(_) => None,
-            })
-            .await
-            .flatten()
     }
 
     /// Insert an ICB directly as `Available`. If the entry is currently
@@ -1255,6 +1279,68 @@ mod tests {
                 })
             }
         }
+    }
+
+    /// Regression test: `get_icb` must survive the entry cycling back to
+    /// `InFlight` between when `wait_for_available` returns and when
+    /// `read_async` runs. The loop in `get_icb` should retry and eventually
+    /// return the final resolved value.
+    #[tokio::test]
+    async fn wait_for_available_retries_on_re_inflight() {
+        let cache = Arc::new(test_cache());
+        let ino: Inode = 42;
+
+        // Phase 1: insert an InFlight entry.
+        let (tx1, rx1) = watch::channel(());
+        cache
+            .inode_table
+            .upsert_async(ino, IcbState::InFlight(rx1))
+            .await;
+
+        // Spawn get_icb — it will wait for InFlight to resolve.
+        let cache_get = Arc::clone(&cache);
+        let get_handle =
+            tokio::spawn(async move { cache_get.get_icb(ino, |icb| icb.path.clone()).await });
+
+        // Give get_icb time to start waiting on the watch channel.
+        tokio::task::yield_now().await;
+
+        // Phase 1 complete: transition to Available briefly, then immediately
+        // back to InFlight (simulates get_or_resolve finding a stub and
+        // re-entering InFlight for a second resolution).
+        let (tx2, rx2) = watch::channel(());
+        cache
+            .inode_table
+            .upsert_async(ino, IcbState::InFlight(rx2))
+            .await;
+        // Signal phase-1 watchers so get_icb wakes up; it will re-read the
+        // entry and find InFlight again, then loop back to wait.
+        drop(tx1);
+
+        // Give get_icb time to re-enter the wait loop.
+        tokio::task::yield_now().await;
+
+        // Phase 2 complete: write the final resolved value.
+        cache
+            .inode_table
+            .upsert_async(
+                ino,
+                IcbState::Available(TestIcb {
+                    rc: 1,
+                    path: "/fully-resolved".into(),
+                    resolved: true,
+                }),
+            )
+            .await;
+        drop(tx2);
+
+        // get_icb should return the final resolved value (not None).
+        let result = get_handle.await.expect("get_icb task panicked");
+        assert_eq!(
+            result,
+            Some(PathBuf::from("/fully-resolved")),
+            "get_icb must survive re-InFlight and return the final resolved value"
+        );
     }
 
     /// Regression test: an entry evicted by `forget` during an in-progress

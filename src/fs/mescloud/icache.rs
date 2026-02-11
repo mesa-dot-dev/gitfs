@@ -115,7 +115,8 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     pub async fn get_icb<T>(
         &self,
         ino: Inode,
-        f: impl FnOnce(&InodeControlBlock) -> T,
+        // `Sync` required: see comment on `AsyncICache::get_icb`.
+        f: impl Fn(&InodeControlBlock) -> T + Send + Sync,
     ) -> Option<T> {
         self.inner.get_icb(ino, f).await
     }
