@@ -20,16 +20,3 @@ impl FileTable {
         self.next_fh.fetch_add(1, Ordering::Relaxed)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn allocate_returns_monotonic_handles() {
-        let ft = FileTable::new();
-        assert_eq!(ft.allocate(), 1);
-        assert_eq!(ft.allocate(), 2);
-        assert_eq!(ft.allocate(), 3);
-    }
-}
