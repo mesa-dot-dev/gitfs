@@ -238,7 +238,9 @@ impl<R: IcbResolver> AsyncICache<R> {
                 .inode_table
                 .read_async(&ino, |_, s| match s {
                     IcbState::Available(icb) if !icb.needs_resolve() => {
-                        let t = then_fn.take().unwrap_or_else(|| unreachable!());
+                        let t = then_fn
+                            .take()
+                            .unwrap_or_else(|| unreachable!("then_fn consumed more than once"));
                         Some(t(icb))
                     }
                     IcbState::InFlight(_) | IcbState::Available(_) => None,
@@ -254,21 +256,25 @@ impl<R: IcbResolver> AsyncICache<R> {
             match self.inode_table.entry_async(ino).await {
                 Entry::Occupied(mut occ) => match occ.get_mut() {
                     IcbState::Available(icb) if !icb.needs_resolve() => {
-                        let t = then_fn.take().unwrap_or_else(|| unreachable!());
+                        let t = then_fn
+                            .take()
+                            .unwrap_or_else(|| unreachable!("then_fn consumed more than once"));
                         return Ok(t(icb));
                     }
                     IcbState::Available(_) => {
                         // Stub needing resolution — extract stub, replace with InFlight
                         let (tx, rx) = watch::channel(());
                         let old = std::mem::replace(occ.get_mut(), IcbState::InFlight(rx));
-                        let IcbState::Available(stub) = old else {
-                            unreachable!()
-                        };
+                        let stub = old.into_available().unwrap_or_else(|| {
+                            unreachable!("matched Available arm, replaced value must be Available")
+                        });
                         drop(occ); // release shard lock before awaiting
 
                         match self.resolver.resolve(ino, Some(stub), self).await {
                             Ok(icb) => {
-                                let t = then_fn.take().unwrap_or_else(|| unreachable!());
+                                let t = then_fn.take().unwrap_or_else(|| {
+                                    unreachable!("then_fn consumed more than once")
+                                });
                                 let result = t(&icb);
                                 self.inode_table
                                     .upsert_async(ino, IcbState::Available(icb))
@@ -295,7 +301,9 @@ impl<R: IcbResolver> AsyncICache<R> {
 
                     match self.resolver.resolve(ino, None, self).await {
                         Ok(icb) => {
-                            let t = then_fn.take().unwrap_or_else(|| unreachable!());
+                            let t = then_fn
+                                .take()
+                                .unwrap_or_else(|| unreachable!("then_fn consumed more than once"));
                             let result = t(&icb);
                             self.inode_table
                                 .upsert_async(ino, IcbState::Available(icb))

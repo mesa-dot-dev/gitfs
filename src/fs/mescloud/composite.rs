@@ -21,11 +21,21 @@ pub(super) struct ChildSlot<Inner> {
     pub bridge: HashMapBridge,
 }
 
-/// Generic compositing filesystem that delegates to child `Inner` filesystems.
+/// Layered filesystem that presents multiple child filesystems under a single
+/// inode namespace.
 ///
-/// Holds the shared infrastructure (icache, file table, readdir buffer, child
-/// slots) and implements all the delegation methods that `MesaFS` and `OrgFs`
-/// previously duplicated.
+/// MesaCloud's filesystem is a hierarchy of compositions:
+///
+/// ```text
+/// MesaFS  (CompositeFs<_, OrgFs>)
+///  └─ OrgFs  (CompositeFs<_, RepoFs>)
+///      └─ RepoFs  (leaf — backed by git)
+/// ```
+///
+/// Each child filesystem numbers its inodes starting from 1, so the composite
+/// maintains a bidirectional inode/file-handle bridge per child (see
+/// [`ChildSlot`]) to translate between the outer namespace visible to FUSE and
+/// each child's internal namespace.
 pub(super) struct CompositeFs<R, Inner>
 where
     R: IcbResolver<Icb = InodeControlBlock>,
