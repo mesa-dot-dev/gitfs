@@ -187,7 +187,9 @@ impl<R: IcbResolver> AsyncICache<R> {
             match self.inode_table.entry_async(ino).await {
                 Entry::Occupied(mut occ) => match occ.get_mut() {
                     IcbState::Available(icb) => {
-                        let t = then_fn.take().unwrap_or_else(|| unreachable!());
+                        let t = then_fn
+                            .take()
+                            .unwrap_or_else(|| unreachable!("then_fn consumed more than once"));
                         return t(icb);
                     }
                     IcbState::InFlight(rx) => {
@@ -197,13 +199,16 @@ impl<R: IcbResolver> AsyncICache<R> {
                     }
                 },
                 Entry::Vacant(vac) => {
-                    let f = factory.take().unwrap_or_else(|| unreachable!());
-                    let mut occ = vac.insert_entry(IcbState::Available(f()));
-                    if let IcbState::Available(icb) = occ.get_mut() {
-                        let t = then_fn.take().unwrap_or_else(|| unreachable!());
-                        return t(icb);
-                    }
-                    unreachable!("just inserted Available");
+                    let f = factory
+                        .take()
+                        .unwrap_or_else(|| unreachable!("factory consumed more than once"));
+                    let t = then_fn
+                        .take()
+                        .unwrap_or_else(|| unreachable!("then_fn consumed more than once"));
+                    let mut icb = f();
+                    let result = t(&mut icb);
+                    vac.insert_entry(IcbState::Available(icb));
+                    return result;
                 }
             }
         }
