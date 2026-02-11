@@ -1307,9 +1307,9 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "mesa-dev"
-version = "1.8.0"
+version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb5d4651070e6257276f86eb0737bfe37bd6a6a73f7de827fca4efaef55da091"
+checksum = "0685415ca22ab4f72a6a3f0f720fcca0c69d295d2a95a40cd3ce92555103d3a1"
 dependencies = [
  "async-stream",
  "futures-core",
@@ -1319,6 +1319,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_path_to_error",
+ "tracing",
 ]
 
 [[package]]
