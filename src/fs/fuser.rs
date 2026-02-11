@@ -154,7 +154,7 @@ where
     F::ReaddirError: Into<i32>,
     F::ReleaseError: Into<i32>,
 {
-    #[instrument(skip(self, _req, reply))]
+    #[instrument(name = "FuserAdapter::lookup", skip(self, _req, reply))]
     fn lookup(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -178,7 +178,7 @@ where
         }
     }
 
-    #[instrument(skip(self, _req, fh, reply))]
+    #[instrument(name = "FuserAdapter::getattr", skip(self, _req, fh, reply))]
     fn getattr(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -198,7 +198,7 @@ where
         }
     }
 
-    #[instrument(skip(self, _req, _fh, offset, reply))]
+    #[instrument(name = "FuserAdapter::readdir", skip(self, _req, _fh, offset, reply))]
     fn readdir(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -243,7 +243,7 @@ where
         reply.ok();
     }
 
-    #[instrument(skip(self, _req, flags, reply))]
+    #[instrument(name = "FuserAdapter::open", skip(self, _req, flags, reply))]
     fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
         match self.runtime.block_on(self.fs.open(ino, flags.into())) {
             Ok(open_file) => {
@@ -257,7 +257,10 @@ where
         }
     }
 
-    #[instrument(skip(self, _req, fh, offset, size, flags, lock_owner, reply))]
+    #[instrument(
+        name = "FuserAdapter::read",
+        skip(self, _req, fh, offset, size, flags, lock_owner, reply)
+    )]
     fn read(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -290,7 +293,7 @@ where
         }
     }
 
-    #[instrument(skip(self, _req, _lock_owner, reply))]
+    #[instrument(name = "FuserAdapter::release", skip(self, _req, _lock_owner, reply))]
     fn release(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -316,12 +319,12 @@ where
         }
     }
 
-    #[instrument(skip(self, _req, nlookup))]
+    #[instrument(name = "FuserAdapter::forget", skip(self, _req, nlookup))]
     fn forget(&mut self, _req: &fuser::Request<'_>, ino: u64, nlookup: u64) {
         self.runtime.block_on(self.fs.forget(ino, nlookup));
     }
 
-    #[instrument(skip(self, _req, _ino, reply))]
+    #[instrument(name = "FuserAdapter::statfs", skip(self, _req, _ino, reply))]
     fn statfs(&mut self, _req: &fuser::Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
         self.runtime.block_on(async {
             match self.fs.statfs().await {

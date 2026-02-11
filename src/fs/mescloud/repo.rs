@@ -2,6 +2,7 @@
 //!
 //! This module directly accesses the mesa repo through the Rust SDK, on a per-repo basis.
 
+use std::future::Future;
 use std::{collections::HashMap, ffi::OsStr, path::PathBuf, time::SystemTime};
 
 use base64::Engine as _;
@@ -9,8 +10,9 @@ use bytes::Bytes;
 use mesa_dev::MesaClient;
 use mesa_dev::low_level::content::{Content, DirEntry as MesaDirEntry};
 use num_traits::cast::ToPrimitive as _;
-use tracing::{instrument, trace, warn};
+use tracing::{Instrument as _, instrument, trace, warn};
 
+use crate::fs::icache::{AsyncICache, FileTable, IcbResolver};
 use crate::fs::r#trait::{
     DirEntry, DirEntryType, FileAttr, FileHandle, FileOpenOptions, FilesystemStats, Fs, Inode,
     LockOwner, OpenFile, OpenFlags,
@@ -21,7 +23,151 @@ pub use super::common::{
     GetAttrError, LookupError, OpenError, ReadDirError, ReadError, ReleaseError,
 };
 use super::icache as mescloud_icache;
-use super::icache::MescloudICache;
+use super::icache::{InodeControlBlock, MescloudICache};
+
+pub(super) struct RepoResolver {
+    client: MesaClient,
+    org_name: String,
+    repo_name: String,
+    ref_: String,
+    fs_owner: (u32, u32),
+    block_size: u32,
+}
+
+impl IcbResolver for RepoResolver {
+    type Icb = InodeControlBlock;
+    type Error = LookupError;
+
+    fn resolve(
+        &self,
+        ino: Inode,
+        stub: Option<InodeControlBlock>,
+        cache: &AsyncICache<Self>,
+    ) -> impl Future<Output = Result<InodeControlBlock, LookupError>> + Send
+    where
+        Self: Sized,
+    {
+        let client = self.client.clone();
+        let org_name = self.org_name.clone();
+        let repo_name = self.repo_name.clone();
+        let ref_ = self.ref_.clone();
+        let fs_owner = self.fs_owner;
+        let block_size = self.block_size;
+
+        async move {
+            let stub = stub.ok_or(LookupError::InodeNotFound)?;
+            let file_path = build_repo_path(stub.parent, &stub.path, cache, RepoFs::ROOT_INO).await;
+
+            // Non-root inodes must have a resolvable path.
+            if stub.parent.is_some() && file_path.is_none() {
+                return Err(LookupError::InodeNotFound);
+            }
+
+            let content = client
+                .org(&org_name)
+                .repos()
+                .at(&repo_name)
+                .content()
+                .get(Some(ref_.as_str()), file_path.as_deref(), Some(1u64))
+                .await
+                .map_err(MesaApiError::from)?;
+
+            let now = SystemTime::now();
+            let attr = match &content {
+                Content::File(f) => {
+                    let size = f.size.to_u64().unwrap_or(0);
+                    FileAttr::RegularFile {
+                        common: mescloud_icache::make_common_file_attr(
+                            ino, 0o644, now, now, fs_owner, block_size,
+                        ),
+                        size,
+                        blocks: mescloud_icache::blocks_of_size(block_size, size),
+                    }
+                }
+                Content::Symlink(s) => {
+                    let size = s.size.to_u64().unwrap_or(0);
+                    FileAttr::RegularFile {
+                        common: mescloud_icache::make_common_file_attr(
+                            ino, 0o644, now, now, fs_owner, block_size,
+                        ),
+                        size,
+                        blocks: mescloud_icache::blocks_of_size(block_size, size),
+                    }
+                }
+                Content::Dir(_) => FileAttr::Directory {
+                    common: mescloud_icache::make_common_file_attr(
+                        ino, 0o755, now, now, fs_owner, block_size,
+                    ),
+                },
+            };
+
+            let children = match content {
+                Content::Dir(d) => Some(
+                    d.entries
+                        .into_iter()
+                        .filter_map(|e| {
+                            let (name, kind) = match e {
+                                MesaDirEntry::File(f) => (f.name?, DirEntryType::RegularFile),
+                                // TODO(MES-712): return DirEntryType::Symlink once readlink is wired up.
+                                MesaDirEntry::Symlink(s) => (s.name?, DirEntryType::RegularFile),
+                                MesaDirEntry::Dir(d) => (d.name?, DirEntryType::Directory),
+                            };
+                            Some((name, kind))
+                        })
+                        .collect(),
+                ),
+                Content::File(_) | Content::Symlink(_) => None,
+            };
+
+            Ok(InodeControlBlock {
+                parent: stub.parent,
+                path: stub.path,
+                rc: stub.rc,
+                attr: Some(attr),
+                children,
+            })
+        }
+        .instrument(tracing::info_span!("RepoResolver::resolve", ino))
+    }
+}
+
+/// Walk the parent chain in the cache to build the repo-relative path.
+/// Returns `None` for the root inode (maps to `path=None` in the mesa content API).
+async fn build_repo_path(
+    parent: Option<Inode>,
+    name: &std::path::Path,
+    cache: &AsyncICache<RepoResolver>,
+    root_ino: Inode,
+) -> Option<String> {
+    /// Maximum parent-chain depth before bailing out. Prevents infinite loops
+    /// if a bug creates a cycle in the parent pointers.
+    const MAX_DEPTH: usize = 1024;
+
+    let parent = parent?;
+    if parent == root_ino {
+        return name.to_str().map(String::from);
+    }
+
+    let mut components = vec![name.to_path_buf()];
+    let mut current = parent;
+    for _ in 0..MAX_DEPTH {
+        if current == root_ino {
+            break;
+        }
+        let (path, next_parent) = cache
+            .get_icb(current, |icb| (icb.path.clone(), icb.parent))
+            .await?;
+        components.push(path);
+        current = next_parent?;
+    }
+    if current != root_ino {
+        tracing::warn!("build_repo_path: exceeded MAX_DEPTH={MAX_DEPTH}, possible parent cycle");
+        return None;
+    }
+    components.reverse();
+    let joined: PathBuf = components.iter().collect();
+    joined.to_str().map(String::from)
+}
 
 /// A filesystem rooted at a single mesa repository.
 ///
@@ -33,7 +179,9 @@ pub struct RepoFs {
     repo_name: String,
     ref_: String,
 
-    icache: MescloudICache,
+    icache: MescloudICache<RepoResolver>,
+    file_table: FileTable,
+    readdir_buf: Vec<DirEntry>,
     open_files: HashMap<FileHandle, Inode>,
 }
 
@@ -49,12 +197,22 @@ impl RepoFs {
         ref_: String,
         fs_owner: (u32, u32),
     ) -> Self {
+        let resolver = RepoResolver {
+            client: client.clone(),
+            org_name: org_name.clone(),
+            repo_name: repo_name.clone(),
+            ref_: ref_.clone(),
+            fs_owner,
+            block_size: Self::BLOCK_SIZE,
+        };
         Self {
             client,
             org_name,
             repo_name,
             ref_,
-            icache: MescloudICache::new(Self::ROOT_INO, fs_owner, Self::BLOCK_SIZE),
+            icache: MescloudICache::new(resolver, Self::ROOT_INO, fs_owner, Self::BLOCK_SIZE),
+            file_table: FileTable::new(),
+            readdir_buf: Vec::new(),
             open_files: HashMap::new(),
         }
     }
@@ -64,42 +222,48 @@ impl RepoFs {
         &self.repo_name
     }
 
-    /// Get the cached attr for an inode, if present.
-    pub(crate) fn inode_table_get_attr(&self, ino: Inode) -> Option<FileAttr> {
-        self.icache.get_attr(ino)
-    }
-
     /// Build the repo-relative path for an inode by walking up the parent chain.
     ///
     /// Returns `None` for the root inode (the repo top-level maps to `path=None` in the
     /// mesa content API).
-    fn path_of_inode(&self, ino: Inode) -> Option<String> {
+    async fn path_of_inode(&self, ino: Inode) -> Option<String> {
+        /// Maximum parent-chain depth before bailing out.
+        const MAX_DEPTH: usize = 1024;
+
         if ino == Self::ROOT_INO {
             return None;
         }
 
         let mut components = Vec::new();
         let mut current = ino;
-        while current != Self::ROOT_INO {
-            let icb = self.icache.get_icb(current)?;
-            components.push(icb.path.clone());
-            current = icb.parent?;
+        for _ in 0..MAX_DEPTH {
+            if current == Self::ROOT_INO {
+                break;
+            }
+            let (path, parent) = self
+                .icache
+                .get_icb(current, |icb| (icb.path.clone(), icb.parent))
+                .await?;
+            components.push(path);
+            current = parent?;
+        }
+        if current != Self::ROOT_INO {
+            tracing::warn!(
+                ino,
+                "path_of_inode: exceeded MAX_DEPTH={MAX_DEPTH}, possible parent cycle"
+            );
+            return None;
         }
         components.reverse();
         let joined: PathBuf = components.iter().collect();
         joined.to_str().map(String::from)
     }
+}
 
-    /// Build the repo-relative path for a child of `parent`.
-    fn path_of_child(&self, parent: Inode, name: &OsStr) -> Option<String> {
-        if parent == Self::ROOT_INO {
-            return name.to_str().map(String::from);
-        }
-        self.path_of_inode(parent).and_then(|p| {
-            let mut pb = PathBuf::from(p);
-            pb.push(name);
-            pb.to_str().map(String::from)
-        })
+#[async_trait::async_trait]
+impl super::common::InodeCachePeek for RepoFs {
+    async fn peek_attr(&self, ino: Inode) -> Option<FileAttr> {
+        self.icache.get_attr(ino).await
     }
 }
 
@@ -112,81 +276,42 @@ impl Fs for RepoFs {
     type ReaddirError = ReadDirError;
     type ReleaseError = ReleaseError;
 
-    #[instrument(skip(self), fields(repo = %self.repo_name))]
+    #[instrument(name = "RepoFs::lookup", skip(self), fields(repo = %self.repo_name))]
     async fn lookup(&mut self, parent: Inode, name: &OsStr) -> Result<FileAttr, LookupError> {
         debug_assert!(
             self.icache.contains(parent),
             "lookup: parent inode {parent} not in inode table"
         );
 
-        let file_path = self.path_of_child(parent, name);
+        let ino = self.icache.ensure_child_ino(parent, name).await;
+        let attr = self
+            .icache
+            .get_or_resolve(ino, |icb| icb.attr)
+            .await?
+            .ok_or(LookupError::InodeNotFound)?;
 
-        let content = self
-            .client
-            .org(&self.org_name)
-            .repos()
-            .at(&self.repo_name)
-            .content()
-            .get(Some(self.ref_.as_str()), file_path.as_deref(), None)
+        let rc = self
+            .icache
+            .inc_rc(ino)
             .await
-            .map_err(MesaApiError::from)?;
-
-        #[expect(
-            clippy::match_same_arms,
-            reason = "symlink arm will diverge once readlink is wired up"
-        )]
-        let kind = match &content {
-            Content::File(_) => DirEntryType::RegularFile,
-            // TODO(MES-712): return DirEntryType::Symlink and FileAttr::Symlink, then wire up readlink.
-            Content::Symlink(_) => DirEntryType::RegularFile,
-            Content::Dir(_) => DirEntryType::Directory,
-        };
-
-        let (ino, _) = self.icache.ensure_child_inode(parent, name, kind);
-
-        let now = SystemTime::now();
-        let attr = match &content {
-            Content::File(f) => {
-                let size = f.size.to_u64().unwrap_or(0);
-                FileAttr::RegularFile {
-                    common: self.icache.make_common_file_attr(ino, 0o644, now, now),
-                    size,
-                    blocks: mescloud_icache::blocks_of_size(Self::BLOCK_SIZE, size),
-                }
-            }
-            // TODO(MES-712): return FileAttr::Symlink { target, size } and wire up readlink.
-            Content::Symlink(s) => {
-                let size = s.size.to_u64().unwrap_or(0);
-                FileAttr::RegularFile {
-                    common: self.icache.make_common_file_attr(ino, 0o644, now, now),
-                    size,
-                    blocks: mescloud_icache::blocks_of_size(Self::BLOCK_SIZE, size),
-                }
-            }
-            Content::Dir(_) => FileAttr::Directory {
-                common: self.icache.make_common_file_attr(ino, 0o755, now, now),
-            },
-        };
-        self.icache.cache_attr(ino, attr);
-
-        let rc = self.icache.inc_rc(ino);
-        trace!(ino, path = ?file_path, rc, "resolved inode");
+            .ok_or(LookupError::InodeNotFound)?;
+        trace!(ino, ?name, rc, "resolved inode");
         Ok(attr)
     }
 
-    #[instrument(skip(self), fields(repo = %self.repo_name))]
+    #[instrument(name = "RepoFs::getattr", skip(self), fields(repo = %self.repo_name))]
     async fn getattr(
         &mut self,
         ino: Inode,
         _fh: Option<FileHandle>,
     ) -> Result<FileAttr, GetAttrError> {
-        self.icache.get_attr(ino).ok_or_else(|| {
+        self.icache.get_attr(ino).await.ok_or_else(|| {
             warn!(ino, "getattr on unknown inode");
             GetAttrError::InodeNotFound
         })
     }
 
-    #[instrument(skip(self), fields(repo = %self.repo_name))]
+    #[instrument(name = "RepoFs::readdir", skip(self), fields(repo = %self.repo_name))]
     async fn readdir(&mut self, ino: Inode) -> Result<&[DirEntry], ReadDirError> {
         debug_assert!(
             self.icache.contains(ino),
@@ -194,47 +319,47 @@ impl Fs for RepoFs {
         );
         debug_assert!(
             matches!(
-                self.icache.get_attr(ino),
+                self.icache.get_attr(ino).await,
                 Some(FileAttr::Directory { .. }) | None
             ),
             "readdir: inode {ino} has non-directory cached attr"
         );
 
-        let file_path = self.path_of_inode(ino);
+        let children = self
+            .icache
+            .get_or_resolve(ino, |icb| icb.children.clone())
+            .await?
+            .ok_or(ReadDirError::NotADirectory)?;
 
-        let content = self
-            .client
-            .org(&self.org_name)
-            .repos()
-            .at(&self.repo_name)
-            .content()
-            .get(Some(self.ref_.as_str()), file_path.as_deref(), None)
-            .await
-            .map_err(MesaApiError::from)?;
+        trace!(
+            ino,
+            count = children.len(),
+            "readdir: resolved directory listing from icache"
+        );
 
-        let mesa_entries = match content {
-            Content::Dir(d) => d.entries,
-            Content::File(_) | Content::Symlink(_) => return Err(ReadDirError::NotADirectory),
-        };
+        self.icache.evict_zero_rc_children(ino).await;
 
-        let collected: Vec<(String, DirEntryType)> = mesa_entries
-            .into_iter()
-            .filter_map(|e| {
-                let (name, kind) = match e {
-                    MesaDirEntry::File(f) => (f.name?, DirEntryType::RegularFile),
-                    // TODO(MES-712): return DirEntryType::Symlink once readlink is wired up.
-                    MesaDirEntry::Symlink(s) => (s.name?, DirEntryType::RegularFile),
-                    MesaDirEntry::Dir(d) => (d.name?, DirEntryType::Directory),
+        let mut entries = Vec::with_capacity(children.len());
+        for (name, kind) in &children {
+            let child_ino = self.icache.ensure_child_ino(ino, OsStr::new(name)).await;
+            // Only cache directory attrs in readdir. File attrs are left as
+            // None so that lookup triggers the resolver to fetch the real file
+            // size. Caching placeholder file attrs (size=0) would poison
+            // needs_resolve(), preventing resolution on subsequent lookups.
+            if *kind == DirEntryType::Directory {
+                let now = SystemTime::now();
+                let attr = FileAttr::Directory {
+                    common: mescloud_icache::make_common_file_attr(
+                        child_ino,
+                        0o755,
+                        now,
+                        now,
+                        self.icache.fs_owner(),
+                        self.icache.block_size(),
+                    ),
                 };
-                Some((name, kind))
-            })
-            .collect();
-
-        trace!(ino, path = ?file_path, count = collected.len(), "fetched directory listing");
-
-        let mut entries = Vec::with_capacity(collected.len());
-        for (name, kind) in &collected {
-            let (child_ino, _) = self.icache.ensure_child_inode(ino, OsStr::new(name), *kind);
+                self.icache.cache_attr(child_ino, attr).await;
+            }
             entries.push(DirEntry {
                 ino: child_ino,
                 name: name.clone().into(),
@@ -242,14 +367,11 @@ impl Fs for RepoFs {
             });
         }
 
-        let icb = self
-            .icache
-            .get_icb_mut(ino)
-            .ok_or(ReadDirError::InodeNotFound)?;
-        Ok(icb.children.insert(entries))
+        self.readdir_buf = entries;
+        Ok(&self.readdir_buf)
     }
 
-    #[instrument(skip(self), fields(repo = %self.repo_name))]
+    #[instrument(name = "RepoFs::open", skip(self), fields(repo = %self.repo_name))]
     async fn open(&mut self, ino: Inode, _flags: OpenFlags) -> Result<OpenFile, OpenError> {
         if !self.icache.contains(ino) {
             warn!(ino, "open on unknown inode");
@@ -257,12 +379,12 @@ impl Fs for RepoFs {
         }
         debug_assert!(
             matches!(
-                self.icache.get_attr(ino),
+                self.icache.get_attr(ino).await,
                 Some(FileAttr::RegularFile { .. }) | None
             ),
             "open: inode {ino} has non-file cached attr"
         );
-        let fh = self.icache.allocate_fh();
+        let fh = self.file_table.allocate();
         self.open_files.insert(fh, ino);
         trace!(ino, fh, "assigned file handle");
         Ok(OpenFile {
@@ -271,7 +393,7 @@ impl Fs for RepoFs {
         })
     }
 
-    #[instrument(skip(self), fields(repo = %self.repo_name))]
+    #[instrument(name = "RepoFs::read", skip(self), fields(repo = %self.repo_name))]
     async fn read(
         &mut self,
         ino: Inode,
@@ -291,13 +413,19 @@ impl Fs for RepoFs {
         );
         debug_assert!(
             matches!(
-                self.icache.get_attr(ino),
+                self.icache.get_attr(ino).await,
                 Some(FileAttr::RegularFile { .. }) | None
             ),
             "read: inode {ino} has non-file cached attr"
         );
 
-        let file_path = self.path_of_inode(ino);
+        let file_path = self.path_of_inode(ino).await;
+
+        // Non-root inodes must have a resolvable path.
+        if ino != Self::ROOT_INO && file_path.is_none() {
+            warn!(ino, "read: path_of_inode returned None for non-root inode");
+            return Err(ReadError::InodeNotFound);
+        }
 
         let content = self
             .client
@@ -327,7 +455,7 @@ impl Fs for RepoFs {
         Ok(Bytes::copy_from_slice(&decoded[start..end]))
     }
 
-    #[instrument(skip(self), fields(repo = %self.repo_name))]
+    #[instrument(name = "RepoFs::release", skip(self), fields(repo = %self.repo_name))]
     async fn release(
         &mut self,
         ino: Inode,
@@ -347,14 +475,14 @@ impl Fs for RepoFs {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(repo = %self.repo_name))]
+    #[instrument(name = "RepoFs::forget", skip(self), fields(repo = %self.repo_name))]
     async fn forget(&mut self, ino: Inode, nlookups: u64) {
         debug_assert!(
             self.icache.contains(ino),
             "forget: inode {ino} not in inode table"
         );
 
-        self.icache.forget(ino, nlookups);
+        self.icache.forget(ino, nlookups).await;
     }
 
     async fn statfs(&mut self) -> Result<FilesystemStats, std::io::Error> {

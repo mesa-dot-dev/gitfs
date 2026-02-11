@@ -3,6 +3,8 @@
 use mesa_dev::low_level::apis;
 use thiserror::Error;
 
+use crate::fs::r#trait::{FileAttr, Inode};
+
 pub(super) use super::icache::InodeControlBlock;
 
 /// A concrete error type that preserves the structure of `mesa_dev::low_level::apis::Error<T>`
@@ -137,6 +139,15 @@ pub enum ReadDirError {
     NotPermitted,
 }
 
+impl From<LookupError> for ReadDirError {
+    fn from(e: LookupError) -> Self {
+        match e {
+            LookupError::RemoteMesaError(api) => Self::RemoteMesaError(api),
+            LookupError::InodeNotFound | LookupError::FileDoesNotExist => Self::InodeNotFound,
+        }
+    }
+}
+
 impl From<ReadDirError> for i32 {
     fn from(e: ReadDirError) -> Self {
         match e {
@@ -159,5 +170,38 @@ impl From<ReleaseError> for i32 {
         match e {
             ReleaseError::FileNotOpen => libc::EBADF,
         }
+    }
+}
+
+/// Allows a parent compositor to peek at cached attrs from a child filesystem.
+#[async_trait::async_trait]
+pub(super) trait InodeCachePeek {
+    async fn peek_attr(&self, ino: Inode) -> Option<FileAttr>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookup_inode_not_found_converts_to_readdir_inode_not_found() {
+        let err: ReadDirError = LookupError::InodeNotFound.into();
+        assert!(matches!(err, ReadDirError::InodeNotFound));
+    }
+
+    #[test]
+    fn lookup_file_does_not_exist_converts_to_readdir_inode_not_found() {
+        let err: ReadDirError = LookupError::FileDoesNotExist.into();
+        assert!(matches!(err, ReadDirError::InodeNotFound));
+    }
+
+    #[test]
+    fn lookup_remote_error_converts_to_readdir_remote_error() {
+        let api_err = MesaApiError::Response {
+            status: 500,
+            body: "test".to_owned(),
+        };
+        let err: ReadDirError = LookupError::RemoteMesaError(api_err).into();
+        assert!(matches!(err, ReadDirError::RemoteMesaError(_)));
     }
 }

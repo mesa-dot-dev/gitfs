@@ -3,22 +3,21 @@
 use std::ffi::OsStr;
 use std::time::SystemTime;
 
-use tracing::warn;
-
-use crate::fs::icache::{ICache, IcbLike, InodeFactory};
+use crate::fs::icache::{AsyncICache, IcbLike, IcbResolver, InodeFactory};
 use crate::fs::r#trait::{
-    CommonFileAttr, DirEntry, DirEntryType, FileAttr, FilesystemStats, Inode, Permissions,
+    CommonFileAttr, DirEntryType, FileAttr, FilesystemStats, Inode, Permissions,
 };
 
-/// Inode control block for mescloud filesystem layers (`MesaFS`, `OrgFs`, `RepoFs`).
+/// Inode control block for mescloud filesystem layers.
+#[derive(Clone)]
 pub struct InodeControlBlock {
-    /// The root inode doesn't have a parent.
     pub parent: Option<Inode>,
     pub rc: u64,
     pub path: std::path::PathBuf,
-    pub children: Option<Vec<DirEntry>>,
     /// Cached file attributes from the last lookup.
     pub attr: Option<FileAttr>,
+    /// Cached directory children from the resolver (directories only).
+    pub children: Option<Vec<(String, DirEntryType)>>,
 }
 
 impl IcbLike for InodeControlBlock {
@@ -27,8 +26,8 @@ impl IcbLike for InodeControlBlock {
             rc: 1,
             parent: None,
             path,
-            children: None,
             attr: None,
+            children: None,
         }
     }
 
@@ -39,6 +38,14 @@ impl IcbLike for InodeControlBlock {
     fn rc_mut(&mut self) -> &mut u64 {
         &mut self.rc
     }
+
+    fn needs_resolve(&self) -> bool {
+        match self.attr {
+            None => true,
+            Some(FileAttr::Directory { .. }) => self.children.is_none(),
+            Some(_) => false,
+        }
+    }
 }
 
 /// Calculate the number of blocks needed for a given size.
@@ -46,149 +53,128 @@ pub fn blocks_of_size(block_size: u32, size: u64) -> u64 {
     size.div_ceil(u64::from(block_size))
 }
 
-/// Mescloud-specific directory cache.
-///
-/// Wraps [`ICache<InodeControlBlock>`] and adds inode allocation, attribute
-/// caching, `ensure_child_inode`, and filesystem metadata.
-pub struct MescloudICache {
-    inner: ICache<InodeControlBlock>,
+/// Free function -- usable by both `MescloudICache` and resolvers.
+pub fn make_common_file_attr(
+    ino: Inode,
+    perm: u16,
+    atime: SystemTime,
+    mtime: SystemTime,
+    fs_owner: (u32, u32),
+    block_size: u32,
+) -> CommonFileAttr {
+    CommonFileAttr {
+        ino,
+        atime,
+        mtime,
+        ctime: SystemTime::UNIX_EPOCH,
+        crtime: SystemTime::UNIX_EPOCH,
+        perm: Permissions::from_bits_truncate(perm),
+        nlink: 1,
+        uid: fs_owner.0,
+        gid: fs_owner.1,
+        blksize: block_size,
+    }
+}
+
+/// Mescloud-specific directory cache wrapper over `AsyncICache`.
+pub struct MescloudICache<R: IcbResolver<Icb = InodeControlBlock>> {
+    inner: AsyncICache<R>,
     inode_factory: InodeFactory,
     fs_owner: (u32, u32),
     block_size: u32,
 }
 
-impl std::ops::Deref for MescloudICache {
-    type Target = ICache<InodeControlBlock>;
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl std::ops::DerefMut for MescloudICache {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
-impl MescloudICache {
+impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     /// Create a new `MescloudICache`. Initializes root ICB (rc=1), caches root dir attr.
-    pub fn new(root_ino: Inode, fs_owner: (u32, u32), block_size: u32) -> Self {
-        let mut icache = Self {
-            inner: ICache::new(root_ino, "/"),
+    pub fn new(resolver: R, root_ino: Inode, fs_owner: (u32, u32), block_size: u32) -> Self {
+        let cache = Self {
+            inner: AsyncICache::new(resolver, root_ino, "/"),
             inode_factory: InodeFactory::new(root_ino + 1),
             fs_owner,
             block_size,
         };
 
+        // Set root directory attr synchronously during initialization
         let now = SystemTime::now();
         let root_attr = FileAttr::Directory {
-            common: icache.make_common_file_attr(root_ino, 0o755, now, now),
+            common: make_common_file_attr(root_ino, 0o755, now, now, fs_owner, block_size),
         };
-        icache.cache_attr(root_ino, root_attr);
-        icache
+        cache.inner.get_icb_mut_sync(root_ino, |icb| {
+            icb.attr = Some(root_attr);
+        });
+
+        cache
     }
 
+    // -- Delegated from AsyncICache (async) --
+
+    pub fn contains(&self, ino: Inode) -> bool {
+        self.inner.contains(ino)
+    }
+
+    pub async fn get_icb<T>(
+        &self,
+        ino: Inode,
+        // `Sync` required: see comment on `AsyncICache::get_icb`.
+        f: impl Fn(&InodeControlBlock) -> T + Send + Sync,
+    ) -> Option<T> {
+        self.inner.get_icb(ino, f).await
+    }
+
+    pub async fn insert_icb(&self, ino: Inode, icb: InodeControlBlock) {
+        self.inner.insert_icb(ino, icb).await;
+    }
+
+    pub async fn entry_or_insert_icb<T>(
+        &self,
+        ino: Inode,
+        factory: impl FnOnce() -> InodeControlBlock,
+        then: impl FnOnce(&mut InodeControlBlock) -> T,
+    ) -> T {
+        self.inner.entry_or_insert_icb(ino, factory, then).await
+    }
+
+    pub async fn inc_rc(&self, ino: Inode) -> Option<u64> {
+        self.inner.inc_rc(ino).await
+    }
+
+    pub async fn forget(&self, ino: Inode, nlookups: u64) -> Option<InodeControlBlock> {
+        self.inner.forget(ino, nlookups).await
+    }
+
+    pub async fn get_or_resolve<T>(
+        &self,
+        ino: Inode,
+        then: impl FnOnce(&InodeControlBlock) -> T,
+    ) -> Result<T, R::Error> {
+        self.inner.get_or_resolve(ino, then).await
+    }
+
+    // -- Domain-specific --
+
     /// Allocate a new inode number.
-    pub fn allocate_inode(&mut self) -> Inode {
+    pub fn allocate_inode(&self) -> Inode {
         self.inode_factory.allocate()
     }
 
-    pub fn get_attr(&self, ino: Inode) -> Option<FileAttr> {
-        self.inner.get_icb(ino).and_then(|icb| icb.attr)
+    pub async fn get_attr(&self, ino: Inode) -> Option<FileAttr> {
+        self.inner.get_icb(ino, |icb| icb.attr).await.flatten()
     }
 
-    pub fn cache_attr(&mut self, ino: Inode, attr: FileAttr) {
-        if let Some(icb) = self.inner.get_icb_mut(ino) {
-            icb.attr = Some(attr);
-        }
-    }
-
-    /// Ensure a child inode exists under `parent` with the given `name` and `kind`.
-    /// Reuses existing inode if present. Does NOT bump rc.
-    pub fn ensure_child_inode(
-        &mut self,
-        parent: Inode,
-        name: &OsStr,
-        kind: DirEntryType,
-    ) -> (Inode, FileAttr) {
-        // Check existing child by parent + name.
-        let existing = self
-            .inner
-            .iter()
-            .find(|&(&_ino, icb)| icb.parent == Some(parent) && icb.path.as_os_str() == name)
-            .map(|(&ino, _)| ino);
-
-        if let Some(existing_ino) = existing {
-            if let Some(attr) = self.inner.get_icb(existing_ino).and_then(|icb| icb.attr) {
-                return (existing_ino, attr);
-            }
-
-            warn!(ino = existing_ino, parent, name = ?name, ?kind,
-                "ensure_child_inode: attr missing on existing inode, rebuilding");
-            let attr = self.make_attr_for_kind(existing_ino, kind);
-            self.cache_attr(existing_ino, attr);
-            return (existing_ino, attr);
-        }
-
-        let ino = self.inode_factory.allocate();
-        self.inner.insert_icb(
-            ino,
-            InodeControlBlock {
-                rc: 0,
-                path: name.into(),
-                parent: Some(parent),
-                children: None,
-                attr: None,
-            },
-        );
-
-        let attr = self.make_attr_for_kind(ino, kind);
-        self.cache_attr(ino, attr);
-        (ino, attr)
-    }
-
-    pub fn make_common_file_attr(
-        &self,
-        ino: Inode,
-        perm: u16,
-        atime: SystemTime,
-        mtime: SystemTime,
-    ) -> CommonFileAttr {
-        CommonFileAttr {
-            ino,
-            atime,
-            mtime,
-            ctime: SystemTime::UNIX_EPOCH,
-            crtime: SystemTime::UNIX_EPOCH,
-            perm: Permissions::from_bits_truncate(perm),
-            nlink: 1,
-            uid: self.fs_owner.0,
-            gid: self.fs_owner.1,
-            blksize: self.block_size,
-        }
-    }
-
-    fn make_attr_for_kind(&self, ino: Inode, kind: DirEntryType) -> FileAttr {
-        let now = SystemTime::now();
-        match kind {
-            DirEntryType::Directory => FileAttr::Directory {
-                common: self.make_common_file_attr(ino, 0o755, now, now),
-            },
-            DirEntryType::RegularFile
-            | DirEntryType::Symlink
-            | DirEntryType::CharDevice
-            | DirEntryType::BlockDevice
-            | DirEntryType::NamedPipe
-            | DirEntryType::Socket => FileAttr::RegularFile {
-                common: self.make_common_file_attr(ino, 0o644, now, now),
-                size: 0,
-                blocks: 0,
-            },
-        }
+    pub async fn cache_attr(&self, ino: Inode, attr: FileAttr) {
+        self.inner
+            .get_icb_mut(ino, |icb| {
+                icb.attr = Some(attr);
+            })
+            .await;
     }
 
     pub fn fs_owner(&self) -> (u32, u32) {
         self.fs_owner
+    }
+
+    pub fn block_size(&self) -> u32 {
+        self.block_size
     }
 
     pub fn statfs(&self) -> FilesystemStats {
@@ -205,5 +191,247 @@ impl MescloudICache {
             mount_flags: 0,
             max_filename_length: 255,
         }
+    }
+
+    /// Evict all `Available` children of `parent` that have `rc == 0`.
+    /// Returns the list of evicted inode numbers so callers can clean up
+    /// associated state (e.g., bridge mappings, slot tracking).
+    pub async fn evict_zero_rc_children(&self, parent: Inode) -> Vec<Inode> {
+        let mut to_evict = Vec::new();
+        self.inner
+            .for_each(|&ino, icb| {
+                if icb.rc == 0 && icb.parent == Some(parent) {
+                    to_evict.push(ino);
+                }
+            })
+            .await;
+        let mut evicted = Vec::new();
+        for ino in to_evict {
+            if self.inner.forget(ino, 0).await.is_some() {
+                evicted.push(ino);
+            }
+        }
+        evicted
+    }
+
+    /// Find an existing child by (parent, name) or allocate a new inode.
+    /// If new, inserts a stub ICB (parent+path set, attr=None, children=None, rc=0).
+    /// Does NOT bump rc. Returns the inode number.
+    ///
+    /// # Safety invariant
+    ///
+    /// The `for_each` scan and `insert_icb` are **not** atomic. If two callers
+    /// race with the same `(parent, name)`, both may allocate distinct inodes
+    /// for the same logical child. This is currently safe because all callers
+    /// go through `&mut self` on the owning `Fs` implementation.
+    pub async fn ensure_child_ino(&self, parent: Inode, name: &OsStr) -> Inode {
+        // Search for existing child by parent + name
+        let mut existing_ino = None;
+        self.inner
+            .for_each(|&ino, icb| {
+                if icb.parent == Some(parent) && icb.path.as_os_str() == name {
+                    existing_ino = Some(ino);
+                }
+            })
+            .await;
+
+        if let Some(ino) = existing_ino {
+            return ino;
+        }
+
+        // Allocate new inode and insert stub
+        let ino = self.inode_factory.allocate();
+        self.inner
+            .insert_icb(
+                ino,
+                InodeControlBlock {
+                    rc: 0,
+                    path: name.into(),
+                    parent: Some(parent),
+                    attr: None,
+                    children: None,
+                },
+            )
+            .await;
+        ino
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+
+    use super::*;
+    use crate::fs::icache::async_cache::AsyncICache;
+    use crate::fs::r#trait::DirEntryType;
+
+    fn dummy_dir_attr(ino: Inode) -> FileAttr {
+        let now = SystemTime::now();
+        FileAttr::Directory {
+            common: make_common_file_attr(ino, 0o755, now, now, (0, 0), 4096),
+        }
+    }
+
+    fn dummy_file_attr(ino: Inode) -> FileAttr {
+        let now = SystemTime::now();
+        FileAttr::RegularFile {
+            common: make_common_file_attr(ino, 0o644, now, now, (0, 0), 4096),
+            size: 100,
+            blocks: 1,
+        }
+    }
+
+    #[test]
+    fn needs_resolve_stub_returns_true() {
+        let icb = InodeControlBlock {
+            parent: Some(1),
+            rc: 0,
+            path: "stub".into(),
+            attr: None,
+            children: None,
+        };
+        assert!(icb.needs_resolve());
+    }
+
+    #[test]
+    fn needs_resolve_file_with_attr_returns_false() {
+        let icb = InodeControlBlock {
+            parent: Some(1),
+            rc: 1,
+            path: "file.txt".into(),
+            attr: Some(dummy_file_attr(2)),
+            children: None,
+        };
+        assert!(!icb.needs_resolve());
+    }
+
+    #[test]
+    fn needs_resolve_dir_without_children_returns_true() {
+        let icb = InodeControlBlock {
+            parent: Some(1),
+            rc: 1,
+            path: "dir".into(),
+            attr: Some(dummy_dir_attr(3)),
+            children: None,
+        };
+        assert!(icb.needs_resolve());
+    }
+
+    #[test]
+    fn needs_resolve_dir_with_children_returns_false() {
+        let icb = InodeControlBlock {
+            parent: Some(1),
+            rc: 1,
+            path: "dir".into(),
+            attr: Some(dummy_dir_attr(3)),
+            children: Some(vec![("README.md".to_owned(), DirEntryType::RegularFile)]),
+        };
+        assert!(!icb.needs_resolve());
+    }
+
+    #[test]
+    fn needs_resolve_dir_with_empty_children_returns_false() {
+        let icb = InodeControlBlock {
+            parent: Some(1),
+            rc: 1,
+            path: "empty-dir".into(),
+            attr: Some(dummy_dir_attr(4)),
+            children: Some(vec![]),
+        };
+        assert!(!icb.needs_resolve());
+    }
+
+    struct NoOpResolver;
+
+    impl IcbResolver for NoOpResolver {
+        type Icb = InodeControlBlock;
+        type Error = std::convert::Infallible;
+
+        #[expect(
+            clippy::manual_async_fn,
+            reason = "must match IcbResolver trait signature"
+        )]
+        fn resolve(
+            &self,
+            _ino: Inode,
+            _stub: Option<InodeControlBlock>,
+            _cache: &AsyncICache<Self>,
+        ) -> impl Future<Output = Result<InodeControlBlock, Self::Error>> + Send {
+            async { unreachable!("NoOpResolver should not be called") }
+        }
+    }
+
+    fn test_mescloud_cache() -> MescloudICache<NoOpResolver> {
+        MescloudICache::new(NoOpResolver, 1, (0, 0), 4096)
+    }
+
+    #[tokio::test]
+    async fn evict_zero_rc_children_removes_stubs() {
+        let cache = test_mescloud_cache();
+
+        // Insert stubs as children of root (ino=1) with rc=0
+        cache
+            .insert_icb(
+                10,
+                InodeControlBlock {
+                    rc: 0,
+                    path: "child_a".into(),
+                    parent: Some(1),
+                    attr: None,
+                    children: None,
+                },
+            )
+            .await;
+        cache
+            .insert_icb(
+                11,
+                InodeControlBlock {
+                    rc: 0,
+                    path: "child_b".into(),
+                    parent: Some(1),
+                    attr: None,
+                    children: None,
+                },
+            )
+            .await;
+
+        // Insert a child with rc > 0 — should survive
+        cache
+            .insert_icb(
+                12,
+                InodeControlBlock {
+                    rc: 1,
+                    path: "active".into(),
+                    parent: Some(1),
+                    attr: None,
+                    children: None,
+                },
+            )
+            .await;
+
+        // Insert a stub under a different parent — should survive
+        cache
+            .insert_icb(
+                20,
+                InodeControlBlock {
+                    rc: 0,
+                    path: "other".into(),
+                    parent: Some(12),
+                    attr: None,
+                    children: None,
+                },
+            )
+            .await;
+
+        let evicted = cache.evict_zero_rc_children(1).await;
+        assert_eq!(evicted.len(), 2, "should evict 2 zero-rc children of root");
+
+        assert!(!cache.contains(10), "child_a should be evicted");
+        assert!(!cache.contains(11), "child_b should be evicted");
+        assert!(cache.contains(12), "active child should survive");
+        assert!(
+            cache.contains(20),
+            "child of different parent should survive"
+        );
     }
 }
