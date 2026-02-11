@@ -194,8 +194,9 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     }
 
     /// Evict all `Available` children of `parent` that have `rc == 0`.
-    /// Returns the number of evicted entries.
-    pub async fn evict_zero_rc_children(&self, parent: Inode) -> usize {
+    /// Returns the list of evicted inode numbers so callers can clean up
+    /// associated state (e.g., bridge mappings, slot tracking).
+    pub async fn evict_zero_rc_children(&self, parent: Inode) -> Vec<Inode> {
         let mut to_evict = Vec::new();
         self.inner
             .for_each(|&ino, icb| {
@@ -204,11 +205,13 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
                 }
             })
             .await;
-        let count = to_evict.len();
+        let mut evicted = Vec::new();
         for ino in to_evict {
-            self.inner.forget(ino, 0).await;
+            if self.inner.forget(ino, 0).await.is_some() {
+                evicted.push(ino);
+            }
         }
-        count
+        evicted
     }
 
     /// Find an existing child by (parent, name) or allocate a new inode.
@@ -414,7 +417,7 @@ mod tests {
             .await;
 
         let evicted = cache.evict_zero_rc_children(1).await;
-        assert_eq!(evicted, 2, "should evict 2 zero-rc children of root");
+        assert_eq!(evicted.len(), 2, "should evict 2 zero-rc children of root");
 
         assert!(!cache.contains(10), "child_a should be evicted");
         assert!(!cache.contains(11), "child_b should be evicted");

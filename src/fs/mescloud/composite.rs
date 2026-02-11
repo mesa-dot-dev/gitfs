@@ -280,7 +280,13 @@ where
             .forward_or_insert_inode(ino, || unreachable!("readdir: ino should be mapped"));
         let inner_entries = self.slots[idx].inner.readdir(inner_ino).await?;
         let inner_entries: Vec<DirEntry> = inner_entries.to_vec();
-        self.icache.evict_zero_rc_children(ino).await;
+        let evicted = self.icache.evict_zero_rc_children(ino).await;
+        for evicted_ino in evicted {
+            if let Some(slot) = self.inode_to_slot.remove(&evicted_ino) {
+                self.slots[slot].bridge.remove_inode_by_left(evicted_ino);
+            }
+            self.child_inodes.remove(&evicted_ino);
+        }
         let mut outer_entries = Vec::with_capacity(inner_entries.len());
         for entry in &inner_entries {
             let outer_child_ino = self
