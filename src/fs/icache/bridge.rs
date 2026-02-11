@@ -64,11 +64,7 @@ impl HashMapBridge {
     ///
     /// Uses double-checked locking: read-lock first, then write-lock only if
     /// the mapping is missing.
-    pub fn forward_or_insert_inode(
-        &self,
-        left: Inode,
-        allocate: impl FnOnce() -> Inode,
-    ) -> Inode {
+    pub fn forward_or_insert_inode(&self, left: Inode, allocate: impl FnOnce() -> Inode) -> Inode {
         // Fast path: read-lock.
         {
             let map = self.inode_map.read();
