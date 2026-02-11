@@ -1,6 +1,7 @@
 //! Mescloud-specific inode control block, helpers, and directory cache wrapper.
 
 use std::ffi::{OsStr, OsString};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use scc::HashMap as ConcurrentHashMap;
@@ -78,9 +79,8 @@ pub fn make_common_file_attr(
     }
 }
 
-/// Mescloud-specific directory cache wrapper over `AsyncICache`.
-pub struct MescloudICache<R: IcbResolver<Icb = InodeControlBlock>> {
-    inner: AsyncICache<R>,
+struct MescloudICacheInner<R: IcbResolver<Icb = InodeControlBlock>> {
+    cache: AsyncICache<R>,
     inode_factory: InodeFactory,
     /// O(1) lookup from (parent inode, child name) to child inode.
     /// Maintained alongside the inode table to avoid linear scans in
@@ -90,15 +90,33 @@ pub struct MescloudICache<R: IcbResolver<Icb = InodeControlBlock>> {
     block_size: u32,
 }
 
+/// Mescloud-specific directory cache wrapper over `AsyncICache`.
+///
+/// Cheaply cloneable via `Arc` so background tasks (e.g. prefetch) can share
+/// access to the cache and its domain-specific helpers.
+pub struct MescloudICache<R: IcbResolver<Icb = InodeControlBlock>> {
+    inner: Arc<MescloudICacheInner<R>>,
+}
+
+impl<R: IcbResolver<Icb = InodeControlBlock>> Clone for MescloudICache<R> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
 impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     /// Create a new `MescloudICache`. Initializes root ICB (rc=1), caches root dir attr.
     pub fn new(resolver: R, root_ino: Inode, fs_owner: (u32, u32), block_size: u32) -> Self {
         let cache = Self {
-            inner: AsyncICache::new(resolver, root_ino, "/"),
-            inode_factory: InodeFactory::new(root_ino + 1),
-            child_index: ConcurrentHashMap::new(),
-            fs_owner,
-            block_size,
+            inner: Arc::new(MescloudICacheInner {
+                cache: AsyncICache::new(resolver, root_ino, "/"),
+                inode_factory: InodeFactory::new(root_ino + 1),
+                child_index: ConcurrentHashMap::new(),
+                fs_owner,
+                block_size,
+            }),
         };
 
         // Set root directory attr synchronously during initialization
@@ -106,7 +124,7 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         let root_attr = FileAttr::Directory {
             common: make_common_file_attr(root_ino, 0o755, now, now, fs_owner, block_size),
         };
-        cache.inner.get_icb_mut_sync(root_ino, |icb| {
+        cache.inner.cache.get_icb_mut_sync(root_ino, |icb| {
             icb.attr = Some(root_attr);
         });
 
@@ -116,7 +134,7 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     // -- Delegated from AsyncICache (async) --
 
     pub fn contains(&self, ino: Inode) -> bool {
-        self.inner.contains(ino)
+        self.inner.cache.contains(ino)
     }
 
     pub async fn get_icb<T>(
@@ -125,11 +143,11 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         // `Sync` required: see comment on `AsyncICache::get_icb`.
         f: impl Fn(&InodeControlBlock) -> T + Send + Sync,
     ) -> Option<T> {
-        self.inner.get_icb(ino, f).await
+        self.inner.cache.get_icb(ino, f).await
     }
 
     pub async fn insert_icb(&self, ino: Inode, icb: InodeControlBlock) {
-        self.inner.insert_icb(ino, icb).await;
+        self.inner.cache.insert_icb(ino, icb).await;
     }
 
     pub async fn entry_or_insert_icb<T>(
@@ -138,19 +156,23 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         factory: impl FnOnce() -> InodeControlBlock,
         then: impl FnOnce(&mut InodeControlBlock) -> T,
     ) -> T {
-        self.inner.entry_or_insert_icb(ino, factory, then).await
+        self.inner
+            .cache
+            .entry_or_insert_icb(ino, factory, then)
+            .await
     }
 
     pub async fn inc_rc(&self, ino: Inode) -> Option<u64> {
-        self.inner.inc_rc(ino).await
+        self.inner.cache.inc_rc(ino).await
     }
 
     pub async fn forget(&self, ino: Inode, nlookups: u64) -> Option<InodeControlBlock> {
-        let evicted = self.inner.forget(ino, nlookups).await;
+        let evicted = self.inner.cache.forget(ino, nlookups).await;
         if let Some(ref icb) = evicted
             && let Some(parent) = icb.parent
         {
-            self.child_index
+            self.inner
+                .child_index
                 .remove_async(&(parent, icb.path.as_os_str().to_os_string()))
                 .await;
         }
@@ -162,7 +184,7 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         ino: Inode,
         then: impl FnOnce(&InodeControlBlock) -> T,
     ) -> Result<T, R::Error> {
-        self.inner.get_or_resolve(ino, then).await
+        self.inner.cache.get_or_resolve(ino, then).await
     }
 
     pub fn spawn_prefetch(&self, inodes: impl IntoIterator<Item = Inode>)
@@ -170,22 +192,27 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         R: 'static,
         R::Error: 'static,
     {
-        self.inner.spawn_prefetch(inodes);
+        self.inner.cache.spawn_prefetch(inodes);
     }
 
     // -- Domain-specific --
 
     /// Allocate a new inode number.
     pub fn allocate_inode(&self) -> Inode {
-        self.inode_factory.allocate()
+        self.inner.inode_factory.allocate()
     }
 
     pub async fn get_attr(&self, ino: Inode) -> Option<FileAttr> {
-        self.inner.get_icb(ino, |icb| icb.attr).await.flatten()
+        self.inner
+            .cache
+            .get_icb(ino, |icb| icb.attr)
+            .await
+            .flatten()
     }
 
     pub async fn cache_attr(&self, ino: Inode, attr: FileAttr) {
         self.inner
+            .cache
             .get_icb_mut(ino, |icb| {
                 icb.attr = Some(attr);
             })
@@ -193,21 +220,21 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     }
 
     pub fn fs_owner(&self) -> (u32, u32) {
-        self.fs_owner
+        self.inner.fs_owner
     }
 
     pub fn block_size(&self) -> u32 {
-        self.block_size
+        self.inner.block_size
     }
 
     pub fn statfs(&self) -> FilesystemStats {
         FilesystemStats {
-            block_size: self.block_size,
-            fragment_size: u64::from(self.block_size),
+            block_size: self.inner.block_size,
+            fragment_size: u64::from(self.inner.block_size),
             total_blocks: 0,
             free_blocks: 0,
             available_blocks: 0,
-            total_inodes: self.inner.inode_count() as u64,
+            total_inodes: self.inner.cache.inode_count() as u64,
             free_inodes: 0,
             available_inodes: 0,
             filesystem_id: 0,
@@ -222,6 +249,7 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     pub async fn evict_zero_rc_children(&self, parent: Inode) -> Vec<Inode> {
         let mut to_evict = Vec::new();
         self.inner
+            .cache
             .for_each(|&ino, icb| {
                 if icb.rc == 0 && icb.parent == Some(parent) {
                     to_evict.push((ino, icb.path.as_os_str().to_os_string()));
@@ -230,8 +258,8 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
             .await;
         let mut evicted = Vec::new();
         for (ino, name) in to_evict {
-            if self.inner.forget(ino, 0).await.is_some() {
-                self.child_index.remove_async(&(parent, name)).await;
+            if self.inner.cache.forget(ino, 0).await.is_some() {
+                self.inner.child_index.remove_async(&(parent, name)).await;
                 evicted.push(ino);
             }
         }
@@ -249,12 +277,13 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         use scc::hash_map::Entry;
 
         let key = (parent, name.to_os_string());
-        match self.child_index.entry_async(key).await {
+        match self.inner.child_index.entry_async(key).await {
             Entry::Occupied(occ) => *occ.get(),
             Entry::Vacant(vac) => {
-                let ino = self.inode_factory.allocate();
+                let ino = self.inner.inode_factory.allocate();
                 vac.insert_entry(ino);
                 self.inner
+                    .cache
                     .insert_icb(
                         ino,
                         InodeControlBlock {
@@ -275,7 +304,6 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
 #[cfg(test)]
 mod tests {
     use std::future::Future;
-    use std::sync::Arc;
 
     use super::*;
     use crate::fs::icache::async_cache::AsyncICache;
@@ -491,6 +519,16 @@ mod tests {
             ino1, ino2,
             "after eviction, a new inode should be allocated"
         );
+    }
+
+    #[test]
+    #[expect(
+        clippy::redundant_clone,
+        reason = "test exists to verify Clone is implemented"
+    )]
+    fn mescloud_icache_is_clone() {
+        let cache = test_mescloud_cache();
+        let _clone = cache.clone();
     }
 
     #[tokio::test]
