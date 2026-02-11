@@ -322,20 +322,39 @@ impl<R: IcbResolver> AsyncICache<R> {
         }
     }
 
-    /// Increment rc. **Awaits** `InFlight`. Panics if inode is missing.
+    /// Increment rc. **Awaits** `InFlight`.
+    /// Returns `None` if the inode does not exist or was evicted concurrently.
     #[instrument(name = "AsyncICache::inc_rc", skip(self))]
-    pub async fn inc_rc(&self, ino: Inode) -> u64 {
-        self.wait_for_available(ino).await;
-        self.inode_table
-            .update_async(&ino, |_, state| match state {
-                IcbState::Available(icb) => {
-                    *icb.rc_mut() += 1;
-                    icb.rc()
+    pub async fn inc_rc(&self, ino: Inode) -> Option<u64> {
+        loop {
+            if !self.wait_for_available(ino).await {
+                warn!(ino, "inc_rc: inode not in table");
+                return None;
+            }
+            let result = self
+                .inode_table
+                .update_async(&ino, |_, state| match state {
+                    IcbState::Available(icb) => {
+                        *icb.rc_mut() += 1;
+                        Some(icb.rc())
+                    }
+                    IcbState::InFlight(_) => None,
+                })
+                .await
+                .flatten();
+
+            match result {
+                Some(rc) => return Some(rc),
+                None => {
+                    // Entry was concurrently replaced with InFlight or evicted.
+                    if !self.contains(ino) {
+                        warn!(ino, "inc_rc: inode evicted concurrently");
+                        return None;
+                    }
+                    // Entry exists but became InFlight — retry.
                 }
-                IcbState::InFlight(_) => unreachable!("inc_rc after wait_for_available"),
-            })
-            .await
-            .unwrap_or_else(|| unreachable!("inc_rc: inode {ino} not in table"))
+            }
+        }
     }
 
     /// Decrement rc by `nlookups`. If rc drops to zero, evicts and returns
@@ -684,7 +703,7 @@ mod tests {
             )
             .await;
         let new_rc = cache.inc_rc(42).await;
-        assert_eq!(new_rc, 2, "rc 1 + 1 = 2");
+        assert_eq!(new_rc, Some(2), "rc 1 + 1 = 2");
     }
 
     #[tokio::test]
@@ -973,5 +992,67 @@ mod tests {
         // get_or_resolve should trigger resolution because needs_resolve() == true
         let path: Result<PathBuf, String> = cache.get_or_resolve(42, |icb| icb.path.clone()).await;
         assert_eq!(path, Ok(PathBuf::from("/resolved")));
+    }
+
+    #[tokio::test]
+    async fn inc_rc_missing_inode_returns_none() {
+        let cache = test_cache();
+        assert_eq!(cache.inc_rc(999).await, None);
+    }
+
+    #[tokio::test]
+    async fn inc_rc_waits_for_inflight() {
+        let cache = Arc::new(test_cache());
+        let (tx, rx) = watch::channel(());
+        cache
+            .inode_table
+            .upsert_async(42, IcbState::InFlight(rx))
+            .await;
+
+        let cache2 = Arc::clone(&cache);
+        let handle = tokio::spawn(async move { cache2.inc_rc(42).await });
+
+        cache
+            .insert_icb(
+                42,
+                TestIcb {
+                    rc: 1,
+                    path: "/a".into(),
+                    resolved: true,
+                },
+            )
+            .await;
+        drop(tx);
+
+        let result = handle
+            .await
+            .unwrap_or_else(|e| panic!("task panicked: {e}"));
+        assert_eq!(
+            result,
+            Some(2),
+            "waited for Available, then incremented 1 -> 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn inc_rc_returns_none_after_concurrent_eviction() {
+        let cache = Arc::new(test_cache());
+        let (tx, rx) = watch::channel(());
+        cache
+            .inode_table
+            .upsert_async(42, IcbState::InFlight(rx))
+            .await;
+
+        let cache2 = Arc::clone(&cache);
+        let handle = tokio::spawn(async move { cache2.inc_rc(42).await });
+
+        // Evict instead of completing
+        cache.inode_table.remove_async(&42).await;
+        drop(tx);
+
+        let result = handle
+            .await
+            .unwrap_or_else(|e| panic!("task panicked: {e}"));
+        assert_eq!(result, None, "evicted entry should return None");
     }
 }

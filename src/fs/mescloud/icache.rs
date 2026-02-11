@@ -132,7 +132,7 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         self.inner.entry_or_insert_icb(ino, factory, then).await
     }
 
-    pub async fn inc_rc(&self, ino: Inode) -> u64 {
+    pub async fn inc_rc(&self, ino: Inode) -> Option<u64> {
         self.inner.inc_rc(ino).await
     }
 

@@ -262,7 +262,7 @@ impl Fs for RepoFs {
             .ok_or(LookupError::InodeNotFound)?;
         self.icache.cache_attr(ino, attr).await;
 
-        let rc = self.icache.inc_rc(ino).await;
+        let rc = self.icache.inc_rc(ino).await.unwrap_or(0);
         trace!(ino, ?name, rc, "resolved inode");
         Ok(attr)
     }

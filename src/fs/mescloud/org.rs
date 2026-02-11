@@ -370,7 +370,7 @@ impl Fs for OrgFs {
                     let (ino, attr) = self
                         .ensure_repo_inode(name_str, name_str, &repo.default_branch, Self::ROOT_INO)
                         .await;
-                    let rc = self.composite.icache.inc_rc(ino).await;
+                    let rc = self.composite.icache.inc_rc(ino).await.unwrap_or(0);
                     trace!(ino, repo = name_str, rc, "lookup: resolved repo inode");
                     Ok(attr)
                 }

@@ -261,7 +261,7 @@ where
         let outer_ino = self.translate_inner_ino(idx, inner_ino, parent, name).await;
         let outer_attr = self.slots[idx].bridge.attr_backward(inner_attr);
         self.icache.cache_attr(outer_ino, outer_attr).await;
-        let rc = self.icache.inc_rc(outer_ino).await;
+        let rc = self.icache.inc_rc(outer_ino).await.unwrap_or(0);
         trace!(outer_ino, inner_ino, rc, "lookup: resolved via delegation");
         Ok(outer_attr)
     }
