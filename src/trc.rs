@@ -102,16 +102,24 @@ impl Default for Trc {
             EnvFilter::try_from_env("GIT_FS_LOG").or_else(|_| EnvFilter::try_from_default_env());
 
         match maybe_env_filter {
-            Ok(env_filter) => Self {
-                mode: TrcMode::Ugly { use_ansi },
-                env_filter,
-                otlp_endpoints: Vec::new(),
-            },
-            Err(_) => Self {
-                mode: TrcMode::丑 { use_ansi },
-                env_filter: EnvFilter::new("info"),
-                otlp_endpoints: Vec::new(),
-            },
+            Ok(env_filter) => {
+                // If the user provided an env filter, they probably know what they're doing
+                // and don't want any fancy formatting or spinners. Default to ugly mode.
+                Self {
+                    mode: TrcMode::Ugly { use_ansi },
+                    env_filter,
+                    otlp_endpoints: Vec::new(),
+                }
+            }
+            Err(_) => {
+                // No env filter provided — give the user a nice out-of-the-box experience
+                // with compact formatting and progress spinners.
+                Self {
+                    mode: TrcMode::丑 { use_ansi },
+                    env_filter: EnvFilter::new("info"),
+                    otlp_endpoints: Vec::new(),
+                }
+            }
         }
     }
 }
@@ -132,10 +140,15 @@ impl Trc {
 
         let resource = Resource::builder_empty()
             .with_service_name("git-fs")
+            .with_attribute(opentelemetry::KeyValue::new(
+                "service.version",
+                env!("CARGO_PKG_VERSION"),
+            ))
             .build();
         let mut builder =
             opentelemetry_sdk::trace::SdkTracerProvider::builder().with_resource(resource);
 
+        let mut has_exporter = false;
         for endpoint in &self.otlp_endpoints {
             match opentelemetry_otlp::SpanExporter::builder()
                 .with_http()
@@ -144,6 +157,7 @@ impl Trc {
             {
                 Ok(exporter) => {
                     builder = builder.with_batch_exporter(exporter);
+                    has_exporter = true;
                 }
                 Err(e) => {
                     eprintln!("Failed to create OTLP exporter for {endpoint}: {e}");
@@ -151,7 +165,7 @@ impl Trc {
             }
         }
 
-        Some(builder.build())
+        has_exporter.then(|| builder.build())
     }
 
     /// Initialize the global tracing subscriber and return a handle for runtime reconfiguration.

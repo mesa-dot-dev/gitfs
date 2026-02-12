@@ -494,6 +494,15 @@ impl Config {
             }
         }
 
+        if let Some(ref url) = self.telemetry.collector_url
+            && !url.starts_with("http://")
+            && !url.starts_with("https://")
+        {
+            errors.push(format!(
+                "Telemetry collector URL '{url}' must start with http:// or https://."
+            ));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {

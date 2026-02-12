@@ -77,7 +77,9 @@ fn main() {
             std::process::exit(1);
         });
 
-    updates::check_for_updates();
+    if !config.telemetry.endpoints().is_empty() {
+        tracing::info!(endpoints = ?config.telemetry.endpoints(), "Telemetry export enabled.");
+    }
 
     match args.command.unwrap_or(Command::Run { daemonize: false }) {
         Command::Run { daemonize } => {
