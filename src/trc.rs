@@ -138,7 +138,7 @@ impl Trc {
             return None;
         }
 
-        let resource = Resource::builder_empty()
+        let resource = Resource::builder()
             .with_service_name("git-fs")
             .with_attribute(opentelemetry::KeyValue::new(
                 "service.version",

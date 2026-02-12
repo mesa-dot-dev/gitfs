@@ -334,7 +334,7 @@ impl Default for DaemonConfig {
 }
 
 /// The Mesa telemetry endpoint.
-pub const MESA_TELEMETRY_ENDPOINT: &str = "https://telemetry.priv.mesa.dev";
+pub const MESA_TELEMETRY_ENDPOINT: &str = "https://telemetry.priv.mesa.dev/v1/traces";
 
 /// Telemetry configuration for exporting OpenTelemetry traces.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
