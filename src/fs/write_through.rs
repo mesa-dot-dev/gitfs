@@ -182,8 +182,11 @@ where
             .read(ino, fh, offset, size, flags, lock_owner)
             .await?;
 
-        // Background: populate cache with the full read result
-        if let Some(path) = self.inode_paths.get(&ino).cloned() {
+        // Background: populate cache only for full-file reads (offset == 0) to avoid
+        // caching a partial slice under the file's path.
+        if offset == 0
+            && let Some(path) = self.inode_paths.get(&ino).cloned()
+        {
             let front = Arc::clone(&self.front);
             let tracker = Arc::clone(&self.tracker);
             let content = data.clone();

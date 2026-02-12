@@ -1,4 +1,5 @@
 //! An implementation of a filesystem that directly overlays the host filesystem.
+#![allow(dead_code, reason = "LocalFs consumed by WriteThroughFs in Tasks 4-6")]
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -130,8 +131,6 @@ impl From<ReadDirError> for i32 {
 }
 
 #[derive(Clone)]
-#[allow(clippy::allow_attributes)]
-#[allow(dead_code)]
 struct InodeControlBlock {
     rc: u64,
     path: PathBuf,
@@ -160,8 +159,6 @@ impl IcbLike for InodeControlBlock {
     }
 }
 
-#[allow(clippy::allow_attributes)]
-#[allow(dead_code)]
 struct LocalResolver;
 
 impl IcbResolver for LocalResolver {
@@ -182,8 +179,6 @@ impl IcbResolver for LocalResolver {
     }
 }
 
-#[allow(clippy::allow_attributes)]
-#[allow(dead_code)]
 pub struct LocalFs {
     root_path: PathBuf,
     icache: AsyncICache<LocalResolver>,
@@ -192,8 +187,6 @@ pub struct LocalFs {
     readdir_buf: Vec<DirEntry>,
 }
 
-#[allow(clippy::allow_attributes)]
-#[allow(dead_code)]
 impl LocalFs {
     #[must_use]
     pub fn new(abs_path: impl Into<PathBuf>) -> Self {
@@ -486,19 +479,16 @@ impl FsCacheProvider for LocalFs {
         size: u32,
     ) -> Result<Option<Bytes>, Self::CacheError> {
         let full_path = self.root_path.join(path);
-        match tokio::fs::read(&full_path).await {
-            Ok(data) => {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "offset narrowing is intentional for slicing"
-                )]
-                let start = (offset as usize).min(data.len());
-                let end = start.saturating_add(size as usize).min(data.len());
-                Ok(Some(Bytes::copy_from_slice(&data[start..end])))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        }
+        let mut file = match tokio::fs::File::open(&full_path).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        let mut buf = vec![0u8; size as usize];
+        let n = file.read(&mut buf).await?;
+        buf.truncate(n);
+        Ok(Some(Bytes::from(buf)))
     }
 
     async fn is_cached(&self, path: &Path) -> bool {
