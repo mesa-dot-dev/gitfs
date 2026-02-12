@@ -5,6 +5,7 @@
 use async_trait::async_trait;
 use std::{
     ffi::{OsStr, OsString},
+    path::Path,
     time::{Duration, SystemTime},
 };
 use tracing::error;
@@ -372,4 +373,37 @@ pub trait Fs {
 
     /// Get filesystem statistics.
     async fn statfs(&mut self) -> Result<FilesystemStats, std::io::Error>;
+}
+
+/// Trait for filesystem implementations that can serve as a local mirror/cache.
+///
+/// All methods take `&self` to allow safe use from background `tokio::spawn` tasks.
+/// Implementations should use internal mutability (e.g., `tokio::fs` operations).
+/// Paths are relative to the cache root directory.
+#[async_trait]
+#[expect(
+    dead_code,
+    reason = "will be used by LocalFs and WriteThroughFs implementations"
+)]
+pub trait FsCacheProvider: Send + Sync {
+    /// The error type returned by cache operations.
+    type CacheError: std::error::Error + Send + 'static;
+
+    /// Write file content to the cache at the given relative path.
+    /// Creates parent directories as needed.
+    async fn populate_file(&self, path: &Path, content: &[u8]) -> Result<(), Self::CacheError>;
+
+    /// Read cached file content. Returns `None` if the file is not in the cache.
+    async fn read_cached_file(
+        &self,
+        path: &Path,
+        offset: u64,
+        size: u32,
+    ) -> Result<Option<Bytes>, Self::CacheError>;
+
+    /// Check whether a path has cached content.
+    async fn is_cached(&self, path: &Path) -> bool;
+
+    /// Remove cached content at a path (file or directory tree).
+    async fn invalidate(&self, path: &Path) -> Result<(), Self::CacheError>;
 }
