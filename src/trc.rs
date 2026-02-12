@@ -139,7 +139,7 @@ impl Trc {
 
         match self.mode {
             TrcMode::丑 { .. } => {
-                let indicatif_layer = IndicatifLayer::new();
+                let indicatif_layer = IndicatifLayer::new().with_max_progress_bars(20, None);
                 let pretty_with_indicatif: BoxedFmtLayer = Box::new(
                     tracing_subscriber::fmt::layer()
                         .with_ansi(use_ansi)

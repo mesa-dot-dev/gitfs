@@ -1,7 +1,13 @@
 //! Mescloud-specific inode control block, helpers, and directory cache wrapper.
 
-use std::ffi::OsStr;
+use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
+use std::sync::Arc;
 use std::time::SystemTime;
+
+use futures::StreamExt as _;
+use scc::HashMap as ConcurrentHashMap;
+use tracing::{trace, warn};
 
 use crate::fs::icache::{AsyncICache, IcbLike, IcbResolver, InodeFactory};
 use crate::fs::r#trait::{
@@ -76,22 +82,44 @@ pub fn make_common_file_attr(
     }
 }
 
-/// Mescloud-specific directory cache wrapper over `AsyncICache`.
-pub struct MescloudICache<R: IcbResolver<Icb = InodeControlBlock>> {
-    inner: AsyncICache<R>,
+struct MescloudICacheInner<R: IcbResolver<Icb = InodeControlBlock>> {
+    cache: AsyncICache<R>,
     inode_factory: InodeFactory,
+    /// O(1) lookup from (parent inode, child name) to child inode.
+    /// Maintained alongside the inode table to avoid linear scans in
+    /// `ensure_child_ino` and to provide atomicity under concurrent access.
+    child_index: ConcurrentHashMap<(Inode, OsString), Inode>,
     fs_owner: (u32, u32),
     block_size: u32,
+}
+
+/// Mescloud-specific directory cache wrapper over `AsyncICache`.
+///
+/// Cheaply cloneable via `Arc` so background tasks (e.g. prefetch) can share
+/// access to the cache and its domain-specific helpers.
+pub struct MescloudICache<R: IcbResolver<Icb = InodeControlBlock>> {
+    inner: Arc<MescloudICacheInner<R>>,
+}
+
+impl<R: IcbResolver<Icb = InodeControlBlock>> Clone for MescloudICache<R> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     /// Create a new `MescloudICache`. Initializes root ICB (rc=1), caches root dir attr.
     pub fn new(resolver: R, root_ino: Inode, fs_owner: (u32, u32), block_size: u32) -> Self {
         let cache = Self {
-            inner: AsyncICache::new(resolver, root_ino, "/"),
-            inode_factory: InodeFactory::new(root_ino + 1),
-            fs_owner,
-            block_size,
+            inner: Arc::new(MescloudICacheInner {
+                cache: AsyncICache::new(resolver, root_ino, "/"),
+                inode_factory: InodeFactory::new(root_ino + 1),
+                child_index: ConcurrentHashMap::new(),
+                fs_owner,
+                block_size,
+            }),
         };
 
         // Set root directory attr synchronously during initialization
@@ -99,7 +127,7 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         let root_attr = FileAttr::Directory {
             common: make_common_file_attr(root_ino, 0o755, now, now, fs_owner, block_size),
         };
-        cache.inner.get_icb_mut_sync(root_ino, |icb| {
+        cache.inner.cache.get_icb_mut_sync(root_ino, |icb| {
             icb.attr = Some(root_attr);
         });
 
@@ -109,7 +137,7 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     // -- Delegated from AsyncICache (async) --
 
     pub fn contains(&self, ino: Inode) -> bool {
-        self.inner.contains(ino)
+        self.inner.cache.contains(ino)
     }
 
     pub async fn get_icb<T>(
@@ -118,11 +146,11 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         // `Sync` required: see comment on `AsyncICache::get_icb`.
         f: impl Fn(&InodeControlBlock) -> T + Send + Sync,
     ) -> Option<T> {
-        self.inner.get_icb(ino, f).await
+        self.inner.cache.get_icb(ino, f).await
     }
 
     pub async fn insert_icb(&self, ino: Inode, icb: InodeControlBlock) {
-        self.inner.insert_icb(ino, icb).await;
+        self.inner.cache.insert_icb(ino, icb).await;
     }
 
     pub async fn entry_or_insert_icb<T>(
@@ -131,15 +159,28 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         factory: impl FnOnce() -> InodeControlBlock,
         then: impl FnOnce(&mut InodeControlBlock) -> T,
     ) -> T {
-        self.inner.entry_or_insert_icb(ino, factory, then).await
+        self.inner
+            .cache
+            .entry_or_insert_icb(ino, factory, then)
+            .await
     }
 
     pub async fn inc_rc(&self, ino: Inode) -> Option<u64> {
-        self.inner.inc_rc(ino).await
+        self.inner.cache.inc_rc(ino).await
     }
 
     pub async fn forget(&self, ino: Inode, nlookups: u64) -> Option<InodeControlBlock> {
-        self.inner.forget(ino, nlookups).await
+        let evicted = self.inner.cache.forget(ino, nlookups).await;
+        if let Some(ref icb) = evicted
+            && let Some(parent) = icb.parent
+        {
+            trace!(ino, parent, path = %icb.path.display(), "forget: cleaning up child_index");
+            self.inner
+                .child_index
+                .remove_async(&(parent, icb.path.as_os_str().to_os_string()))
+                .await;
+        }
+        evicted
     }
 
     pub async fn get_or_resolve<T>(
@@ -147,22 +188,119 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         ino: Inode,
         then: impl FnOnce(&InodeControlBlock) -> T,
     ) -> Result<T, R::Error> {
-        self.inner.get_or_resolve(ino, then).await
+        self.inner.cache.get_or_resolve(ino, then).await
+    }
+
+    /// Maximum concurrent readdir prefetches.
+    const MAX_READDIR_PREFETCH_CONCURRENCY: usize = 4;
+
+    /// Perform readdir-equivalent work for a directory: resolve its ICB,
+    /// allocate inodes for children, cache directory attrs, and trigger
+    /// deeper prefetch for subdirectory children.
+    ///
+    /// This is the "true readdir prefetch" -- when the user later calls
+    /// `readdir(ino)`, all the expensive work is already done.
+    pub async fn prefetch_readdir(&self, ino: Inode) -> Result<(), R::Error>
+    where
+        R: 'static,
+        R::Error: 'static,
+    {
+        let children = self
+            .inner
+            .cache
+            .get_or_resolve(ino, |icb| icb.children.clone())
+            .await?;
+
+        let Some(children) = children else {
+            return Ok(()); // Not a directory
+        };
+
+        let mut subdir_inodes = Vec::new();
+        let now = SystemTime::now();
+
+        for (name, kind) in &children {
+            let child_ino = self.ensure_child_ino(ino, OsStr::new(name)).await;
+            if *kind == DirEntryType::Directory {
+                let attr = FileAttr::Directory {
+                    common: make_common_file_attr(
+                        child_ino,
+                        0o755,
+                        now,
+                        now,
+                        self.inner.fs_owner,
+                        self.inner.block_size,
+                    ),
+                };
+                self.cache_attr(child_ino, attr).await;
+                subdir_inodes.push(child_ino);
+            }
+        }
+
+        let subdir_count = subdir_inodes.len();
+
+        // Trigger deeper prefetch: resolve subdirectory ICBs (one more level)
+        if !subdir_inodes.is_empty() {
+            self.inner.cache.spawn_prefetch(subdir_inodes);
+        }
+
+        trace!(
+            ino,
+            child_count = children.len(),
+            subdir_count,
+            "prefetch_readdir: completed"
+        );
+
+        Ok(())
+    }
+
+    /// Fire-and-forget: spawn background tasks that perform full readdir
+    /// prefetch for the given directory inodes.
+    pub fn spawn_prefetch_readdir(&self, inodes: impl IntoIterator<Item = Inode>)
+    where
+        R: 'static,
+        R::Error: std::fmt::Display + 'static,
+    {
+        let inodes: Vec<_> = inodes.into_iter().collect();
+        if inodes.is_empty() {
+            return;
+        }
+        trace!(
+            count = inodes.len(),
+            "spawn_prefetch_readdir: dispatching background task"
+        );
+        let cache = self.clone();
+        tokio::spawn(async move {
+            futures::stream::iter(inodes)
+                .for_each_concurrent(Self::MAX_READDIR_PREFETCH_CONCURRENCY, |ino| {
+                    let cache = cache.clone();
+                    async move {
+                        if let Err(e) = cache.prefetch_readdir(ino).await {
+                            warn!(ino, error = %e, "prefetch_readdir: failed (will retry on access)");
+                        }
+                    }
+                })
+                .await;
+        });
     }
 
     // -- Domain-specific --
 
     /// Allocate a new inode number.
     pub fn allocate_inode(&self) -> Inode {
-        self.inode_factory.allocate()
+        self.inner.inode_factory.allocate()
     }
 
     pub async fn get_attr(&self, ino: Inode) -> Option<FileAttr> {
-        self.inner.get_icb(ino, |icb| icb.attr).await.flatten()
+        self.inner
+            .cache
+            .get_icb(ino, |icb| icb.attr)
+            .await
+            .flatten()
     }
 
     pub async fn cache_attr(&self, ino: Inode, attr: FileAttr) {
         self.inner
+            .cache
             .get_icb_mut(ino, |icb| {
                 icb.attr = Some(attr);
             })
@@ -170,21 +308,21 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     }
 
     pub fn fs_owner(&self) -> (u32, u32) {
-        self.fs_owner
+        self.inner.fs_owner
     }
 
     pub fn block_size(&self) -> u32 {
-        self.block_size
+        self.inner.block_size
     }
 
     pub fn statfs(&self) -> FilesystemStats {
         FilesystemStats {
-            block_size: self.block_size,
-            fragment_size: u64::from(self.block_size),
+            block_size: self.inner.block_size,
+            fragment_size: u64::from(self.inner.block_size),
             total_blocks: 0,
             free_blocks: 0,
             available_blocks: 0,
-            total_inodes: self.inner.inode_count() as u64,
+            total_inodes: self.inner.cache.inode_count() as u64,
             free_inodes: 0,
             available_inodes: 0,
             filesystem_id: 0,
@@ -193,23 +331,41 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
         }
     }
 
-    /// Evict all `Available` children of `parent` that have `rc == 0`.
+    /// Evict rc=0 children of `parent` that are NOT in `current_names`.
+    /// Preserves prefetched children that are still part of the directory listing.
     /// Returns the list of evicted inode numbers so callers can clean up
     /// associated state (e.g., bridge mappings, slot tracking).
-    pub async fn evict_zero_rc_children(&self, parent: Inode) -> Vec<Inode> {
+    pub async fn evict_stale_children(
+        &self,
+        parent: Inode,
+        current_names: &HashSet<OsString>,
+    ) -> Vec<Inode> {
         let mut to_evict = Vec::new();
         self.inner
+            .cache
             .for_each(|&ino, icb| {
-                if icb.rc == 0 && icb.parent == Some(parent) {
-                    to_evict.push(ino);
+                if icb.rc == 0
+                    && icb.parent == Some(parent)
+                    && !current_names.contains(icb.path.as_os_str())
+                {
+                    to_evict.push((ino, icb.path.as_os_str().to_os_string()));
                 }
             })
             .await;
         let mut evicted = Vec::new();
-        for ino in to_evict {
-            if self.inner.forget(ino, 0).await.is_some() {
+        for (ino, name) in to_evict {
+            if self.inner.cache.forget(ino, 0).await.is_some() {
+                self.inner.child_index.remove_async(&(parent, name)).await;
                 evicted.push(ino);
             }
+        }
+        if !evicted.is_empty() {
+            trace!(
+                parent,
+                evicted_count = evicted.len(),
+                current_count = current_names.len(),
+                "evict_stale_children: removed stale entries"
+            );
         }
         evicted
     }
@@ -218,42 +374,52 @@ impl<R: IcbResolver<Icb = InodeControlBlock>> MescloudICache<R> {
     /// If new, inserts a stub ICB (parent+path set, attr=None, children=None, rc=0).
     /// Does NOT bump rc. Returns the inode number.
     ///
-    /// # Safety invariant
-    ///
-    /// The `for_each` scan and `insert_icb` are **not** atomic. If two callers
-    /// race with the same `(parent, name)`, both may allocate distinct inodes
-    /// for the same logical child. This is currently safe because all callers
-    /// go through `&mut self` on the owning `Fs` implementation.
+    /// Thread-safe: uses `child_index` with `entry_async` for atomic
+    /// check-and-insert, so concurrent callers for the same (parent, name)
+    /// always receive the same inode.
     pub async fn ensure_child_ino(&self, parent: Inode, name: &OsStr) -> Inode {
-        // Search for existing child by parent + name
-        let mut existing_ino = None;
-        self.inner
-            .for_each(|&ino, icb| {
-                if icb.parent == Some(parent) && icb.path.as_os_str() == name {
-                    existing_ino = Some(ino);
+        use scc::hash_map::Entry;
+
+        loop {
+            let key = (parent, name.to_os_string());
+            match self.inner.child_index.entry_async(key).await {
+                Entry::Occupied(occ) => {
+                    let ino = *occ.get();
+                    if self.inner.cache.contains(ino) {
+                        trace!(parent, ?name, ino, "ensure_child_ino: cache hit");
+                        return ino;
+                    }
+                    // Stale: inode was evicted (e.g. failed prefetch with rc=0).
+                    // Remove the stale mapping and loop to reallocate.
+                    warn!(
+                        parent,
+                        ?name,
+                        ino,
+                        "ensure_child_ino: stale child_index entry, reallocating"
+                    );
+                    drop(occ.remove_entry());
                 }
-            })
-            .await;
-
-        if let Some(ino) = existing_ino {
-            return ino;
+                Entry::Vacant(vac) => {
+                    let ino = self.inner.inode_factory.allocate();
+                    vac.insert_entry(ino);
+                    self.inner
+                        .cache
+                        .insert_icb(
+                            ino,
+                            InodeControlBlock {
+                                rc: 0,
+                                path: name.into(),
+                                parent: Some(parent),
+                                attr: None,
+                                children: None,
+                            },
+                        )
+                        .await;
+                    trace!(parent, ?name, ino, "ensure_child_ino: allocated new inode");
+                    return ino;
+                }
+            }
         }
-
-        // Allocate new inode and insert stub
-        let ino = self.inode_factory.allocate();
-        self.inner
-            .insert_icb(
-                ino,
-                InodeControlBlock {
-                    rc: 0,
-                    path: name.into(),
-                    parent: Some(parent),
-                    attr: None,
-                    children: None,
-                },
-            )
-            .await;
-        ino
     }
 }
 
@@ -366,72 +532,191 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evict_zero_rc_children_removes_stubs() {
+    async fn ensure_child_ino_is_idempotent() {
+        let cache = test_mescloud_cache();
+        let ino1 = cache.ensure_child_ino(1, OsStr::new("foo")).await;
+        let ino2 = cache.ensure_child_ino(1, OsStr::new("foo")).await;
+        assert_eq!(ino1, ino2, "same (parent, name) must return same inode");
+    }
+
+    #[tokio::test]
+    async fn ensure_child_ino_concurrent_same_child() {
+        let cache = Arc::new(test_mescloud_cache());
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let c = Arc::clone(&cache);
+            handles.push(tokio::spawn(async move {
+                c.ensure_child_ino(1, OsStr::new("bar")).await
+            }));
+        }
+        let inodes: Vec<Inode> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|e| panic!("task panicked: {e}")))
+            .collect();
+        assert!(
+            inodes.iter().all(|&i| i == inodes[0]),
+            "all concurrent calls must return the same inode: {inodes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_cleans_child_index() {
+        let cache = test_mescloud_cache();
+        let ino1 = cache.ensure_child_ino(1, OsStr::new("temp")).await;
+        // Use evict_stale_children with empty set (evicts all rc=0 children)
+        let evicted = cache.evict_stale_children(1, &HashSet::new()).await;
+        assert!(evicted.contains(&ino1));
+        let ino2 = cache.ensure_child_ino(1, OsStr::new("temp")).await;
+        assert_ne!(
+            ino1, ino2,
+            "after eviction, a new inode should be allocated"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::redundant_clone,
+        reason = "test exists to verify Clone is implemented"
+    )]
+    fn mescloud_icache_is_clone() {
+        let cache = test_mescloud_cache();
+        let _clone = cache.clone();
+    }
+
+    #[tokio::test]
+    async fn forget_cleans_child_index() {
+        let cache = test_mescloud_cache();
+        let ino = cache.ensure_child_ino(1, OsStr::new("ephemeral")).await;
+        let evicted = cache.forget(ino, 0).await;
+        assert!(evicted.is_some());
+        let ino2 = cache.ensure_child_ino(1, OsStr::new("ephemeral")).await;
+        assert_ne!(ino, ino2, "child_index should have been cleaned up");
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::similar_names,
+        reason = "bar_ino/baz_ino distinction is intentional"
+    )]
+    async fn evict_stale_children_preserves_current() {
+        use std::collections::HashSet;
+
         let cache = test_mescloud_cache();
 
-        // Insert stubs as children of root (ino=1) with rc=0
-        cache
-            .insert_icb(
-                10,
-                InodeControlBlock {
-                    rc: 0,
-                    path: "child_a".into(),
-                    parent: Some(1),
-                    attr: None,
-                    children: None,
-                },
-            )
-            .await;
-        cache
-            .insert_icb(
-                11,
-                InodeControlBlock {
-                    rc: 0,
-                    path: "child_b".into(),
-                    parent: Some(1),
-                    attr: None,
-                    children: None,
-                },
-            )
-            .await;
+        // Insert children of root via ensure_child_ino (populates child_index)
+        let foo_ino = cache.ensure_child_ino(1, OsStr::new("foo")).await;
+        let bar_ino = cache.ensure_child_ino(1, OsStr::new("bar")).await;
+        let baz_ino = cache.ensure_child_ino(1, OsStr::new("baz")).await;
 
-        // Insert a child with rc > 0 — should survive
-        cache
-            .insert_icb(
-                12,
-                InodeControlBlock {
-                    rc: 1,
-                    path: "active".into(),
-                    parent: Some(1),
-                    attr: None,
-                    children: None,
-                },
-            )
-            .await;
+        // "foo" and "baz" are in the current listing; "bar" is stale
+        let current: HashSet<OsString> =
+            ["foo", "baz"].iter().copied().map(OsString::from).collect();
+        let evicted = cache.evict_stale_children(1, &current).await;
 
-        // Insert a stub under a different parent — should survive
-        cache
-            .insert_icb(
-                20,
-                InodeControlBlock {
-                    rc: 0,
-                    path: "other".into(),
-                    parent: Some(12),
-                    attr: None,
-                    children: None,
-                },
-            )
-            .await;
+        assert_eq!(evicted, vec![bar_ino], "only stale 'bar' should be evicted");
+        assert!(cache.contains(foo_ino), "current child 'foo' preserved");
+        assert!(!cache.contains(bar_ino), "stale child 'bar' evicted");
+        assert!(cache.contains(baz_ino), "current child 'baz' preserved");
+    }
 
-        let evicted = cache.evict_zero_rc_children(1).await;
-        assert_eq!(evicted.len(), 2, "should evict 2 zero-rc children of root");
+    struct PrefetchTestResolver {
+        listings: std::sync::Mutex<std::collections::HashMap<Inode, Vec<(String, DirEntryType)>>>,
+    }
 
-        assert!(!cache.contains(10), "child_a should be evicted");
-        assert!(!cache.contains(11), "child_b should be evicted");
-        assert!(cache.contains(12), "active child should survive");
+    impl PrefetchTestResolver {
+        fn new() -> Self {
+            Self {
+                listings: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+
+        fn add_dir(&self, ino: Inode, children: Vec<(String, DirEntryType)>) {
+            self.listings.lock().unwrap().insert(ino, children);
+        }
+    }
+
+    impl IcbResolver for PrefetchTestResolver {
+        type Icb = InodeControlBlock;
+        type Error = super::super::common::LookupError;
+
+        fn resolve(
+            &self,
+            ino: Inode,
+            stub: Option<InodeControlBlock>,
+            _cache: &AsyncICache<Self>,
+        ) -> impl Future<Output = Result<InodeControlBlock, Self::Error>> + Send
+        where
+            Self: Sized,
+        {
+            let listings = self.listings.lock().unwrap().clone();
+            async move {
+                let stub = stub.ok_or(super::super::common::LookupError::InodeNotFound)?;
+                let children = listings.get(&ino).cloned();
+                let now = SystemTime::now();
+                let attr = if children.is_some() {
+                    FileAttr::Directory {
+                        common: make_common_file_attr(ino, 0o755, now, now, (0, 0), 4096),
+                    }
+                } else {
+                    FileAttr::RegularFile {
+                        common: make_common_file_attr(ino, 0o644, now, now, (0, 0), 4096),
+                        size: 42,
+                        blocks: 1,
+                    }
+                };
+                Ok(InodeControlBlock {
+                    parent: stub.parent,
+                    path: stub.path,
+                    rc: stub.rc,
+                    attr: Some(attr),
+                    children,
+                })
+            }
+        }
+    }
+
+    fn test_prefetch_cache(resolver: PrefetchTestResolver) -> MescloudICache<PrefetchTestResolver> {
+        MescloudICache::new(resolver, 1, (0, 0), 4096)
+    }
+
+    #[tokio::test]
+    async fn prefetch_readdir_allocates_child_inodes_and_caches_dir_attrs() {
+        let resolver = PrefetchTestResolver::new();
+        resolver.add_dir(
+            1,
+            vec![
+                ("src".to_owned(), DirEntryType::Directory),
+                ("README.md".to_owned(), DirEntryType::RegularFile),
+            ],
+        );
+
+        let cache = test_prefetch_cache(resolver);
+
+        cache.prefetch_readdir(1).await.unwrap();
+
+        // Children should have inodes allocated
+        let src_ino = cache.ensure_child_ino(1, OsStr::new("src")).await;
+        let readme_ino = cache.ensure_child_ino(1, OsStr::new("README.md")).await;
+
+        assert!(cache.contains(src_ino), "src should exist in cache");
         assert!(
-            cache.contains(20),
-            "child of different parent should survive"
+            cache.contains(readme_ino),
+            "README.md should exist in cache"
+        );
+
+        // Directory children should have cached attr
+        let src_attr = cache.get_attr(src_ino).await;
+        assert!(
+            matches!(src_attr, Some(FileAttr::Directory { .. })),
+            "src should have directory attr cached"
+        );
+
+        // File children should NOT have cached attr (avoids poisoning needs_resolve)
+        let readme_attr = cache.get_attr(readme_ino).await;
+        assert!(
+            readme_attr.is_none(),
+            "file children should not have attr cached by prefetch"
         );
     }
 }
