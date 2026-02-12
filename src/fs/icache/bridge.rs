@@ -1,72 +1,104 @@
+use parking_lot::RwLock;
+
 use crate::fs::r#trait::{FileAttr, FileHandle, Inode};
 
 /// Bidirectional bridge for both inodes and file handles between two Fs layers.
 ///
 /// Convention: **left = outer (caller), right = inner (callee)**.
-/// `forward(left)` → right, `backward(right)` → left.
+/// `forward(left)` -> right, `backward(right)` -> left.
+///
+/// All methods take `&self`; internal synchronization via `parking_lot::RwLock`.
 pub struct HashMapBridge {
-    inode_map: bimap::BiMap<Inode, Inode>,
-    fh_map: bimap::BiMap<FileHandle, FileHandle>,
+    inode_map: RwLock<bimap::BiMap<Inode, Inode>>,
+    fh_map: RwLock<bimap::BiMap<FileHandle, FileHandle>>,
 }
 
 impl HashMapBridge {
     pub fn new() -> Self {
         Self {
-            inode_map: bimap::BiMap::new(),
-            fh_map: bimap::BiMap::new(),
+            inode_map: RwLock::new(bimap::BiMap::new()),
+            fh_map: RwLock::new(bimap::BiMap::new()),
         }
     }
 
-    // ── Inode methods ────────────────────────────────────────────────────
-
-    pub fn insert_inode(&mut self, left: Inode, right: Inode) {
-        self.inode_map.insert(left, right);
+    /// Clear both maps, resetting the bridge to its initial empty state.
+    pub fn reset(&self) {
+        self.inode_map.write().clear();
+        self.fh_map.write().clear();
     }
 
-    /// Look up right→left, or allocate a new left inode if unmapped.
+    // Inode methods
+
+    pub fn insert_inode(&self, left: Inode, right: Inode) {
+        self.inode_map.write().insert(left, right);
+    }
+
+    /// Look up right->left, or allocate a new left inode if unmapped.
+    ///
+    /// Uses double-checked locking: read-lock first, then write-lock only if
+    /// the mapping is missing.
     pub fn backward_or_insert_inode(
-        &mut self,
+        &self,
         right: Inode,
         allocate: impl FnOnce() -> Inode,
     ) -> Inode {
-        if let Some(&left) = self.inode_map.get_by_right(&right) {
+        // Fast path: read-lock.
+        {
+            let map = self.inode_map.read();
+            if let Some(&left) = map.get_by_right(&right) {
+                return left;
+            }
+        }
+        // Slow path: write-lock with re-check.
+        let mut map = self.inode_map.write();
+        if let Some(&left) = map.get_by_right(&right) {
             left
         } else {
             let left = allocate();
-            self.inode_map.insert(left, right);
+            map.insert(left, right);
             left
         }
     }
 
-    /// Look up left→right, or allocate a new right inode if unmapped.
-    pub fn forward_or_insert_inode(
-        &mut self,
-        left: Inode,
-        allocate: impl FnOnce() -> Inode,
-    ) -> Inode {
-        if let Some(&right) = self.inode_map.get_by_left(&left) {
+    /// Look up left->right, or allocate a new right inode if unmapped.
+    ///
+    /// Uses double-checked locking: read-lock first, then write-lock only if
+    /// the mapping is missing.
+    pub fn forward_or_insert_inode(&self, left: Inode, allocate: impl FnOnce() -> Inode) -> Inode {
+        // Fast path: read-lock.
+        {
+            let map = self.inode_map.read();
+            if let Some(&right) = map.get_by_left(&left) {
+                return right;
+            }
+        }
+        // Slow path: write-lock with re-check.
+        let mut map = self.inode_map.write();
+        if let Some(&right) = map.get_by_left(&left) {
             right
         } else {
             let right = allocate();
-            self.inode_map.insert(left, right);
+            map.insert(left, right);
             right
         }
     }
 
     /// Remove an inode mapping by its left (outer) key.
-    pub fn remove_inode_by_left(&mut self, left: Inode) {
-        self.inode_map.remove_by_left(&left);
+    pub fn remove_inode_by_left(&self, left: Inode) {
+        self.inode_map.write().remove_by_left(&left);
     }
 
-    /// Look up left→right directly.
-    pub fn inode_map_get_by_left(&self, left: Inode) -> Option<&Inode> {
-        self.inode_map.get_by_left(&left)
+    /// Look up left->right directly. Returns an owned `Inode` (copied out of
+    /// the lock guard) so the caller does not hold a borrow into the map.
+    pub fn inode_map_get_by_left(&self, left: Inode) -> Option<Inode> {
+        self.inode_map.read().get_by_left(&left).copied()
     }
 
     /// Rewrite the `ino` field in a [`FileAttr`] from right (inner) to left (outer) namespace.
     pub fn attr_backward(&self, attr: FileAttr) -> FileAttr {
+        let map = self.inode_map.read();
         let backward = |ino: Inode| -> Inode {
-            if let Some(&left) = self.inode_map.get_by_right(&ino) {
+            if let Some(&left) = map.get_by_right(&ino) {
                 left
             } else {
                 tracing::warn!(
@@ -79,19 +111,19 @@ impl HashMapBridge {
         rewrite_attr_ino(attr, backward)
     }
 
-    // ── File handle methods ──────────────────────────────────────────────
+    // File handle methods
 
-    pub fn insert_fh(&mut self, left: FileHandle, right: FileHandle) {
-        self.fh_map.insert(left, right);
+    pub fn insert_fh(&self, left: FileHandle, right: FileHandle) {
+        self.fh_map.write().insert(left, right);
     }
 
     pub fn fh_forward(&self, left: FileHandle) -> Option<FileHandle> {
-        self.fh_map.get_by_left(&left).copied()
+        self.fh_map.read().get_by_left(&left).copied()
     }
 
     /// Remove a file handle mapping by its left (outer) key.
-    pub fn remove_fh_by_left(&mut self, left: FileHandle) {
-        self.fh_map.remove_by_left(&left);
+    pub fn remove_fh_by_left(&self, left: FileHandle) {
+        self.fh_map.write().remove_by_left(&left);
     }
 }
 
