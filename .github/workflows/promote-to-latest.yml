@@ -133,60 +133,16 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Homebrew
-        uses: Homebrew/actions/setup-homebrew@master
-
-      - name: Download macOS universal tarball and compute SHA256
-        id: sha
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          TAG="v${{ needs.promote.outputs.base_version }}"
-          curl -fSL -o git-fs-macos-universal.tar.gz \
-            "https://github.com/${{ github.repository }}/releases/download/${TAG}/git-fs-macos-universal.tar.gz"
-          SHA=$(sha256sum git-fs-macos-universal.tar.gz | cut -d' ' -f1)
-          echo "sha256=${SHA}" >> "$GITHUB_OUTPUT"
-
-      - name: Clone Homebrew tap
-        uses: actions/checkout@v4
+      - uses: mesa-dot-dev/homebrew-tap-action@main
         with:
-          repository: mesa-dot-dev/homebrew-tap
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          path: tap
-          ref: staged
-
-      - name: Compute Homebrew class name
-        id: class
-        env:
-          VERSION: ${{ needs.promote.outputs.base_version }}
-        run: |
-          CLASS_NAME=$(brew ruby -e "puts Formulary.class_s('git-fs@${VERSION}')")
-          echo "class_name=${CLASS_NAME}" >> "$GITHUB_OUTPUT"
-
-      - name: Generate formulae
-        env:
-          VERSION: ${{ needs.promote.outputs.base_version }}
-          SHA256: ${{ steps.sha.outputs.sha256 }}
-          CLASS_NAME: ${{ steps.class.outputs.class_name }}
-        run: |
-          if [ ! -d tap ]; then
-            echo "Error: tap directory does not exist — clone may have failed"
-            exit 1
-          fi
-          mkdir -p tap/Formula
-
-          # Latest formula (class name is always GitFs)
-          CLASS_NAME=GitFs envsubst '${CLASS_NAME} ${VERSION} ${SHA256}' < formula.rb > tap/Formula/git-fs.rb
-
-          # Versioned formula (e.g., Formula/git-fs@0.1.1-alpha.1.rb)
-          envsubst '${CLASS_NAME} ${VERSION} ${SHA256}' < formula.rb > "tap/Formula/git-fs@${VERSION}.rb"
-
-      - name: Commit and push formulae
-        working-directory: tap
-        run: |
-          git config user.name "mesa-ci[bot]"
-          git config user.email "ci-bot@mesa.dev"
-          git add Formula/
-          git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "git-fs ${{ needs.promote.outputs.base_version }}"
-          git push origin staged
+          tap: mesa-dot-dev/homebrew-tap
+          tap-token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          tap-branch: staged
+          template: formula.rb
+          latest-path: Formula/git-fs.rb
+          versioned-path: "Formula/git-fs@${VERSION}.rb"
+          version: ${{ needs.promote.outputs.base_version }}
+          url: "https://github.com/${{ github.repository }}/releases/download/v${{ needs.promote.outputs.base_version }}/git-fs-macos-universal.tar.gz"
+          commit-message: "git-fs ${VERSION}"
+          committer-name: "mesa-ci[bot]"
+          committer-email: ci-bot@mesa.dev
