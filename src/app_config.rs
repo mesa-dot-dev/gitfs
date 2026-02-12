@@ -333,6 +333,35 @@ impl Default for DaemonConfig {
     }
 }
 
+/// The Mesa telemetry endpoint.
+pub const MESA_TELEMETRY_ENDPOINT: &str = "https://telemetry.priv.mesa.dev/v1/traces";
+
+/// Telemetry configuration for exporting OpenTelemetry traces.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct TelemetryConfig {
+    /// Whether to send telemetry data to Mesa's servers.
+    pub vendor: bool,
+
+    /// Custom collector URL for forwarding telemetry to the user's own servers.
+    pub collector_url: Option<String>,
+}
+
+impl TelemetryConfig {
+    /// Returns the list of OTLP endpoints to export traces to.
+    #[must_use]
+    pub fn endpoints(&self) -> Vec<String> {
+        let mut endpoints = Vec::new();
+        if self.vendor {
+            endpoints.push(MESA_TELEMETRY_ENDPOINT.to_owned());
+        }
+        if let Some(ref url) = self.collector_url {
+            endpoints.push(url.clone());
+        }
+        endpoints
+    }
+}
+
 /// Application configuration structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -349,6 +378,9 @@ pub struct Config {
 
     #[serde(default)]
     pub daemon: DaemonConfig,
+
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
 
     /// The mount point for the filesystem.
     #[serde(default = "default_mount_point")]
@@ -369,6 +401,7 @@ struct DangerousConfig<'a> {
     pub organizations: HashMap<&'a str, DangerousOrganizationConfig<'a>>,
     pub cache: &'a CacheConfig,
     pub daemon: &'a DaemonConfig,
+    pub telemetry: &'a TelemetryConfig,
     pub mount_point: &'a Path,
     pub uid: u32,
     pub gid: u32,
@@ -388,6 +421,7 @@ impl<'a> From<&'a Config> for DangerousConfig<'a> {
                 .collect(),
             cache: &config.cache,
             daemon: &config.daemon,
+            telemetry: &config.telemetry,
             mount_point: &config.mount_point,
             uid: config.uid,
             gid: config.gid,
@@ -401,6 +435,7 @@ impl Default for Config {
             organizations: default_organizations(),
             cache: CacheConfig::default(),
             daemon: DaemonConfig::default(),
+            telemetry: TelemetryConfig::default(),
             mount_point: default_mount_point(),
             uid: current_uid(),
             gid: current_gid(),
@@ -457,6 +492,15 @@ impl Config {
                     path.display()
                 ));
             }
+        }
+
+        if let Some(ref url) = self.telemetry.collector_url
+            && !url.starts_with("http://")
+            && !url.starts_with("https://")
+        {
+            errors.push(format!(
+                "Telemetry collector URL '{url}' must start with http:// or https://."
+            ));
         }
 
         if errors.is_empty() {

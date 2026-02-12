@@ -767,6 +767,7 @@ dependencies = [
  "dirs",
  "fuser",
  "futures",
+ "http",
  "inquire",
  "libc",
  "mesa-dev",
@@ -1533,7 +1534,6 @@ dependencies = [
  "prost",
  "reqwest",
  "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]

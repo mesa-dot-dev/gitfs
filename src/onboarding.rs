@@ -7,7 +7,7 @@ use inquire::{Confirm, Password, Text, validator::Validation};
 use secrecy::SecretString;
 
 use crate::{
-    app_config::{Config, ExpandedPathBuf, OrganizationConfig},
+    app_config::{Config, ExpandedPathBuf, OrganizationConfig, TelemetryConfig},
     term::should_use_color,
 };
 
@@ -116,9 +116,22 @@ pub fn run_wizard() -> Result<Config, OnboardingError> {
         org_keys.push((org_name, SecretString::from(api_key)));
     }
 
+    let enable_vendor_telemetry = Confirm::new(
+        "Would you like to share anonymous usage data with Mesa to help improve git-fs?",
+    )
+    .with_default(true)
+    .with_help_message(
+        "This sends performance telemetry to Mesa's servers. No file contents are shared.",
+    )
+    .prompt()?;
+
     // Build config
     let mut config = Config {
         mount_point,
+        telemetry: TelemetryConfig {
+            vendor: enable_vendor_telemetry,
+            collector_url: None,
+        },
         ..defaults
     };
 
