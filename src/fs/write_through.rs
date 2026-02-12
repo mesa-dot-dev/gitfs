@@ -136,8 +136,17 @@ where
 
     #[instrument(name = "WriteThroughFs::readdir", skip(self))]
     async fn readdir(&mut self, ino: Inode) -> Result<&[DirEntry], Self::ReaddirError> {
-        // Stub -- caching implemented in Task 6
+        self.maybe_evict();
+
         let entries = self.back.readdir(ino).await?.to_vec();
+
+        // Record paths for all children
+        let parent_path = self.inode_paths.get(&ino).cloned().unwrap_or_default();
+        for entry in &entries {
+            let child_path = parent_path.join(&entry.name);
+            self.inode_paths.insert(entry.ino, child_path);
+        }
+
         self.readdir_buf = entries;
         Ok(&self.readdir_buf)
     }
@@ -227,7 +236,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::r#trait::{CommonFileAttr, Permissions};
+    use crate::fs::r#trait::{CommonFileAttr, DirEntryType, Permissions};
     use std::path::Path;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -654,5 +663,79 @@ mod tests {
         // Read a slice from cache
         let data = wt.read(10, 1, 3, 4, OpenFlags::RDONLY, None).await.unwrap();
         assert_eq!(data, Bytes::from_static(b"3456"));
+    }
+
+    #[tokio::test]
+    async fn readdir_records_child_paths() {
+        let mut mock = MockBackend::new();
+        mock.readdir_results.insert(
+            1,
+            vec![
+                DirEntry {
+                    ino: 2,
+                    name: "src".into(),
+                    kind: DirEntryType::Directory,
+                },
+                DirEntry {
+                    ino: 3,
+                    name: "README.md".into(),
+                    kind: DirEntryType::RegularFile,
+                },
+            ],
+        );
+        let mut wt = make_wt(mock);
+        wt.inode_paths.insert(1, PathBuf::new());
+
+        wt.readdir(1).await.unwrap();
+
+        assert_eq!(wt.inode_paths.get(&2), Some(&PathBuf::from("src")));
+        assert_eq!(wt.inode_paths.get(&3), Some(&PathBuf::from("README.md")));
+    }
+
+    #[tokio::test]
+    async fn tracker_records_cached_file_size() {
+        let mut mock = MockBackend::new();
+        mock.read_results.insert(10, Bytes::from_static(b"hello"));
+        let mut wt = make_wt(mock);
+        wt.inode_paths.insert(10, PathBuf::from("f.txt"));
+
+        wt.read(10, 1, 0, 100, OpenFlags::RDONLY, None)
+            .await
+            .unwrap();
+
+        // Wait for background task
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert_eq!(wt.tracker.estimated_size(), 5);
+    }
+
+    #[tokio::test]
+    async fn eviction_removes_stale_cache_entries() {
+        let mut mock = MockBackend::new();
+        mock.read_results.insert(10, Bytes::from_static(b"content"));
+        let mut wt = WriteThroughFs::new(
+            MockCache::new(),
+            mock,
+            Duration::from_millis(50), // stale after 50ms
+            Duration::from_millis(10), // check every 10ms
+        );
+        wt.inode_paths.insert(10, PathBuf::from("f.txt"));
+
+        // Populate cache
+        wt.read(10, 1, 0, 100, OpenFlags::RDONLY, None)
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(wt.front.is_cached(Path::new("f.txt")).await);
+
+        // Wait for staleness + trigger eviction
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        wt.maybe_evict();
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert!(!wt.front.is_cached(Path::new("f.txt")).await);
     }
 }
