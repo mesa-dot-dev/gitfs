@@ -380,11 +380,11 @@ pub trait Fs {
 /// All methods take `&self` to allow safe use from background `tokio::spawn` tasks.
 /// Implementations should use internal mutability (e.g., `tokio::fs` operations).
 /// Paths are relative to the cache root directory.
-#[async_trait]
-#[expect(
-    dead_code,
-    reason = "will be used by LocalFs and WriteThroughFs implementations"
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by WriteThroughFs in Tasks 4-6")
 )]
+#[async_trait]
 pub trait FsCacheProvider: Send + Sync {
     /// The error type returned by cache operations.
     type CacheError: std::error::Error + Send + 'static;
