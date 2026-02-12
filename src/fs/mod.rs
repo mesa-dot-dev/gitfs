@@ -1,3 +1,4 @@
+pub mod cache_tracker;
 pub mod fuser;
 pub mod icache;
 // TODO: re-enable after icache refactoring is complete
