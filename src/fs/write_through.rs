@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tracing::{instrument, warn};
+use tracing::{instrument, trace, warn};
 
 use crate::fs::cache_tracker::CacheTracker;
 use crate::fs::r#trait::{
@@ -157,10 +157,39 @@ where
         flags: OpenFlags,
         lock_owner: Option<LockOwner>,
     ) -> Result<Bytes, Self::ReadError> {
-        // Stub -- caching implemented in Task 5
-        self.back
+        self.maybe_evict();
+
+        // Check cache first
+        if let Some(path) = self.inode_paths.get(&ino)
+            && let Ok(Some(cached)) = self.front.read_cached_file(path, offset, size).await
+        {
+            trace!(ino, ?path, "read: cache hit");
+            return Ok(cached);
+        }
+
+        // Cache miss — read from backend
+        let data = self
+            .back
             .read(ino, fh, offset, size, flags, lock_owner)
-            .await
+            .await?;
+
+        // Background: populate cache with the full read result
+        if let Some(path) = self.inode_paths.get(&ino).cloned() {
+            let front = Arc::clone(&self.front);
+            let tracker = Arc::clone(&self.tracker);
+            let content = data.clone();
+            tokio::spawn(async move {
+                let size = content.len() as u64;
+                if let Err(e) = front.populate_file(&path, &content).await {
+                    warn!(?e, ?path, "background cache populate failed");
+                    return;
+                }
+                tracker.track(path, size).await;
+                trace!("background cache populate complete");
+            });
+        }
+
+        Ok(data)
     }
 
     #[instrument(name = "WriteThroughFs::release", skip(self))]
@@ -223,7 +252,7 @@ mod tests {
         lookup_count: AtomicU64,
         getattr_count: AtomicU64,
         _readdir_count: AtomicU64,
-        _read_count: AtomicU64,
+        read_count: AtomicU64,
         readdir_buf: Vec<DirEntry>,
     }
 
@@ -237,7 +266,7 @@ mod tests {
                 lookup_count: AtomicU64::new(0),
                 getattr_count: AtomicU64::new(0),
                 _readdir_count: AtomicU64::new(0),
-                _read_count: AtomicU64::new(0),
+                read_count: AtomicU64::new(0),
                 readdir_buf: Vec::new(),
             }
         }
@@ -287,7 +316,7 @@ mod tests {
             _flags: OpenFlags,
             _lock_owner: Option<LockOwner>,
         ) -> Result<Bytes, MockError> {
-            self._read_count.fetch_add(1, Ordering::Relaxed);
+            self.read_count.fetch_add(1, Ordering::Relaxed);
             let data = self.read_results.get(&ino).ok_or(MockError)?;
             let start = usize::try_from(offset)
                 .unwrap_or(usize::MAX)
@@ -558,5 +587,72 @@ mod tests {
             !wt.inode_paths.contains_key(&10),
             "inode 10 should be evicted after forget"
         );
+    }
+
+    #[tokio::test]
+    async fn read_caches_to_front_in_background() {
+        let mut mock = MockBackend::new();
+        mock.read_results
+            .insert(10, Bytes::from_static(b"file content here"));
+        let mut wt = make_wt(mock);
+        wt.inode_paths.insert(10, PathBuf::from("test/file.txt"));
+
+        // First read: goes to backend, spawns background cache write
+        let data = wt
+            .read(10, 1, 0, 100, OpenFlags::RDONLY, None)
+            .await
+            .unwrap();
+        assert_eq!(data, Bytes::from_static(b"file content here"));
+        assert_eq!(wt.back.read_count.load(Ordering::Relaxed), 1);
+
+        // Give background task time to complete
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Second read: should hit the cache, NOT the backend
+        let data = wt
+            .read(10, 1, 0, 100, OpenFlags::RDONLY, None)
+            .await
+            .unwrap();
+        assert_eq!(data, Bytes::from_static(b"file content here"));
+        assert_eq!(
+            wt.back.read_count.load(Ordering::Relaxed),
+            1,
+            "backend should only be called once"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_without_path_still_works() {
+        let mut mock = MockBackend::new();
+        mock.read_results.insert(10, Bytes::from_static(b"data"));
+        let mut wt = make_wt(mock);
+        // No inode_paths entry for ino 10
+
+        let data = wt
+            .read(10, 1, 0, 100, OpenFlags::RDONLY, None)
+            .await
+            .unwrap();
+        assert_eq!(data, Bytes::from_static(b"data"));
+    }
+
+    #[tokio::test]
+    async fn read_cache_hit_returns_correct_slice() {
+        let mut mock = MockBackend::new();
+        mock.read_results
+            .insert(10, Bytes::from_static(b"0123456789"));
+        let mut wt = make_wt(mock);
+        wt.inode_paths.insert(10, PathBuf::from("f.txt"));
+
+        // Populate cache with full content
+        wt.read(10, 1, 0, 100, OpenFlags::RDONLY, None)
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Read a slice from cache
+        let data = wt.read(10, 1, 3, 4, OpenFlags::RDONLY, None).await.unwrap();
+        assert_eq!(data, Bytes::from_static(b"3456"));
     }
 }
