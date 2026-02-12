@@ -180,6 +180,11 @@ impl Trc {
 
         let (reload_layer, fmt_handle) = reload::Layer::new(initial_layer);
         let provider = self.build_otel_provider();
+        if provider.is_some() {
+            opentelemetry::global::set_text_map_propagator(
+                opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+            );
+        }
 
         match self.mode {
             TrcMode::丑 { .. } => {

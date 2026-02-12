@@ -767,6 +767,7 @@ dependencies = [
  "dirs",
  "fuser",
  "futures",
+ "http",
  "inquire",
  "libc",
  "mesa-dev",
