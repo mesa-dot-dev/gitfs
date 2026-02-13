@@ -35,7 +35,7 @@ struct LruProcessingTask<K: Copy, D: Deleter<K>> {
     ordered_key_set: LinkedHashSet<K>,
 
     /// Tracks which keys are currently considered evicted. Read the long explanation in
-    /// service_message for why this is necessary.
+    /// `service_message` for why this is necessary.
     evicted_keys: HashSet<K>,
 
     /// The deleter to call when we need to evict keys.
@@ -132,14 +132,17 @@ impl<K: Copy + Eq + Hash + Send + 'static, D: Deleter<K>> LruProcessingTask<K, D
                         self.evicted_keys.extend(eviction_set_it.clone());
                         self.deleter.delete(eviction_set_it);
                         for _ in 0..take_count {
-                            if let None = self.ordered_key_set.pop_front() {
+                            if self.ordered_key_set.pop_front().is_none() {
                                 break;
                             }
                         }
                     }
                 }
                 Message::Inserted(k) => {
-                    debug_assert!(!self.ordered_key_set.contains(&k));
+                    debug_assert!(
+                        !self.ordered_key_set.contains(&k),
+                        "key must not already exist in the ordered set when inserting"
+                    );
 
                     // If the key has been evicted, but is now inserted, that means the key is no
                     // longer stale.
@@ -156,7 +159,10 @@ impl<K: Copy + Eq + Hash + Send + 'static, D: Deleter<K>> LruProcessingTask<K, D
     }
 
     fn reposition_existing_key(&mut self, key: K) {
-        debug_assert!(self.ordered_key_set.contains(&key));
+        debug_assert!(
+            self.ordered_key_set.contains(&key),
+            "key must exist in the ordered set before repositioning"
+        );
 
         self.ordered_key_set.remove(&key);
         self.ordered_key_set.insert(key);
@@ -203,7 +209,12 @@ impl<K: Copy + Eq + Send + Hash + 'static> LruEvictionTracker<K> {
 
     /// Send a message to the worker. This is a helper method to reduce code duplication.
     async fn send_msg(&self, message: Message<K>) {
-        if let Err(_) = self.worker_message_sender.send(message.clone()).await {
+        if self
+            .worker_message_sender
+            .send(message.clone())
+            .await
+            .is_err()
+        {
             unreachable!();
         }
     }

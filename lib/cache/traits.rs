@@ -55,6 +55,7 @@ where
 /// Avoid using this cache as a generic parameter. `ReadableCache` is the correct trait to use for
 /// generic parameters, and will support both synchronous and asynchronous implementations of the
 /// cache.
+#[expect(async_fn_in_trait)]
 pub trait AsyncReadableCache<K, V>
 where
     K: Eq + Hash,
@@ -170,6 +171,7 @@ where
 /// Avoid using this cache as a generic parameter. `WritableCache` is the correct trait to use for
 /// generic parameters, and will support both synchronous and asynchronous implementations of the
 /// cache.
+#[expect(async_fn_in_trait)]
 pub trait AsyncWritableCache<K, V, E>
 where
     K: Eq + Hash,
