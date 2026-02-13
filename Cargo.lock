@@ -788,7 +788,6 @@ dependencies = [
  "reqwest-middleware",
  "rustc-hash",
  "scc",
- "scopeguard",
  "secrecy",
  "self_update",
  "semver",
