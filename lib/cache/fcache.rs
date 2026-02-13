@@ -6,10 +6,34 @@ use std::{
     sync::atomic::AtomicUsize,
 };
 
-use crate::{cache::traits::AsyncReadableCache, io};
+use crate::{
+    cache::{
+        eviction::lru::{Deleter, LruEvictionTracker},
+        traits::AsyncReadableCache,
+    },
+    io,
+};
 use thiserror::Error;
 
 use tokio::io::AsyncReadExt;
+
+struct LruEntryDeleter;
+
+impl LruEntryDeleter {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl<K> Deleter<K> for LruEntryDeleter {
+    fn delete<'a>(&mut self, keys: impl Iterator<Item = &'a K>)
+    where
+        K: 'a,
+    {
+        // TODO(markovejnovic): Implement this.
+        unimplemented!()
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum InvalidRootPathError {
@@ -27,9 +51,15 @@ pub struct FileCache<K: Eq + Hash> {
     root_path: PathBuf,
     map: scc::HashMap<K, usize>,
     file_generator: AtomicUsize,
+    lru_tracker: LruEvictionTracker<K>,
 }
 
-impl<K: Eq + Hash> FileCache<K> {
+impl<K: Eq + Hash + Send + Copy + 'static> FileCache<K> {
+    // How many cache entries to evict at most in a single batch.
+    //
+    // Not really sure how to determine this number.
+    const LRU_EVICTION_MAX_BATCH_SIZE: usize = 32;
+
     // Dangerous: Changing this constant may cause the program to treat existing cache directories
     // as invalid, and thus provide a worse user experience. Do not change this unless you have a
     // very good reason to do so. Changing this will break backwards compatibility with existing
@@ -83,17 +113,22 @@ impl<K: Eq + Hash> FileCache<K> {
             root_path: pbuf,
             map: scc::HashMap::new(),
             file_generator: AtomicUsize::new(0),
+            lru_tracker: LruEvictionTracker::spawn(
+                LruEntryDeleter::new(),
+                Self::LRU_EVICTION_MAX_BATCH_SIZE,
+            ),
         })
     }
 }
 
-impl<K: Eq + Hash> AsyncReadableCache<K, Vec<u8>> for FileCache<K> {
+impl<K: Eq + Hash + Copy + Send + 'static> AsyncReadableCache<K, Vec<u8>> for FileCache<K> {
     async fn get(&self, key: &K) -> Option<Vec<u8>> {
         let mut file = {
             let entry = self.map.get_async(key).await?;
             let path = self.root_path.join(entry.get().to_string());
             tokio::fs::File::open(&path).await.ok()?
         };
+        self.lru_tracker.access(*key).await;
 
         let mut buf = Vec::new();
         file.read_to_end(&mut buf).await.ok()?;

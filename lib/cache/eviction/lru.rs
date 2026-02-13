@@ -185,24 +185,24 @@ impl<K: Copy + Eq + Send + Hash + 'static> LruEvictionTracker<K> {
     /// Notify the LRU eviction tracker that the given key was inserted.
     ///
     /// You MUST call this method for every new key that is inserted into the cache.
-    pub async fn insert(&mut self, key: K) {
+    pub async fn insert(&self, key: K) {
         self.send_msg(Message::Inserted(key)).await;
     }
 
     /// Notify the LRU eviction tracker that the given key was accessed.
     ///
     /// You MUST call this method for every read or update to a key.
-    pub async fn access(&mut self, key: K) {
+    pub async fn access(&self, key: K) {
         self.send_msg(Message::Accessed(key)).await;
     }
 
     /// Cull the least recently used keys with the given deletion method.
-    pub async fn cull(&mut self, max_count: usize) {
+    pub async fn cull(&self, max_count: usize) {
         self.send_msg(Message::Evict(max_count)).await;
     }
 
     /// Send a message to the worker. This is a helper method to reduce code duplication.
-    async fn send_msg(&mut self, message: Message<K>) {
+    async fn send_msg(&self, message: Message<K>) {
         if let Err(_) = self.worker_message_sender.send(message.clone()).await {
             unreachable!();
         }
