@@ -18,15 +18,60 @@ use crate::{
 };
 use thiserror::Error;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+struct FileCacheShared<K: Eq + Hash> {
+    root_path: PathBuf,
+    map: scc::HashMap<K, CacheMapEntry>,
+    size_bytes: AtomicUsize,
+}
+
+impl<K: Eq + Hash + Send + Sync> FileCacheShared<K> {
+    fn size(&self) -> usize {
+        self.size_bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn path_for(&self, fid: usize) -> PathBuf {
+        self.root_path.join(fid.to_string())
+    }
+
+    /// Given an entry, remove it from the disk and update the size of the cache accordingly.
+    ///
+    /// Gracefully handles the case where the file doesn't exist, which can happen if the file was
+    /// deleted after we read the file ID from the map, but before we tried to delete
+    /// the file.
+    async fn delete_entry_from_disk_async(&self, entry: &CacheMapEntry) -> std::io::Result<()> {
+        match tokio::fs::remove_file(self.path_for(entry.fid)).await {
+            Ok(()) => {
+                self.size_bytes
+                    .fetch_sub(entry.size_bytes, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn delete_entry_from_disk_sync(&self, entry: &CacheMapEntry) -> std::io::Result<()> {
+        match std::fs::remove_file(self.path_for(entry.fid)) {
+            Ok(()) => {
+                self.size_bytes
+                    .fetch_sub(entry.size_bytes, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
 
 struct LruEntryDeleter<K: Eq + Hash> {
-    file_cache: Arc<FileCache<K>>,
+    shared: Arc<FileCacheShared<K>>,
 }
 
 impl<K: Eq + Hash> LruEntryDeleter<K> {
-    fn new(file_cache: Arc<FileCache<K>>) -> Self {
-        Self { file_cache }
+    fn new(shared: Arc<FileCacheShared<K>>) -> Self {
+        Self { shared }
     }
 }
 
@@ -37,19 +82,16 @@ impl<K: Copy + Eq + Hash + Sync + Send + 'static> Deleter<K> for LruEntryDeleter
         K: 'a,
     {
         for key in keys {
-            // Deleting keys should be atomic from scc::HashMap, which means that all subsequent
-            // lookups on the same key will fail, and thus we'll be a-ok.
-            if let Some(entry) = self.file_cache.map.remove_sync(key) {
-                // On the other hand, deleting the file may fail for a variety of reasons, but
-                // that's all mostly managed by the delete_entry_from_disk_sync method, which
-                // gracefully handles the case where the file is already deleted.
-                self.file_cache.delete_entry_from_disk_sync(&entry.1);
+            if let Some(entry) = self.shared.map.remove_sync(key)
+                && let Err(e) = self.shared.delete_entry_from_disk_sync(&entry.1)
+            {
+                error!(error = ?e, "failed to delete evicted cache entry from disk");
             }
         }
     }
 }
 
-/// Error thrown during construction of a FileCache which describes why the given root path is
+/// Error thrown during construction of a `FileCache` which describes why the given root path is
 /// invalid.
 #[derive(Debug, Error)]
 pub enum InvalidRootPathError {
@@ -92,21 +134,11 @@ struct CacheMapEntry {
 ///
 /// This cache is considered thread-safe and async-safe.
 pub struct FileCache<K: Eq + Hash> {
-    /// The root path for the cache. This is the directory where all cache files will be stored.
-    root_path: PathBuf,
-
-    /// The main map of the cache. This maps keys to file IDs, which are just integers that
-    /// correspond to file paths on disk. The file ID is used to generate the file path for the
-    /// cache entry.
-    map: scc::HashMap<K, CacheMapEntry>,
+    shared: Arc<FileCacheShared<K>>,
 
     /// Generates unique file paths for new cache entries. This is just a counter that increments
     /// for each new file, and the file ID is the value of the counter at the time of creation.
     file_generator: AtomicUsize,
-
-    /// Rough estimate of the current size of the cache in bytes. Not exact, but should be close
-    /// enough for eviction purposes.
-    size_bytes: AtomicUsize,
 
     /// The maximum size of the cache in bytes. This is used to determine when to evict entries
     /// from the cache. This is a soft hint, rather than a hard limit, and the cache may
@@ -119,7 +151,7 @@ pub struct FileCache<K: Eq + Hash> {
     lru_tracker: LruEvictionTracker<K>,
 }
 
-impl<K: Eq + Hash + Send + Copy + 'static> FileCache<K> {
+impl<K: Eq + Hash + Send + Sync + Copy + 'static> FileCache<K> {
     // How many cache entries to evict at most in a single batch.
     //
     // Not really sure how to determine this number.
@@ -143,12 +175,11 @@ impl<K: Eq + Hash + Send + Copy + 'static> FileCache<K> {
     /// # Args
     ///
     /// * `file_path` - If the path exists, it must either be an empty directory, or a directory
-    ///                 which was previously used as a cache for this program.
+    ///   which was previously used as a cache for this program.
     /// * `max_size_bytes` - The maximum size of the cache in bytes. This is used to determine when
-    ///                      to evict entries from the cache. This is a soft hint, rather than a
-    ///                      hard limit, and the cache may temporarily exceed this size during
-    ///                      insertions, but it will try to evict entries as soon as possible to
-    ///                      get back under this limit.
+    ///   to evict entries from the cache. This is a soft hint, rather than a hard limit, and the
+    ///   cache may temporarily exceed this size during insertions, but it will try to evict entries
+    ///   as soon as possible to get back under this limit.
     pub async fn new(
         file_path: &Path,
         max_size_bytes: usize,
@@ -186,98 +217,53 @@ impl<K: Eq + Hash + Send + Copy + 'static> FileCache<K> {
         pbuf.push(Self::GITFS_MARKER_FILE);
         tokio::fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .open(&pbuf)
             .await?;
         pbuf.pop();
 
-        Ok(Self {
+        let shared = Arc::new(FileCacheShared {
             root_path: pbuf,
             map: scc::HashMap::new(),
-            file_generator: AtomicUsize::new(0),
             size_bytes: AtomicUsize::new(0),
+        });
+
+        Ok(Self {
+            shared: Arc::clone(&shared),
+            file_generator: AtomicUsize::new(0),
             max_size_bytes,
             lru_tracker: LruEvictionTracker::spawn(
-                LruEntryDeleter::new(),
+                LruEntryDeleter::new(shared),
                 Self::LRU_EVICTION_MAX_BATCH_SIZE,
             ),
         })
     }
 
-    /// Retrieve the correct path for the given file ID.
-    fn path_for(&self, fid: usize) -> PathBuf {
-        self.root_path.join(fid.to_string())
-    }
-
     async fn create_file(&self, path: &Path) -> Result<tokio::fs::File, std::io::Error> {
         tokio::fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .open(path)
             .await
     }
-
-    /// Given an entry, remove it from the disk and update the size of the cache accordingly.
-    ///
-    /// Gracefully handles the case where the file doesn't exist, which can happen if the file was
-    /// deleted after we read the file ID from the map, but before we tried to delete
-    /// the file.
-    async fn delete_entry_from_disk_async(&self, entry: &CacheMapEntry) -> std::io::Result<()> {
-        match tokio::fs::remove_file(self.path_for(entry.fid)).await {
-            Ok(()) => {
-                self.size_bytes
-                    .fetch_sub(entry.size_bytes, std::sync::atomic::Ordering::Relaxed);
-                Ok(())
-            }
-            // Note that there's a race condition between the deleter and the mutator in
-            // AsyncWritableCache. Either one of these operations atomically grabs the file ID (so
-            // accessing the file ID is safe), but then they race to delete the file.
-            //
-            // Consequently, it's quite possible that the file is already deleted by the time we
-            // try to delete it, and that's already fine with us, so we just treat that case as a
-            // successful deletion.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Given an entry, remove it from the disk and update the size of the cache accordingly.
-    ///
-    /// Gracefully handles the case where the file doesn't exist, which can happen if the file was
-    /// deleted after we read the file ID from the map, but before we tried to delete
-    /// the file.
-    fn delete_entry_from_disk_sync(&self, entry: &CacheMapEntry) -> std::io::Result<()> {
-        match std::fs::remove_file(self.path_for(entry.fid)) {
-            Ok(()) => {
-                self.size_bytes
-                    .fetch_sub(entry.size_bytes, std::sync::atomic::Ordering::Relaxed);
-                Ok(())
-            }
-            // Note that there's a race condition between the deleter and the mutator in
-            // AsyncWritableCache. Either one of these operations atomically grabs the file ID (so
-            // accessing the file ID is safe), but then they race to delete the file.
-            //
-            // Consequently, it's quite possible that the file is already deleted by the time we
-            // try to delete it, and that's already fine with us, so we just treat that case as a
-            // successful deletion.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
 }
 
-impl<K: Eq + Hash + Copy + Send + Debug + 'static> AsyncReadableCache<K, Vec<u8>> for FileCache<K> {
+impl<K: Eq + Hash + Copy + Send + Sync + Debug + 'static> AsyncReadableCache<K, Vec<u8>>
+    for FileCache<K>
+{
     async fn get(&self, key: &K) -> Option<Vec<u8>> {
         for _ in 0..Self::MAX_READ_RETRY_COUNT {
             // Grab the best-guess file ID for the given key. If this fails, then the key is not in
             // the cache, and we can return `None`.
-            let entry = *(self.map.get_async(key).await?);
+            let entry = *(self.shared.map.get_async(key).await?);
 
             // The next thing we need to do is try to open the file. This may fail for a plethora
             // of reasons.
             //
             // TODO(markovejnovic): path_for allocates on heap, could be on stack.
-            let mut file = match tokio::fs::File::open(self.path_for(entry.fid)).await {
+            let mut file = match tokio::fs::File::open(self.shared.path_for(entry.fid)).await {
                 Ok(file) => file,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     // The file was not found.
@@ -321,11 +307,11 @@ impl<K: Eq + Hash + Copy + Send + Debug + 'static> AsyncReadableCache<K, Vec<u8>
     }
 
     async fn contains(&self, key: &K) -> bool {
-        self.map.contains_async(key).await
+        self.shared.map.contains_async(key).await
     }
 }
 
-impl<K: Eq + Hash + Copy + Send + 'static> AsyncWritableCache<K, Vec<u8>, CacheWriteError>
+impl<K: Eq + Hash + Copy + Send + Sync + 'static> AsyncWritableCache<K, Vec<u8>, CacheWriteError>
     for FileCache<K>
 {
     async fn insert(&self, key: &K, value: Vec<u8>) -> Result<(), CacheWriteError> {
@@ -338,9 +324,7 @@ impl<K: Eq + Hash + Copy + Send + 'static> AsyncWritableCache<K, Vec<u8>, CacheW
             size_bytes: value.len(),
         };
 
-        if self.size_bytes.load(std::sync::atomic::Ordering::Relaxed) + new_entry.size_bytes
-            > self.max_size_bytes
-        {
+        if self.shared.size() + new_entry.size_bytes > self.max_size_bytes {
             // We need to evict some entries before we can insert this new entry. Let's just evict
             // a batch of entries.
             self.lru_tracker
@@ -348,14 +332,17 @@ impl<K: Eq + Hash + Copy + Send + 'static> AsyncWritableCache<K, Vec<u8>, CacheW
                 .await;
         }
 
-        let mut new_file = self.create_file(&self.path_for(new_entry.fid)).await?;
+        let mut new_file = self
+            .create_file(&self.shared.path_for(new_entry.fid))
+            .await?;
         new_file.write_all(&value).await?;
 
-        self.size_bytes
+        self.shared
+            .size_bytes
             .fetch_add(new_entry.size_bytes, std::sync::atomic::Ordering::Relaxed);
 
         // Now we insert the new file ID into the map, and get the old file ID if it exists.
-        if let Some(old_entry) = self.map.upsert_async(*key, new_entry).await {
+        if let Some(old_entry) = self.shared.map.upsert_async(*key, new_entry).await {
             // If there was an old file ID, we need to delete the old file and notify the LRU
             // tracker that the key was accessed.
             self.lru_tracker.access(*key).await;
@@ -364,7 +351,7 @@ impl<K: Eq + Hash + Copy + Send + 'static> AsyncWritableCache<K, Vec<u8>, CacheW
             // Note that the file already may be deleted at this point -- the LRU tracker deleter
             // may have already deleted this file, so if the file doesn't exist, that's already
             // fine with us.
-            self.delete_entry_from_disk_async(&old_entry).await?;
+            self.shared.delete_entry_from_disk_async(&old_entry).await?;
         } else {
             self.lru_tracker.insert(*key).await;
         }
