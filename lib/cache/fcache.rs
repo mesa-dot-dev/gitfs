@@ -35,36 +35,21 @@ impl<K: Eq + Hash + Send + Sync> FileCacheShared<K> {
         self.root_path.join(fid.to_string())
     }
 
-    /// Given an entry, remove it from the disk and update the size of the cache accordingly.
+    /// Given an entry, remove it from the disk. Note this does not update the cache size tracker.
     ///
     /// Gracefully handles the case where the file doesn't exist, which can happen if the file was
     /// deleted after we read the file ID from the map, but before we tried to delete
     /// the file.
     async fn delete_entry_from_disk_async(&self, entry: &CacheMapEntry) -> std::io::Result<()> {
         match tokio::fs::remove_file(self.path_for(entry.fid)).await {
-            Ok(()) => {
-                self.size_bytes
-                    .fetch_sub(entry.size_bytes, std::sync::atomic::Ordering::Relaxed);
-                Ok(())
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn delete_entry_from_disk_sync(&self, entry: &CacheMapEntry) -> std::io::Result<()> {
-        match std::fs::remove_file(self.path_for(entry.fid)) {
-            Ok(()) => {
-                self.size_bytes
-                    .fetch_sub(entry.size_bytes, std::sync::atomic::Ordering::Relaxed);
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
     }
 }
 
+#[derive(Clone)]
 struct LruEntryDeleter<K: Eq + Hash> {
     shared: Arc<FileCacheShared<K>>,
 }
@@ -77,16 +62,15 @@ impl<K: Eq + Hash> LruEntryDeleter<K> {
 
 impl<K: Copy + Eq + Hash + Sync + Send + 'static> Deleter<K> for LruEntryDeleter<K> {
     /// The LRU cache will call this method when it wants to evict keys.
-    fn delete<'a>(&mut self, keys: impl Iterator<Item = &'a K>)
-    where
-        K: 'a,
-    {
-        for key in keys {
-            if let Some(entry) = self.shared.map.remove_sync(key)
-                && let Err(e) = self.shared.delete_entry_from_disk_sync(&entry.1)
-            {
+    async fn delete(&mut self, key: K) {
+        if let Some(entry) = self.shared.map.remove_sync(&key) {
+            if let Err(e) = self.shared.delete_entry_from_disk_async(&entry.1).await {
                 error!(error = ?e, "failed to delete evicted cache entry from disk");
             }
+
+            self.shared
+                .size_bytes
+                .fetch_sub(entry.1.size_bytes, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -155,7 +139,12 @@ impl<K: Eq + Hash + Send + Sync + Copy + 'static> FileCache<K> {
     // How many cache entries to evict at most in a single batch.
     //
     // Not really sure how to determine this number.
-    const LRU_EVICTION_MAX_BATCH_SIZE: usize = 32;
+    const LRU_EVICTION_MAX_BATCH_SIZE: u32 = 8;
+
+    // The maximum number of messages that can be buffered between this file cache and the LRU
+    // eviction tracker. If this is too small, then the file cache will be blocked waiting for the
+    // eviction tracker to catch up.
+    const MAX_LRU_TRACKER_CHANNEL_SIZE: usize = 256;
 
     // Dangerous: Changing this constant may cause the program to treat existing cache directories
     // as invalid, and thus provide a worse user experience. Do not change this unless you have a
@@ -235,7 +224,7 @@ impl<K: Eq + Hash + Send + Sync + Copy + 'static> FileCache<K> {
             max_size_bytes,
             lru_tracker: LruEvictionTracker::spawn(
                 LruEntryDeleter::new(shared),
-                Self::LRU_EVICTION_MAX_BATCH_SIZE,
+                Self::MAX_LRU_TRACKER_CHANNEL_SIZE,
             ),
         })
     }
@@ -247,6 +236,21 @@ impl<K: Eq + Hash + Send + Sync + Copy + 'static> FileCache<K> {
             .write(true)
             .open(path)
             .await
+    }
+}
+
+impl<K: Eq + Hash> Drop for FileCache<K> {
+    fn drop(&mut self) {
+        // Surprisingly, it's safe to delete files here.
+        //
+        // Note that the LRU tracker is running at the time of Drop. It, consequently, may end up
+        // calling the deleter, but that's fine, since the deleter ignores this problem gracefully.
+        //
+        // It is 100% safe to do this here, since it's guaranteed no concurrent task is borrowing
+        // the FileCache at this point.
+        if let Err(e) = std::fs::remove_dir_all(&self.shared.root_path) {
+            error!(error = ?e, "failed to delete cache directory on drop");
+        }
     }
 }
 
@@ -296,7 +300,7 @@ impl<K: Eq + Hash + Copy + Send + Sync + Debug + 'static> AsyncReadableCache<K, 
                     error!(error = ?e, key = ?key, "IO error while reading file for cache key");
                 })
                 .ok()?;
-            self.lru_tracker.access(*key).await;
+            self.lru_tracker.access(*key);
             return Some(buf);
         }
 
@@ -324,12 +328,25 @@ impl<K: Eq + Hash + Copy + Send + Sync + 'static> AsyncWritableCache<K, Vec<u8>,
             size_bytes: value.len(),
         };
 
-        if self.shared.size() + new_entry.size_bytes > self.max_size_bytes {
-            // We need to evict some entries before we can insert this new entry. Let's just evict
-            // a batch of entries.
-            self.lru_tracker
-                .cull(Self::LRU_EVICTION_MAX_BATCH_SIZE)
-                .await;
+        while self.shared.size() + new_entry.size_bytes > self.max_size_bytes {
+            // TODO(markovejnovic): This whole spinlock situation sounded better in my head, but
+            // realistically, I think I could've gotten away with just a plain Notify. It is what
+            // it is now.
+
+            // The cache doesn't have any space for this new entry, so we need to evict some
+            // entries before we can insert this new entry.
+            // Before we can do that, we need to make sure there are no other pending culls. If we
+            // let multiple culls happen at the same time, we risk draining a lot more entries from
+            // the cache than necessary, which results in a regression.
+            if self.lru_tracker.have_pending_culls() {
+                // If there are any pending culls, then we need to just wait.
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            // There are no culls in progress, but the cache is still too full for this new entry,
+            // which means we need to evict some entries.
+            self.lru_tracker.cull(Self::LRU_EVICTION_MAX_BATCH_SIZE);
         }
 
         let mut new_file = self
@@ -337,15 +354,14 @@ impl<K: Eq + Hash + Copy + Send + Sync + 'static> AsyncWritableCache<K, Vec<u8>,
             .await?;
         new_file.write_all(&value).await?;
 
-        self.shared
-            .size_bytes
-            .fetch_add(new_entry.size_bytes, std::sync::atomic::Ordering::Relaxed);
+        let mut size_delta: isize = new_entry.size_bytes as isize;
 
         // Now we insert the new file ID into the map, and get the old file ID if it exists.
-        if let Some(old_entry) = self.shared.map.upsert_async(*key, new_entry).await {
+        if let Some(old_entry) = self.shared.map.upsert_sync(*key, new_entry) {
             // If there was an old file ID, we need to delete the old file and notify the LRU
             // tracker that the key was accessed.
-            self.lru_tracker.access(*key).await;
+            self.lru_tracker.access(*key);
+            size_delta -= old_entry.size_bytes as isize;
 
             // TODO(markovejnovic): Could stack allocate the path.
             // Note that the file already may be deleted at this point -- the LRU tracker deleter
@@ -353,7 +369,18 @@ impl<K: Eq + Hash + Copy + Send + Sync + 'static> AsyncWritableCache<K, Vec<u8>,
             // fine with us.
             self.shared.delete_entry_from_disk_async(&old_entry).await?;
         } else {
-            self.lru_tracker.insert(*key).await;
+            self.lru_tracker.insert(*key);
+        }
+
+        if size_delta > 0 {
+            self.shared
+                .size_bytes
+                .fetch_add(size_delta as usize, std::sync::atomic::Ordering::Relaxed);
+        } else if size_delta < 0 {
+            self.shared.size_bytes.fetch_sub(
+                size_delta.abs() as usize,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
 
         // Epic, we did it.
