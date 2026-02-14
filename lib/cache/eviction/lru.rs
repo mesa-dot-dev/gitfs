@@ -4,7 +4,6 @@ use std::{
     collections::HashSet,
     future::Future,
     hash::Hash,
-    pin::Pin,
     sync::{Arc, OnceLock, atomic::AtomicU64},
 };
 
@@ -26,7 +25,7 @@ impl DeletionIndicator {
     /// Call to mark a batch as being processed right now.
     fn process_batch(&self, count: u32) {
         self.underlying.fetch_add(
-            count as u64 - (1 << 32),
+            u64::from(count) - (1 << 32),
             std::sync::atomic::Ordering::Relaxed,
         );
     }
@@ -66,7 +65,7 @@ pub trait Deleter<K>: Send + Clone + 'static {
 }
 
 /// Messages sent to the LRU eviction tracker worker.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum Message<K> {
     /// Notify the LRU eviction tracker that the given key was accessed.
     Accessed(K),
@@ -182,6 +181,7 @@ impl<K: Copy + Eq + Hash + Send + 'static, D: Deleter<K>> LruProcessingTask<K, D
                 {
                     // These integer casts are safe, since max_count is guaranteed to fit
                     // within a u32, min(MAX_U32, MAX_USIZE) == MAX_U32.
+                    #[expect(clippy::cast_possible_truncation)]
                     let take_count = self.ordered_key_set.len().min(max_count as usize) as u32;
                     self.shared.active_deletions.process_batch(take_count);
                     for _ in 0..take_count {
@@ -190,7 +190,7 @@ impl<K: Copy + Eq + Hash + Send + 'static, D: Deleter<K>> LruProcessingTask<K, D
                         };
                         self.evicted_keys.insert(k);
                         let mut deleter = self.deleter.clone();
-                        let shared_clone = self.shared.clone();
+                        let shared_clone = Arc::clone(&self.shared);
                         tokio::spawn(async move {
                             deleter.delete(k).await;
                             shared_clone.active_deletions.observe_deletion();
@@ -231,7 +231,7 @@ impl<K: Copy + Eq + Hash + Send + 'static, D: Deleter<K>> LruProcessingTask<K, D
 #[derive(Debug)]
 struct WorkerState {
     active_deletions: DeletionIndicator,
-    _worker: OnceLock<JoinHandle<()>>,
+    worker: OnceLock<JoinHandle<()>>,
 }
 
 /// An LRU eviction tracker. This is used to track the least recently used keys in the cache, and
@@ -249,10 +249,12 @@ impl<K: Copy + Eq + Send + Hash + 'static> LruEvictionTracker<K> {
 
         let worker_state = Arc::new(WorkerState {
             active_deletions: DeletionIndicator::default(),
-            _worker: OnceLock::new(),
+            worker: OnceLock::new(),
         });
-        let worker = LruProcessingTask::spawn_task(deleter, rx, worker_state.clone());
-        worker_state._worker.set(worker).unwrap();
+        let worker = LruProcessingTask::spawn_task(deleter, rx, Arc::clone(&worker_state));
+        if worker_state.worker.set(worker).is_err() {
+            unreachable!("worker should only be set once, and we just set it");
+        }
 
         Self {
             worker_message_sender: tx,
@@ -283,17 +285,14 @@ impl<K: Copy + Eq + Send + Hash + 'static> LruEvictionTracker<K> {
     }
 
     /// Check whether there are culls that are already scheduled.
+    #[must_use]
     pub fn have_pending_culls(&self) -> bool {
         self.worker_state.active_deletions.have_pending_batches()
     }
 
     /// Send a message to the worker. This is a helper method to reduce code duplication.
     fn send_msg(&self, message: Message<K>) {
-        if self
-            .worker_message_sender
-            .blocking_send(message.clone())
-            .is_err()
-        {
+        if self.worker_message_sender.blocking_send(message).is_err() {
             unreachable!();
         }
     }
@@ -309,6 +308,7 @@ impl<K: Copy + Eq + Send + Hash + 'static> LruEvictionTracker<K> {
     /// provides is whether any deletions are pending or not, but it is not safe to use this to
     /// synchronize upon the results of your deletions, since the underlying atomic is used in a
     /// relaxed manner.
+    #[must_use]
     pub fn have_active_deletions(&self) -> bool {
         self.worker_state.active_deletions.have_pending_deletions()
     }

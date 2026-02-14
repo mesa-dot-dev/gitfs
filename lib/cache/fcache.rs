@@ -354,14 +354,14 @@ impl<K: Eq + Hash + Copy + Send + Sync + 'static> AsyncWritableCache<K, Vec<u8>,
             .await?;
         new_file.write_all(&value).await?;
 
-        let mut size_delta: isize = new_entry.size_bytes as isize;
+        let mut size_delta: isize = new_entry.size_bytes.cast_signed();
 
         // Now we insert the new file ID into the map, and get the old file ID if it exists.
         if let Some(old_entry) = self.shared.map.upsert_sync(*key, new_entry) {
             // If there was an old file ID, we need to delete the old file and notify the LRU
             // tracker that the key was accessed.
             self.lru_tracker.access(*key);
-            size_delta -= old_entry.size_bytes as isize;
+            size_delta -= old_entry.size_bytes.cast_signed();
 
             // TODO(markovejnovic): Could stack allocate the path.
             // Note that the file already may be deleted at this point -- the LRU tracker deleter
@@ -373,12 +373,13 @@ impl<K: Eq + Hash + Copy + Send + Sync + 'static> AsyncWritableCache<K, Vec<u8>,
         }
 
         if size_delta > 0 {
-            self.shared
-                .size_bytes
-                .fetch_add(size_delta as usize, std::sync::atomic::Ordering::Relaxed);
+            self.shared.size_bytes.fetch_add(
+                size_delta.cast_unsigned(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
         } else if size_delta < 0 {
             self.shared.size_bytes.fetch_sub(
-                size_delta.abs() as usize,
+                size_delta.unsigned_abs(),
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
