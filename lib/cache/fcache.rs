@@ -49,6 +49,11 @@ impl<K: Eq + Hash + Send + Sync> FileCacheShared<K> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct DeleterCtx {
+    fid: usize,
+}
+
 #[derive(Clone)]
 struct LruEntryDeleter<K: Eq + Hash> {
     shared: Arc<FileCacheShared<K>>,
@@ -60,10 +65,15 @@ impl<K: Eq + Hash> LruEntryDeleter<K> {
     }
 }
 
-impl<K: Copy + Eq + Hash + Sync + Send + 'static> Deleter<K> for LruEntryDeleter<K> {
+impl<K: Copy + Eq + Hash + Sync + Send + 'static> Deleter<K, DeleterCtx> for LruEntryDeleter<K> {
     /// The LRU cache will call this method when it wants to evict keys.
-    async fn delete(&mut self, key: K) {
-        if let Some(entry) = self.shared.map.remove_sync(&key) {
+    async fn delete(&mut self, key: K, ctx: DeleterCtx) {
+        if let Some(entry) = self
+            .shared
+            .map
+            .remove_if_async(&key, |m| m.fid == ctx.fid)
+            .await
+        {
             if let Err(e) = self.shared.delete_entry_from_disk_async(&entry.1).await {
                 error!(error = ?e, "failed to delete evicted cache entry from disk");
             }
@@ -132,7 +142,7 @@ pub struct FileCache<K: Eq + Hash> {
 
     /// LRU eviction tracker. This is used to track the least recently used keys in the cache, and
     /// to evict keys when necessary.
-    lru_tracker: LruEvictionTracker<K>,
+    lru_tracker: LruEvictionTracker<K, DeleterCtx>,
 }
 
 impl<K: Eq + Hash + Send + Sync + Copy + 'static> FileCache<K> {
@@ -315,8 +325,8 @@ impl<K: Eq + Hash + Copy + Send + Sync + Debug + 'static> AsyncReadableCache<K, 
     }
 }
 
-impl<K: Eq + Hash + Copy + Send + Sync + 'static> AsyncWritableCache<K, Vec<u8>, CacheWriteError>
-    for FileCache<K>
+impl<K: Eq + Hash + Copy + Send + Sync + 'static + Debug>
+    AsyncWritableCache<K, Vec<u8>, CacheWriteError> for FileCache<K>
 {
     async fn insert(&self, key: &K, value: Vec<u8>) -> Result<(), CacheWriteError> {
         // Inserts are tricky. The first thing we'll do is find a new file handle for the new
@@ -329,6 +339,14 @@ impl<K: Eq + Hash + Copy + Send + Sync + 'static> AsyncWritableCache<K, Vec<u8>,
         };
 
         while self.shared.size() + new_entry.size_bytes > self.max_size_bytes {
+            if self.shared.size() == 0 {
+                // This means that the new entry is larger than the entire cache size limit. In
+                // this case, we have no choice but to just insert the entry and let the cache
+                // temporarily exceed the size limit. We will try to evict entries as soon as
+                // possible, but in the meantime, we need to at least insert this entry.
+                break;
+            }
+
             // TODO(markovejnovic): This whole spinlock situation sounded better in my head, but
             // realistically, I think I could've gotten away with just a plain Notify. It is what
             // it is now.
@@ -340,6 +358,8 @@ impl<K: Eq + Hash + Copy + Send + Sync + 'static> AsyncWritableCache<K, Vec<u8>,
             // the cache than necessary, which results in a regression.
             if self.lru_tracker.have_pending_culls() {
                 // If there are any pending culls, then we need to just wait.
+                // TODO(markovejnovic): This could be nicer and maybe starve the CPU less. Chances
+                // are we actually need to yield to the LRU tracker task.
                 tokio::task::yield_now().await;
                 continue;
             }
@@ -357,7 +377,7 @@ impl<K: Eq + Hash + Copy + Send + Sync + 'static> AsyncWritableCache<K, Vec<u8>,
         let mut size_delta: isize = new_entry.size_bytes.cast_signed();
 
         // Now we insert the new file ID into the map, and get the old file ID if it exists.
-        if let Some(old_entry) = self.shared.map.upsert_sync(*key, new_entry) {
+        if let Some(old_entry) = self.shared.map.upsert_async(*key, new_entry).await {
             // If there was an old file ID, we need to delete the old file and notify the LRU
             // tracker that the key was accessed.
             self.lru_tracker.access(*key);
@@ -367,9 +387,12 @@ impl<K: Eq + Hash + Copy + Send + Sync + 'static> AsyncWritableCache<K, Vec<u8>,
             // Note that the file already may be deleted at this point -- the LRU tracker deleter
             // may have already deleted this file, so if the file doesn't exist, that's already
             // fine with us.
-            self.shared.delete_entry_from_disk_async(&old_entry).await?;
+            if let Err(e) = self.shared.delete_entry_from_disk_async(&old_entry).await {
+                error!(error = ?e, key = ?key, "failed to delete old cache entry from disk");
+            }
         } else {
-            self.lru_tracker.insert(*key);
+            self.lru_tracker
+                .insert(*key, DeleterCtx { fid: new_entry.fid });
         }
 
         if size_delta > 0 {

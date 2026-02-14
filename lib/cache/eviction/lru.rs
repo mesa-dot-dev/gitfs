@@ -1,18 +1,20 @@
 //! Implements the LRU eviction policy.
 
 use std::{
-    collections::HashSet,
     future::Future,
     hash::Hash,
-    sync::{Arc, OnceLock, atomic::AtomicU64},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicI64, AtomicUsize},
+    },
 };
 
-use hashlink::LinkedHashSet;
+use hashlink::LinkedHashMap;
 use tokio::{sync::mpsc::Receiver, task::JoinHandle};
 
 #[derive(Debug)]
 struct DeletionIndicator {
-    underlying: AtomicU64,
+    underlying: AtomicI64,
 }
 
 impl DeletionIndicator {
@@ -25,7 +27,7 @@ impl DeletionIndicator {
     /// Call to mark a batch as being processed right now.
     fn process_batch(&self, count: u32) {
         self.underlying.fetch_add(
-            u64::from(count) - (1 << 32),
+            i64::from(count) - (1 << 32),
             std::sync::atomic::Ordering::Relaxed,
         );
     }
@@ -38,7 +40,7 @@ impl DeletionIndicator {
 
     /// Check if there are any scheduled or active deletions.
     fn have_pending_deletions(&self) -> bool {
-        self.underlying.load(std::sync::atomic::Ordering::Relaxed) == 0
+        self.underlying.load(std::sync::atomic::Ordering::Relaxed) != 0
     }
 
     /// Check if there are any scheduled batches of deletions.
@@ -50,41 +52,37 @@ impl DeletionIndicator {
 impl Default for DeletionIndicator {
     fn default() -> Self {
         Self {
-            underlying: AtomicU64::new(0),
+            underlying: AtomicI64::new(0),
         }
     }
 }
 
 /// A trait for deleting keys from the cache. This is used by the LRU eviction tracker to delete
 /// keys when they are evicted.
-pub trait Deleter<K>: Send + Clone + 'static {
+pub trait Deleter<K, Ctx>: Send + Clone + 'static {
     /// Delete the given keys from the cache. The keys are guaranteed to be in the order of
     /// eviction. You absolutely MUST delete the keys in the order they are given, otherwise the
     /// LRU eviction tracker will get very confused and break.
-    fn delete(&mut self, key: K) -> impl Future<Output = ()> + Send;
+    fn delete(&mut self, key: K, ctx: Ctx) -> impl Future<Output = ()> + Send;
 }
 
 /// Messages sent to the LRU eviction tracker worker.
 #[derive(Debug, Clone, Copy)]
-enum Message<K> {
+enum Message<K, C> {
     /// Notify the LRU eviction tracker that the given key was accessed.
-    Accessed(K),
+    Accessed(K, usize),
     /// Request an eviction set of the given size.
     Evict(u32),
     /// Notify the LRU eviction tracker that a given key was inserted.
-    Inserted(K),
+    Inserted(K, C),
 }
 
 #[derive(Debug)]
-struct LruProcessingTask<K: Copy, D: Deleter<K>> {
-    receiver: Receiver<Message<K>>,
+struct LruProcessingTask<K: Copy, C, D: Deleter<K, C>> {
+    receiver: Receiver<Message<K, C>>,
 
     /// The ordered set of keys, ordered according to the last-used policy.
-    ordered_key_set: LinkedHashSet<K>,
-
-    /// Tracks which keys are currently considered evicted. Read the long explanation in
-    /// `service_message` for why this is necessary.
-    evicted_keys: HashSet<K>,
+    ordered_key_map: LinkedHashMap<K, C>,
 
     /// The deleter to call when we need to evict keys.
     deleter: D,
@@ -93,12 +91,13 @@ struct LruProcessingTask<K: Copy, D: Deleter<K>> {
     shared: Arc<WorkerState>,
 }
 
-impl<K: Copy + Eq + Hash + Send + 'static, D: Deleter<K>> LruProcessingTask<K, D> {
-    fn new(deleter: D, receiver: Receiver<Message<K>>, shared: Arc<WorkerState>) -> Self {
+impl<K: Copy + Eq + Hash + Send + 'static, C: Send + 'static, D: Deleter<K, C>>
+    LruProcessingTask<K, C, D>
+{
+    fn new(deleter: D, receiver: Receiver<Message<K, C>>, shared: Arc<WorkerState>) -> Self {
         Self {
             receiver,
-            ordered_key_set: LinkedHashSet::new(),
-            evicted_keys: HashSet::new(),
+            ordered_key_map: LinkedHashMap::new(),
             deleter,
             shared,
         }
@@ -106,7 +105,7 @@ impl<K: Copy + Eq + Hash + Send + 'static, D: Deleter<K>> LruProcessingTask<K, D
 
     fn spawn_task(
         deleter: D,
-        receiver: Receiver<Message<K>>,
+        receiver: Receiver<Message<K, C>>,
         shared: Arc<WorkerState>,
     ) -> JoinHandle<()> {
         // TODO(markovejnovic): This should have a best-effort drop.
@@ -124,18 +123,32 @@ impl<K: Copy + Eq + Hash + Send + 'static, D: Deleter<K>> LruProcessingTask<K, D
 
     /// Returns true if the task should continue working.
     #[must_use]
-    fn service_message(&mut self, message: Message<K>) -> bool {
+    fn service_message(&mut self, message: Message<K, C>) -> bool {
         match message {
-            Message::Accessed(k) => {
-                if self.evicted_keys.contains(&k) {
-                    // This is a ghost access, happens when a client accesses a key that may not
-                    // have been cleaned up yet. Just ignore it.
+            Message::Accessed(k, ev_gen) => {
+                if ev_gen
+                    < self
+                        .shared
+                        .eviction_generation
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    // This is a ghost access. Happens when one client sends an eviction, but other
+                    // clients add accesses to the same keys, before our worker thread had a chance
+                    // to clean up.
+                    //
+                    // We're looking at an access in the "future".
                     return true;
                 }
 
                 self.reposition_existing_key(k);
             }
             Message::Evict(max_count) => {
+                // We got an eviction notice. Bump the eviction generation to indicate that all
+                // accesses after this point are considered in the "future". Read the subsequent
+                // comment for an explanation of why we need to do this.
+                self.shared
+                    .eviction_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Before we send off the eviction set, we actually need to remove the evicted
                 // keys from the pending queue. Read the following for an explanation.
                 //
@@ -175,6 +188,15 @@ impl<K: Copy + Eq + Hash + Send + 'static, D: Deleter<K>> LruProcessingTask<K, D
                 // so the best we can do is simply mark the stupid keys as "evicted" and ignore
                 // any accesses from these keys until they're marked as "inserted" again.
                 //
+                // This is what the generation counter does -- it allows us to track which messages
+                // are considered "stale". There are some problems with the generation counter,
+                // however. We drop all messages that are "generationally old". Under high
+                // contention, this results in the eviction policy acting like a fuzzy LRU policy,
+                // rather than a strict LRU policy, but for the purposes of this cache, this is an
+                // acceptable tradeoff.
+                //
+                // TODO(markovejnovic): Make this a strict LRU.
+                //
                 // We cannot mutate the queue to mark messages as stale, so the best we can do
                 // is mark the keys as "evicted" and ignore any accesses from these keys until
                 // they're marked as "inserted" again.
@@ -182,35 +204,28 @@ impl<K: Copy + Eq + Hash + Send + 'static, D: Deleter<K>> LruProcessingTask<K, D
                     // These integer casts are safe, since max_count is guaranteed to fit
                     // within a u32, min(MAX_U32, MAX_USIZE) == MAX_U32.
                     #[expect(clippy::cast_possible_truncation)]
-                    let take_count = self.ordered_key_set.len().min(max_count as usize) as u32;
+                    let take_count = self.ordered_key_map.len().min(max_count as usize) as u32;
                     self.shared.active_deletions.process_batch(take_count);
                     for _ in 0..take_count {
-                        let Some(k) = self.ordered_key_set.pop_front() else {
+                        let Some(e) = self.ordered_key_map.pop_front() else {
                             break;
                         };
-                        self.evicted_keys.insert(k);
                         let mut deleter = self.deleter.clone();
                         let shared_clone = Arc::clone(&self.shared);
                         tokio::spawn(async move {
-                            deleter.delete(k).await;
+                            deleter.delete(e.0, e.1).await;
                             shared_clone.active_deletions.observe_deletion();
                         });
                     }
                 }
             }
-            Message::Inserted(k) => {
+            Message::Inserted(k, ctx) => {
                 debug_assert!(
-                    !self.ordered_key_set.contains(&k),
+                    !self.ordered_key_map.contains_key(&k),
                     "key must not already exist in the ordered set when inserting"
                 );
 
-                // If the key has been evicted, but is now inserted, that means the key is no
-                // longer stale.
-                if self.evicted_keys.contains(&k) {
-                    self.evicted_keys.remove(&k);
-                }
-
-                self.ordered_key_set.insert(k);
+                self.ordered_key_map.insert(k, ctx);
             }
         }
 
@@ -219,36 +234,39 @@ impl<K: Copy + Eq + Hash + Send + 'static, D: Deleter<K>> LruProcessingTask<K, D
 
     fn reposition_existing_key(&mut self, key: K) {
         debug_assert!(
-            self.ordered_key_set.contains(&key),
+            self.ordered_key_map.contains_key(&key),
             "key must exist in the ordered set before repositioning"
         );
 
-        self.ordered_key_set.remove(&key);
-        self.ordered_key_set.insert(key);
+        if let Some(c) = self.ordered_key_map.remove(&key) {
+            self.ordered_key_map.insert(key, c);
+        }
     }
 }
 
 #[derive(Debug)]
 struct WorkerState {
     active_deletions: DeletionIndicator,
+    eviction_generation: AtomicUsize,
     worker: OnceLock<JoinHandle<()>>,
 }
 
 /// An LRU eviction tracker. This is used to track the least recently used keys in the cache, and
 /// to evict keys when necessary.
 #[derive(Debug)]
-pub struct LruEvictionTracker<K> {
-    worker_message_sender: tokio::sync::mpsc::Sender<Message<K>>,
+pub struct LruEvictionTracker<K, C> {
+    worker_message_sender: tokio::sync::mpsc::Sender<Message<K, C>>,
     worker_state: Arc<WorkerState>,
 }
 
-impl<K: Copy + Eq + Send + Hash + 'static> LruEvictionTracker<K> {
+impl<K: Copy + Eq + Send + Hash + 'static, C: Send + 'static> LruEvictionTracker<K, C> {
     /// Spawn a new LRU eviction tracker with the given deleter and channel size.
-    pub fn spawn<D: Deleter<K>>(deleter: D, channel_size: usize) -> Self {
+    pub fn spawn<D: Deleter<K, C>>(deleter: D, channel_size: usize) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(channel_size);
 
         let worker_state = Arc::new(WorkerState {
             active_deletions: DeletionIndicator::default(),
+            eviction_generation: AtomicUsize::new(0),
             worker: OnceLock::new(),
         });
         let worker = LruProcessingTask::spawn_task(deleter, rx, Arc::clone(&worker_state));
@@ -265,15 +283,20 @@ impl<K: Copy + Eq + Send + Hash + 'static> LruEvictionTracker<K> {
     /// Notify the LRU eviction tracker that the given key was inserted.
     ///
     /// You MUST call this method for every new key that is inserted into the cache.
-    pub fn insert(&self, key: K) {
-        self.send_msg(Message::Inserted(key));
+    pub fn insert(&self, key: K, ctx: C) {
+        self.send_msg(Message::Inserted(key, ctx));
     }
 
     /// Notify the LRU eviction tracker that the given key was accessed.
     ///
     /// You MUST call this method for every read or update to a key.
     pub fn access(&self, key: K) {
-        self.send_msg(Message::Accessed(key));
+        self.send_msg(Message::Accessed(
+            key,
+            self.worker_state
+                .eviction_generation
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ));
     }
 
     /// Cull the least recently used keys with the given deletion method.
@@ -291,7 +314,7 @@ impl<K: Copy + Eq + Send + Hash + 'static> LruEvictionTracker<K> {
     }
 
     /// Send a message to the worker. This is a helper method to reduce code duplication.
-    fn send_msg(&self, message: Message<K>) {
+    fn send_msg(&self, message: Message<K, C>) {
         if self.worker_message_sender.blocking_send(message).is_err() {
             unreachable!();
         }
