@@ -13,6 +13,7 @@ use num_traits::cast::ToPrimitive as _;
 use tracing::{Instrument as _, instrument, trace, warn};
 
 use git_fs::cache::fcache::FileCache;
+use git_fs::cache::traits::{AsyncReadableCache as _, AsyncWritableCache as _};
 
 use crate::app_config::CacheConfig;
 use crate::fs::icache::{AsyncICache, FileTable, IcbResolver};
@@ -186,7 +187,6 @@ pub struct RepoFs {
     file_table: FileTable,
     readdir_buf: Vec<DirEntry>,
     open_files: HashMap<FileHandle, Inode>,
-    #[expect(dead_code, reason = "will be used in RepoFs::read cache integration")]
     file_cache: Option<FileCache<Inode>>,
 }
 
@@ -219,7 +219,7 @@ impl RepoFs {
                 match FileCache::new(&cache_dir, max_bytes).await {
                     Ok(cache) => Some(cache),
                     Err(e) => {
-                        warn!(error = ?e, "failed to create file cache, continuing without caching");
+                        warn!(error = ?e, org = %org_name, repo = %repo_name, "failed to create file cache, continuing without caching");
                         None
                     }
                 }
@@ -442,9 +442,29 @@ impl Fs for RepoFs {
             "read: inode {ino} has non-file cached attr"
         );
 
+        // Try the file cache first.
+        if let Some(cache) = &self.file_cache
+            && let Some(data) = cache.get(&ino).await
+        {
+            let start = usize::try_from(offset)
+                .unwrap_or(data.len())
+                .min(data.len());
+            let end = start.saturating_add(size as usize).min(data.len());
+            trace!(
+                ino,
+                fh,
+                cached = true,
+                decoded_len = data.len(),
+                start,
+                end,
+                "read content"
+            );
+            return Ok(Bytes::copy_from_slice(&data[start..end]));
+        }
+
+        // Cache miss — fetch from the Mesa API.
         let file_path = self.path_of_inode(ino).await;
 
-        // Non-root inodes must have a resolvable path.
         if ino != Self::ROOT_INO && file_path.is_none() {
             warn!(ino, "read: path_of_inode returned None for non-root inode");
             return Err(ReadError::InodeNotFound);
@@ -474,8 +494,17 @@ impl Fs for RepoFs {
             .unwrap_or(decoded.len())
             .min(decoded.len());
         let end = start.saturating_add(size as usize).min(decoded.len());
-        trace!(ino, fh, path = ?file_path, decoded_len = decoded.len(), start, end, "read content");
-        Ok(Bytes::copy_from_slice(&decoded[start..end]))
+        let result = Bytes::copy_from_slice(&decoded[start..end]);
+        trace!(ino, fh, cached = false, path = ?file_path, decoded_len = decoded.len(), start, end, "read content");
+
+        // Store the decoded content in the cache for future reads.
+        if let Some(cache) = &self.file_cache
+            && let Err(e) = cache.insert(&ino, decoded).await
+        {
+            warn!(error = ?e, ino, "failed to cache file content");
+        }
+
+        Ok(result)
     }
 
     #[instrument(name = "RepoFs::release", skip(self), fields(repo = %self.repo_name))]
