@@ -33,7 +33,10 @@ async fn new_rejects_file_path() {
     assert!(
         matches!(result, Err(InvalidRootPathError::NotADirectory(_))),
         "expected NotADirectory, got {:?}",
-        result.as_ref().map(|_| "Ok(...)").map_err(|e| format!("{e:?}"))
+        result
+            .as_ref()
+            .map(|_| "Ok(...)")
+            .map_err(|e| format!("{e:?}"))
     );
 }
 
@@ -48,7 +51,10 @@ async fn new_rejects_non_empty_unmarked_directory() {
     assert!(
         matches!(result, Err(InvalidRootPathError::RootPathUnsafeCache(_))),
         "expected RootPathUnsafeCache, got {:?}",
-        result.as_ref().map(|_| "Ok(...)").map_err(|e| format!("{e:?}"))
+        result
+            .as_ref()
+            .map(|_| "Ok(...)")
+            .map_err(|e| format!("{e:?}"))
     );
 }
 

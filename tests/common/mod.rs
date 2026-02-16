@@ -32,7 +32,12 @@ impl MockDeleter {
 
     /// Returns just the keys that were deleted, in deletion order.
     pub fn deleted_keys(&self) -> Vec<u64> {
-        self.deleted.lock().unwrap().iter().map(|(k, _)| *k).collect()
+        self.deleted
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, _)| *k)
+            .collect()
     }
 }
 
