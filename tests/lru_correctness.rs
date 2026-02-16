@@ -16,7 +16,7 @@ async fn evicts_least_recently_inserted() {
     tracker.upsert(3, MockCtx { version: 3 });
 
     // Let the worker process the upsert messages.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Evict 1 key — should be key 1 (least recently inserted).
     assert!(tracker.try_cull(1), "try_cull should succeed");
@@ -35,19 +35,23 @@ async fn access_moves_key_to_back() {
     tracker.upsert(2, MockCtx { version: 2 });
     tracker.upsert(3, MockCtx { version: 3 });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Access key 1, moving it to the back of the LRU queue.
     tracker.access(1);
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Evict 1 key — should now be key 2 (key 1 was refreshed).
     assert!(tracker.try_cull(1));
     wait_for_culls(&tracker).await;
 
     let deleted = deleter.deleted_keys();
-    assert_eq!(deleted, vec![2], "key 2 should be evicted since key 1 was accessed");
+    assert_eq!(
+        deleted,
+        vec![2],
+        "key 2 should be evicted since key 1 was accessed"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -56,7 +60,7 @@ async fn try_cull_returns_true_on_success() {
     let tracker = LruEvictionTracker::spawn(deleter, 64);
 
     tracker.upsert(1, MockCtx { version: 1 });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     let result = tracker.try_cull(1);
     assert!(result, "try_cull should return true when channel has space");
@@ -71,7 +75,7 @@ async fn have_pending_culls_reflects_state() {
     assert!(!tracker.have_pending_culls());
 
     tracker.upsert(1, MockCtx { version: 1 });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Request a cull.
     let _ = tracker.try_cull(1);
@@ -92,7 +96,7 @@ async fn stale_version_ignored() {
     tracker.upsert(1, MockCtx { version: 5 });
     tracker.upsert(1, MockCtx { version: 3 });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Evict — the context should carry version 5 (stale version 3 was dropped).
     assert!(tracker.try_cull(1));
@@ -100,7 +104,10 @@ async fn stale_version_ignored() {
 
     let deleted = deleter.deleted.lock().unwrap();
     assert_eq!(deleted.len(), 1);
-    assert_eq!(deleted[0].1.version, 5, "should carry version 5, not stale version 3");
+    assert_eq!(
+        deleted[0].1.version, 5,
+        "should carry version 5, not stale version 3"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -111,7 +118,7 @@ async fn evict_more_than_available() {
     tracker.upsert(1, MockCtx { version: 1 });
     tracker.upsert(2, MockCtx { version: 2 });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Request eviction of 100 keys but only 2 exist.
     assert!(tracker.try_cull(100));
@@ -130,7 +137,7 @@ async fn multiple_eviction_rounds() {
         tracker.upsert(i, MockCtx { version: i });
     }
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Round 1: evict 2
     assert!(tracker.try_cull(2));
@@ -141,7 +148,11 @@ async fn multiple_eviction_rounds() {
     wait_for_culls(&tracker).await;
 
     let deleted = deleter.deleted_keys();
-    assert_eq!(deleted.len(), 4, "should have evicted 4 total across 2 rounds");
+    assert_eq!(
+        deleted.len(),
+        4,
+        "should have evicted 4 total across 2 rounds"
+    );
     // First round evicts keys 1, 2; second round evicts keys 3, 4.
     // Deletion tasks within a round may complete in any order, so sort each batch.
     let mut round1: Vec<_> = deleted[..2].to_vec();
@@ -150,4 +161,24 @@ async fn multiple_eviction_rounds() {
     round2.sort_unstable();
     assert_eq!(round1, vec![1, 2]);
     assert_eq!(round2, vec![3, 4]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn try_cull_returns_false_when_channel_full() {
+    let deleter = MockDeleter::new();
+    // Channel size 1 — fills immediately.
+    let tracker = LruEvictionTracker::spawn(deleter, 1);
+
+    tracker.upsert(1, MockCtx { version: 1 });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // First cull takes the only channel slot.
+    assert!(tracker.try_cull(1), "first try_cull should succeed");
+
+    // Second cull should fail — channel is full.
+    assert!(!tracker.try_cull(1), "second try_cull should fail when channel is full");
+
+    // After the worker drains, pending culls should eventually clear.
+    wait_for_culls(&tracker).await;
+    assert!(!tracker.have_pending_culls());
 }

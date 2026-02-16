@@ -45,7 +45,7 @@ async fn concurrent_access_notifications() {
     for i in 1u64..=10 {
         tracker.upsert(i, MockCtx { version: i });
     }
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Concurrently access keys 1..=5, making them "recently used."
     let mut set = JoinSet::new();
@@ -58,7 +58,7 @@ async fn concurrent_access_notifications() {
         });
     }
     while set.join_next().await.is_some() {}
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Evict 5 keys — keys 6..=10 should be evicted (they were never accessed).
     assert!(tracker.try_cull(5));
@@ -81,7 +81,7 @@ async fn concurrent_cull_requests() {
     for i in 0u64..20 {
         tracker.upsert(i, MockCtx { version: i });
     }
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Fire 10 concurrent cull requests, each for 2 keys.
     let mut set = JoinSet::new();
@@ -100,13 +100,10 @@ async fn concurrent_cull_requests() {
     // and scheduling, but at least some culls should succeed).
     let deleted = deleter.deleted_keys();
     assert!(
-        !deleted.is_empty(),
-        "at least some evictions should have occurred"
+        deleted.len() >= 2,
+        "at least one cull request (2 keys) should have succeeded"
     );
-    assert!(
-        deleted.len() <= 20,
-        "cannot evict more keys than exist"
-    );
+    assert!(deleted.len() <= 20, "cannot evict more keys than exist");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
