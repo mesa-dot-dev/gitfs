@@ -75,3 +75,57 @@ async fn new_cleans_previously_used_directory() {
     // Old data should not be accessible
     assert!(cache.get(&1).await.is_none());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn insert_and_get_returns_value() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = FileCache::<u64>::new(tmp.path(), 4096).await.unwrap();
+
+    cache.insert(&42, b"hello world".to_vec()).await.unwrap();
+
+    let val = cache.get(&42).await;
+    assert_eq!(val.as_deref(), Some(b"hello world".as_slice()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_missing_key_returns_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = FileCache::<u64>::new(tmp.path(), 4096).await.unwrap();
+
+    assert!(cache.get(&999).await.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn contains_reflects_presence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = FileCache::<u64>::new(tmp.path(), 4096).await.unwrap();
+
+    assert!(!cache.contains(&1).await);
+
+    cache.insert(&1, b"data".to_vec()).await.unwrap();
+
+    assert!(cache.contains(&1).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn insert_overwrites_previous_value() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = FileCache::<u64>::new(tmp.path(), 4096).await.unwrap();
+
+    cache.insert(&1, b"first".to_vec()).await.unwrap();
+    cache.insert(&1, b"second".to_vec()).await.unwrap();
+
+    let val = cache.get(&1).await;
+    assert_eq!(val.as_deref(), Some(b"second".as_slice()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn insert_empty_value() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = FileCache::<u64>::new(tmp.path(), 4096).await.unwrap();
+
+    cache.insert(&1, Vec::new()).await.unwrap();
+
+    let val = cache.get(&1).await;
+    assert_eq!(val.as_deref(), Some(b"".as_slice()));
+}
