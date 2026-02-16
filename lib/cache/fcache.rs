@@ -396,10 +396,14 @@ impl<K: Eq + Hash + Copy + Send + Sync + 'static + Debug>
             }
         }
 
-        // Write file to disk.
+        // Write file to disk. The guard is constructed *before* the `.await` so that if
+        // this future is cancelled while `create_file` is in flight, the drop guard still
+        // cleans up the (potentially created) file.
         let path = self.shared.path_for(new_fid);
+        let mut guard = FileGuard {
+            path: Some(path.clone()),
+        };
         let mut new_file = self.create_file(&path).await?;
-        let mut guard = FileGuard { path: Some(path) };
         new_file.write_all(&value).await?;
 
         // Use entry_async to lock the bucket, then allocate version under the lock.

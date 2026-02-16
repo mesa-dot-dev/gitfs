@@ -3,15 +3,12 @@
 use std::{future::Future, hash::Hash};
 
 use std::sync::{
-    Arc, OnceLock,
+    Arc,
     atomic::{self, AtomicI64},
 };
 
 use hashlink::LinkedHashMap;
-use tokio::{
-    sync::mpsc::{Receiver, error::TrySendError},
-    task::JoinHandle,
-};
+use tokio::sync::mpsc::{Receiver, error::TrySendError};
 
 /// Types that carry a monotonic version for deduplication of out-of-order messages.
 pub trait Versioned {
@@ -22,9 +19,9 @@ pub trait Versioned {
 /// A trait for deleting keys from the cache. This is used by the LRU eviction tracker to delete
 /// keys when they are evicted.
 pub trait Deleter<K, Ctx>: Send + Clone + 'static {
-    /// Delete the given keys from the cache. The keys are guaranteed to be in the order of
-    /// eviction. You absolutely MUST delete the keys in the order they are given, otherwise the
-    /// LRU eviction tracker will get very confused and break.
+    /// Delete the given key from the cache. Deletions for different keys may be invoked
+    /// concurrently and in arbitrary order. Correctness is ensured by the caller through
+    /// a context-based guard (e.g. matching on a unique file ID), not by invocation order.
     fn delete(&mut self, key: K, ctx: Ctx) -> impl Future<Output = ()> + Send;
 }
 
@@ -123,16 +120,12 @@ impl<K: Copy + Eq + Hash + Send + 'static, C: Versioned + Send + 'static, D: Del
         }
     }
 
-    fn spawn_task(
-        deleter: D,
-        receiver: Receiver<Message<K, C>>,
-        shared: Arc<WorkerState>,
-    ) -> JoinHandle<()> {
+    fn spawn_task(deleter: D, receiver: Receiver<Message<K, C>>, shared: Arc<WorkerState>) {
         // TODO(markovejnovic): This should have a best-effort drop.
         tokio::spawn(async move {
             let mut task = Self::new(deleter, receiver, shared);
             task.work().await;
-        })
+        });
     }
 
     async fn work(&mut self) {
@@ -207,7 +200,6 @@ struct WorkerState {
     /// Packed atomic tracking pending eviction batches (upper 32 bits) and active deletions
     /// (lower 32 bits). See `DeletionIndicator` for the full protocol.
     active_deletions: DeletionIndicator,
-    worker: OnceLock<JoinHandle<()>>,
 }
 
 /// An LRU eviction tracker. This is used to track the least recently used keys in the cache, and
@@ -227,12 +219,10 @@ impl<K: Copy + Eq + Send + Hash + 'static, C: Versioned + Copy + Send + 'static>
 
         let worker_state = Arc::new(WorkerState {
             active_deletions: DeletionIndicator::new(),
-            worker: OnceLock::new(),
         });
-        let worker = LruProcessingTask::spawn_task(deleter, rx, Arc::clone(&worker_state));
-        if worker_state.worker.set(worker).is_err() {
-            unreachable!("worker should only be set once, and we just set it");
-        }
+        // The worker task is intentionally detached: it exits when the channel closes
+        // (i.e. when all senders, including the one held by LruEvictionTracker, are dropped).
+        LruProcessingTask::spawn_task(deleter, rx, Arc::clone(&worker_state));
 
         Self {
             worker_message_sender: tx,
