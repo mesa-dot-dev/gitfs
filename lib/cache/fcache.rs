@@ -197,6 +197,11 @@ impl<K: Eq + Hash + Send + Sync + Copy + 'static> FileCache<K> {
     // See usage for reasoning on why this is necessary.
     const MAX_READ_RETRY_COUNT: usize = 8;
 
+    // The maximum number of eviction loop iterations before giving up and proceeding with the
+    // insert. Prevents livelock when the LRU worker's ordered map is empty (e.g., Upserted
+    // messages haven't been delivered yet) and try_cull succeeds but evicts nothing.
+    const MAX_EVICTION_ATTEMPTS: u32 = 4;
+
     /// Try to create a new file cache at the given path.
     ///
     ///
@@ -362,6 +367,7 @@ impl<K: Eq + Hash + Copy + Send + Sync + 'static + Debug>
         let new_fid = self.file_generator.fetch_add(1, atomic::Ordering::Relaxed);
         let new_size = value.len();
 
+        let mut eviction_attempts = 0u32;
         while self.shared.size() + new_size > self.max_size_bytes {
             if self.shared.size() == 0 {
                 // The new entry is larger than the entire cache size limit. Insert it anyway
@@ -369,13 +375,15 @@ impl<K: Eq + Hash + Copy + Send + Sync + 'static + Debug>
                 break;
             }
 
-            // TODO(markovejnovic): This whole spinlock situation sounded better in my head, but
-            // realistically, I think I could've gotten away with just a plain Notify. It is what
-            // it is now.
+            if eviction_attempts >= Self::MAX_EVICTION_ATTEMPTS {
+                // We've tried enough times. The cache is over budget but max_size_bytes is a
+                // soft hint -- proceed with the insert and let future inserts drive further
+                // eviction.
+                break;
+            }
+            eviction_attempts += 1;
 
             if self.lru_tracker.have_pending_culls() {
-                // TODO(markovejnovic): This could be nicer and maybe starve the CPU less. Chances
-                // are we actually need to yield to the LRU tracker task.
                 tokio::task::yield_now().await;
                 continue;
             }
