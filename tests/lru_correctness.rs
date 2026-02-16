@@ -176,7 +176,10 @@ async fn try_cull_returns_false_when_channel_full() {
     assert!(tracker.try_cull(1), "first try_cull should succeed");
 
     // Second cull should fail — channel is full.
-    assert!(!tracker.try_cull(1), "second try_cull should fail when channel is full");
+    assert!(
+        !tracker.try_cull(1),
+        "second try_cull should fail when channel is full"
+    );
 
     // After the worker drains, pending culls should eventually clear.
     wait_for_culls(&tracker).await;

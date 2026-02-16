@@ -111,12 +111,22 @@ async fn concurrent_reads_during_writes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_inserts_with_eviction() {
-    // Small cache: 200 bytes. 50 tasks each insert 20-byte values.
+    // Small cache: 200 bytes. Sequential warmup fills the LRU worker's map,
+    // then concurrent inserts trigger eviction.
     let tmp = tempfile::tempdir().unwrap();
     let cache = Arc::new(FileCache::<u64>::new(tmp.path(), 200).await.unwrap());
 
+    // Warmup: insert 10 entries sequentially so the LRU worker registers them
+    // in its ordered map. This ensures eviction has candidates to evict.
+    for i in 0u64..10 {
+        cache.insert(&i, vec![b'x'; 20]).await.unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Concurrent phase: 40 more inserts push the cache well over the 200-byte
+    // limit and trigger eviction against the warmed-up LRU map.
     let mut set = JoinSet::new();
-    for i in 0u64..50 {
+    for i in 10u64..50 {
         let cache = Arc::clone(&cache);
         set.spawn(async move {
             cache.insert(&i, vec![b'x'; 20]).await.unwrap();
