@@ -1,16 +1,20 @@
 //! Implements the LRU eviction policy.
 
-use std::{
-    future::Future,
-    hash::Hash,
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicI64, AtomicUsize},
-    },
-};
+use std::{future::Future, hash::Hash};
+
+use crate::sync::{Arc, OnceLock, atomic, atomic::AtomicI64, atomic::AtomicUsize};
 
 use hashlink::LinkedHashMap;
-use tokio::{sync::mpsc::Receiver, task::JoinHandle};
+use tokio::{
+    sync::mpsc::{Receiver, error::TrySendError},
+    task::JoinHandle,
+};
+
+/// Types that carry a monotonic version for deduplication of out-of-order messages.
+pub trait Versioned {
+    /// Returns the monotonic version of this value.
+    fn version(&self) -> u64;
+}
 
 /// A trait for deleting keys from the cache. This is used by the LRU eviction tracker to delete
 /// keys when they are evicted.
@@ -28,8 +32,8 @@ enum Message<K, C> {
     Accessed(K, usize),
     /// Request an eviction set of the given size.
     Evict(u32),
-    /// Notify the LRU eviction tracker that a given key was inserted.
-    Inserted(K, C),
+    /// Notify the LRU eviction tracker that a key was inserted or overwritten.
+    Upserted(K, C),
 }
 
 /// Tracks in-flight eviction batches and individual deletions using a single packed `AtomicI64`.
@@ -60,36 +64,33 @@ impl DeletionIndicator {
     /// side *before* the `Evict` message is sent into the channel.
     fn submit_batch(&self) {
         self.underlying
-            .fetch_add(1 << 32, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(1 << 32, atomic::Ordering::Relaxed);
     }
 
     /// Undo a `submit_batch` call. Used when the channel `try_send` fails after we already
     /// incremented the pending-batch counter.
     fn undo_submit_batch(&self) {
         self.underlying
-            .fetch_sub(1 << 32, std::sync::atomic::Ordering::Relaxed);
+            .fetch_sub(1 << 32, atomic::Ordering::Relaxed);
     }
 
     /// Called by the worker when it begins processing an eviction batch. Atomically decrements
     /// the pending-batch counter (upper half) by 1 and increments the active-deletion counter
     /// (lower half) by `count`.
     fn process_batch(&self, count: u32) {
-        self.underlying.fetch_add(
-            i64::from(count) - (1 << 32),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        self.underlying
+            .fetch_add(i64::from(count) - (1 << 32), atomic::Ordering::Relaxed);
     }
 
     /// Called by a spawned deletion task when it finishes deleting one key.
     fn observe_deletion(&self) {
-        self.underlying
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.underlying.fetch_sub(1, atomic::Ordering::Relaxed);
     }
 
     /// Returns `true` if there are any pending batches (submitted but not yet processed by the
     /// worker). Used by producers to avoid enqueuing redundant eviction requests.
     fn have_pending_batches(&self) -> bool {
-        self.underlying.load(std::sync::atomic::Ordering::Relaxed) >= 1 << 32
+        self.underlying.load(atomic::Ordering::Relaxed) >= 1 << 32
     }
 }
 
@@ -107,7 +108,7 @@ struct LruProcessingTask<K: Copy, C, D: Deleter<K, C>> {
     shared: Arc<WorkerState>,
 }
 
-impl<K: Copy + Eq + Hash + Send + 'static, C: Send + 'static, D: Deleter<K, C>>
+impl<K: Copy + Eq + Hash + Send + 'static, C: Versioned + Send + 'static, D: Deleter<K, C>>
     LruProcessingTask<K, C, D>
 {
     fn new(deleter: D, receiver: Receiver<Message<K, C>>, shared: Arc<WorkerState>) -> Self {
@@ -146,17 +147,18 @@ impl<K: Copy + Eq + Hash + Send + 'static, C: Send + 'static, D: Deleter<K, C>>
                     < self
                         .shared
                         .eviction_generation
-                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .load(atomic::Ordering::Relaxed)
                 {
-                    // This is a ghost access. Happens when one client sends an eviction, but other
-                    // clients add accesses to the same keys, before our worker thread had a chance
-                    // to clean up.
-                    //
-                    // We're looking at an access in the "future".
+                    // This is a ghost access. Happens when one client sends an eviction, but
+                    // other clients add accesses to the same keys, before our worker thread had
+                    // a chance to clean up.
                     return true;
                 }
 
-                self.reposition_existing_key(k);
+                // The key may have been evicted between the access and this message arriving.
+                if let Some(entry) = self.ordered_key_map.remove(&k) {
+                    self.ordered_key_map.insert(k, entry);
+                }
             }
             Message::Evict(max_count) => {
                 // We got an eviction notice. Bump the eviction generation to indicate that all
@@ -164,7 +166,7 @@ impl<K: Copy + Eq + Hash + Send + 'static, C: Send + 'static, D: Deleter<K, C>>
                 // comment for an explanation of why we need to do this.
                 self.shared
                     .eviction_generation
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    .fetch_add(1, atomic::Ordering::Relaxed);
                 // Before we send off the eviction set, we actually need to remove the evicted
                 // keys from the pending queue. Read the following for an explanation.
                 //
@@ -204,12 +206,12 @@ impl<K: Copy + Eq + Hash + Send + 'static, C: Send + 'static, D: Deleter<K, C>>
                 // so the best we can do is simply mark the stupid keys as "evicted" and ignore
                 // any accesses from these keys until they're marked as "inserted" again.
                 //
-                // This is what the generation counter does -- it allows us to track which messages
-                // are considered "stale". There are some problems with the generation counter,
-                // however. We drop all messages that are "generationally old". Under high
-                // contention, this results in the eviction policy acting like a fuzzy LRU policy,
-                // rather than a strict LRU policy, but for the purposes of this cache, this is an
-                // acceptable tradeoff.
+                // This is what the generation counter does -- it allows us to track which
+                // messages are considered "stale". There are some problems with the generation
+                // counter, however. We drop all messages that are "generationally old". Under
+                // high contention, this results in the eviction policy acting like a fuzzy LRU
+                // policy, rather than a strict LRU policy, but for the purposes of this cache,
+                // this is an acceptable tradeoff.
                 //
                 // TODO(markovejnovic): Make this a strict LRU.
                 //
@@ -229,40 +231,31 @@ impl<K: Copy + Eq + Hash + Send + 'static, C: Send + 'static, D: Deleter<K, C>>
                     self.shared.active_deletions.process_batch(take_count);
 
                     for _ in 0..take_count {
-                        let Some(e) = self.ordered_key_map.pop_front() else {
+                        let Some((key, ctx)) = self.ordered_key_map.pop_front() else {
                             break;
                         };
                         let mut deleter = self.deleter.clone();
                         let shared_clone = Arc::clone(&self.shared);
                         tokio::spawn(async move {
-                            deleter.delete(e.0, e.1).await;
+                            deleter.delete(key, ctx).await;
                             shared_clone.active_deletions.observe_deletion();
                         });
                     }
                 }
             }
-            Message::Inserted(k, ctx) => {
-                debug_assert!(
-                    !self.ordered_key_map.contains_key(&k),
-                    "key must not already exist in the ordered set when inserting"
-                );
-
+            Message::Upserted(k, ctx) => {
+                if let Some(existing) = self.ordered_key_map.get(&k)
+                    && ctx.version() < existing.version()
+                {
+                    // Stale message from a previous incarnation; drop it.
+                    return true;
+                }
+                self.ordered_key_map.remove(&k);
                 self.ordered_key_map.insert(k, ctx);
             }
         }
 
         true
-    }
-
-    fn reposition_existing_key(&mut self, key: K) {
-        debug_assert!(
-            self.ordered_key_map.contains_key(&key),
-            "key must exist in the ordered set before repositioning"
-        );
-
-        if let Some(c) = self.ordered_key_map.remove(&key) {
-            self.ordered_key_map.insert(key, c);
-        }
     }
 }
 
@@ -283,7 +276,9 @@ pub struct LruEvictionTracker<K, C> {
     worker_state: Arc<WorkerState>,
 }
 
-impl<K: Copy + Eq + Send + Hash + 'static, C: Send + 'static> LruEvictionTracker<K, C> {
+impl<K: Copy + Eq + Send + Hash + 'static, C: Versioned + Copy + Send + 'static>
+    LruEvictionTracker<K, C>
+{
     /// Spawn a new LRU eviction tracker with the given deleter and channel size.
     pub fn spawn<D: Deleter<K, C>>(deleter: D, channel_size: usize) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(channel_size);
@@ -304,11 +299,23 @@ impl<K: Copy + Eq + Send + Hash + 'static, C: Send + 'static> LruEvictionTracker
         }
     }
 
-    /// Notify the LRU eviction tracker that the given key was inserted.
+    /// Notify the LRU tracker that a key was inserted or overwritten.
     ///
-    /// You MUST call this method for every new key that is inserted into the cache.
-    pub async fn insert(&self, key: K, ctx: C) {
-        self.send_msg(Message::Inserted(key, ctx)).await;
+    /// Non-cancellable: uses `try_send` (sync) with a `tokio::spawn` fallback so that the
+    /// notification cannot be lost to task cancellation.
+    pub fn upsert(&self, key: K, ctx: C) {
+        match self
+            .worker_message_sender
+            .try_send(Message::Upserted(key, ctx))
+        {
+            Ok(()) | Err(TrySendError::Closed(_)) => {}
+            Err(TrySendError::Full(msg)) => {
+                let sender = self.worker_message_sender.clone();
+                tokio::spawn(async move {
+                    let _ = sender.send(msg).await;
+                });
+            }
+        }
     }
 
     /// Notify the LRU eviction tracker that the given key was accessed.
@@ -319,7 +326,7 @@ impl<K: Copy + Eq + Send + Hash + 'static, C: Send + 'static> LruEvictionTracker
             key,
             self.worker_state
                 .eviction_generation
-                .load(std::sync::atomic::Ordering::Relaxed),
+                .load(atomic::Ordering::Relaxed),
         ))
         .await;
     }

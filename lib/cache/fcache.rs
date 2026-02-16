@@ -4,14 +4,15 @@ use std::{
     fmt::Debug,
     hash::Hash,
     path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicUsize},
 };
+
+use crate::sync::{Arc, atomic, atomic::AtomicU64, atomic::AtomicUsize};
 
 use tracing::error;
 
 use crate::{
     cache::{
-        eviction::lru::{Deleter, LruEvictionTracker},
+        eviction::lru::{Deleter, LruEvictionTracker, Versioned},
         traits::{AsyncReadableCache, AsyncWritableCache},
     },
     io,
@@ -45,7 +46,7 @@ struct FileCacheShared<K: Eq + Hash> {
 
 impl<K: Eq + Hash + Send + Sync> FileCacheShared<K> {
     fn size(&self) -> usize {
-        self.size_bytes.load(std::sync::atomic::Ordering::Relaxed)
+        self.size_bytes.load(atomic::Ordering::Relaxed)
     }
 
     fn path_for(&self, fid: usize) -> PathBuf {
@@ -66,9 +67,16 @@ impl<K: Eq + Hash + Send + Sync> FileCacheShared<K> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct DeleterCtx {
     fid: usize,
+    version: u64,
+}
+
+impl Versioned for DeleterCtx {
+    fn version(&self) -> u64 {
+        self.version
+    }
 }
 
 #[derive(Clone)]
@@ -97,7 +105,7 @@ impl<K: Copy + Eq + Hash + Sync + Send + 'static> Deleter<K, DeleterCtx> for Lru
 
             self.shared
                 .size_bytes
-                .fetch_sub(entry.1.size_bytes, std::sync::atomic::Ordering::Relaxed);
+                .fetch_sub(entry.1.size_bytes, atomic::Ordering::Relaxed);
         }
     }
 }
@@ -160,6 +168,10 @@ pub struct FileCache<K: Eq + Hash> {
     /// LRU eviction tracker. This is used to track the least recently used keys in the cache, and
     /// to evict keys when necessary.
     lru_tracker: LruEvictionTracker<K, DeleterCtx>,
+
+    /// Global monotonic counter for per-key versioning. Incremented under the scc bucket lock
+    /// to guarantee that versions are strictly monotonically increasing per key.
+    version_counter: AtomicU64,
 }
 
 impl<K: Eq + Hash + Send + Sync + Copy + 'static> FileCache<K> {
@@ -253,6 +265,7 @@ impl<K: Eq + Hash + Send + Sync + Copy + 'static> FileCache<K> {
                 LruEntryDeleter::new(shared),
                 Self::MAX_LRU_TRACKER_CHANNEL_SIZE,
             ),
+            version_counter: AtomicU64::new(0),
         })
     }
 
@@ -346,21 +359,13 @@ impl<K: Eq + Hash + Copy + Send + Sync + 'static + Debug>
     AsyncWritableCache<K, Vec<u8>, CacheWriteError> for FileCache<K>
 {
     async fn insert(&self, key: &K, value: Vec<u8>) -> Result<(), CacheWriteError> {
-        // Inserts are tricky. The first thing we'll do is find a new file handle for the new
-        // value.
-        let new_entry = CacheMapEntry {
-            fid: self
-                .file_generator
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            size_bytes: value.len(),
-        };
+        let new_fid = self.file_generator.fetch_add(1, atomic::Ordering::Relaxed);
+        let new_size = value.len();
 
-        while self.shared.size() + new_entry.size_bytes > self.max_size_bytes {
+        while self.shared.size() + new_size > self.max_size_bytes {
             if self.shared.size() == 0 {
-                // This means that the new entry is larger than the entire cache size limit. In
-                // this case, we have no choice but to just insert the entry and let the cache
-                // temporarily exceed the size limit. We will try to evict entries as soon as
-                // possible, but in the meantime, we need to at least insert this entry.
+                // The new entry is larger than the entire cache size limit. Insert it anyway
+                // and let the cache temporarily exceed the limit.
                 break;
             }
 
@@ -368,70 +373,77 @@ impl<K: Eq + Hash + Copy + Send + Sync + 'static + Debug>
             // realistically, I think I could've gotten away with just a plain Notify. It is what
             // it is now.
 
-            // The cache doesn't have any space for this new entry, so we need to evict some
-            // entries before we can insert this new entry.
-            // Before we can do that, we need to make sure there are no other pending culls. If we
-            // let multiple culls happen at the same time, we risk draining a lot more entries from
-            // the cache than necessary, which results in a regression.
             if self.lru_tracker.have_pending_culls() {
-                // If there are any pending culls, then we need to just wait.
                 // TODO(markovejnovic): This could be nicer and maybe starve the CPU less. Chances
                 // are we actually need to yield to the LRU tracker task.
                 tokio::task::yield_now().await;
                 continue;
             }
 
-            // There are no culls in progress, but the cache is still too full for this new entry,
-            // which means we need to evict some entries.
             if !self.lru_tracker.try_cull(Self::LRU_EVICTION_MAX_BATCH_SIZE) {
                 tokio::task::yield_now().await;
             }
         }
 
-        let path = self.shared.path_for(new_entry.fid);
+        // Write file to disk.
+        let path = self.shared.path_for(new_fid);
         let mut new_file = self.create_file(&path).await?;
         let mut guard = FileGuard { path: Some(path) };
         new_file.write_all(&value).await?;
 
-        let mut size_delta: isize = new_entry.size_bytes.cast_signed();
-
-        // Register the file in the map. After this point, the map owns the file and the guard
-        // must not delete it.
-        let old_entry = self.shared.map.upsert_async(*key, new_entry).await;
+        // Use entry_async to lock the bucket, then allocate version under the lock.
+        // This ensures version monotonicity per key matches the actual mutation order.
+        let (old_entry, new_version) = match self.shared.map.entry_async(*key).await {
+            scc::hash_map::Entry::Occupied(mut o) => {
+                let old = *o.get();
+                let v = self.version_counter.fetch_add(1, atomic::Ordering::Relaxed);
+                *o.get_mut() = CacheMapEntry {
+                    fid: new_fid,
+                    size_bytes: new_size,
+                };
+                (Some(old), v)
+            }
+            scc::hash_map::Entry::Vacant(vacant) => {
+                let v = self.version_counter.fetch_add(1, atomic::Ordering::Relaxed);
+                vacant.insert_entry(CacheMapEntry {
+                    fid: new_fid,
+                    size_bytes: new_size,
+                });
+                (None, v)
+            }
+        };
+        // Bucket lock released here.
         guard.path = None;
 
-        if let Some(old_entry) = old_entry {
-            // If there was an old file ID, we need to delete the old file and notify the LRU
-            // tracker that the key was accessed.
-            self.lru_tracker.access(*key).await;
-            size_delta -= old_entry.size_bytes.cast_signed();
+        // LRU notification (sync via try_send, non-cancellable).
+        self.lru_tracker.upsert(
+            *key,
+            DeleterCtx {
+                fid: new_fid,
+                version: new_version,
+            },
+        );
 
-            // TODO(markovejnovic): Could stack allocate the path.
-            // Note that the file already may be deleted at this point -- the LRU tracker deleter
-            // may have already deleted this file, so if the file doesn't exist, that's already
-            // fine with us.
-            if let Err(e) = self.shared.delete_entry_from_disk_async(&old_entry).await {
-                error!(error = ?e, key = ?key, "failed to delete old cache entry from disk");
-            }
-        } else {
-            self.lru_tracker
-                .insert(*key, DeleterCtx { fid: new_entry.fid })
-                .await;
-        }
-
+        // Size accounting (sync atomic, non-cancellable).
+        let size_delta: isize = new_size.cast_signed()
+            - old_entry
+                .as_ref()
+                .map_or(0isize, |e| e.size_bytes.cast_signed());
         if size_delta > 0 {
-            self.shared.size_bytes.fetch_add(
-                size_delta.cast_unsigned(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            self.shared
+                .size_bytes
+                .fetch_add(size_delta.cast_unsigned(), atomic::Ordering::Relaxed);
         } else if size_delta < 0 {
-            self.shared.size_bytes.fetch_sub(
-                size_delta.unsigned_abs(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            self.shared
+                .size_bytes
+                .fetch_sub(size_delta.unsigned_abs(), atomic::Ordering::Relaxed);
         }
 
-        // Epic, we did it.
+        // Deferrable: delete old file (safe to cancel — file is orphaned).
+        if let Some(old_entry) = old_entry {
+            drop(self.shared.delete_entry_from_disk_async(&old_entry).await);
+        }
+
         Ok(())
     }
 }
