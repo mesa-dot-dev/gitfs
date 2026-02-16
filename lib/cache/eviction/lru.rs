@@ -12,51 +12,6 @@ use std::{
 use hashlink::LinkedHashMap;
 use tokio::{sync::mpsc::Receiver, task::JoinHandle};
 
-#[derive(Debug)]
-struct DeletionIndicator {
-    underlying: AtomicI64,
-}
-
-impl DeletionIndicator {
-    /// Call to mark the start of a batch of deletions.
-    fn submit_batch(&self) {
-        self.underlying
-            .fetch_add(1 << 32, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Call to mark a batch as being processed right now.
-    fn process_batch(&self, count: u32) {
-        self.underlying.fetch_add(
-            i64::from(count) - (1 << 32),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-
-    /// Call to mark a deletion as being completed.
-    fn observe_deletion(&self) {
-        self.underlying
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Check if there are any scheduled or active deletions.
-    fn have_pending_deletions(&self) -> bool {
-        self.underlying.load(std::sync::atomic::Ordering::Relaxed) != 0
-    }
-
-    /// Check if there are any scheduled batches of deletions.
-    fn have_pending_batches(&self) -> bool {
-        self.underlying.load(std::sync::atomic::Ordering::Relaxed) >= 1 << 32
-    }
-}
-
-impl Default for DeletionIndicator {
-    fn default() -> Self {
-        Self {
-            underlying: AtomicI64::new(0),
-        }
-    }
-}
-
 /// A trait for deleting keys from the cache. This is used by the LRU eviction tracker to delete
 /// keys when they are evicted.
 pub trait Deleter<K, Ctx>: Send + Clone + 'static {
@@ -75,6 +30,67 @@ enum Message<K, C> {
     Evict(u32),
     /// Notify the LRU eviction tracker that a given key was inserted.
     Inserted(K, C),
+}
+
+/// Tracks in-flight eviction batches and individual deletions using a single packed `AtomicI64`.
+///
+/// Layout: `[upper 32 bits: pending batches | lower 32 bits: active deletions]`
+///
+/// The lifecycle of an eviction is:
+/// 1. Producer calls `submit_batch()` — increments upper half by 1.
+/// 2. Producer enqueues the `Evict` message into the channel.
+/// 3. Worker receives the message and calls `process_batch(n)` — decrements upper half by 1 and
+///    increments lower half by `n` (the actual number of keys to delete).
+/// 4. Each spawned deletion task calls `observe_deletion()` when done — decrements lower half by 1.
+///
+/// The indicator reads zero only when no batches are pending and no deletions are in flight.
+#[derive(Debug)]
+struct DeletionIndicator {
+    underlying: AtomicI64,
+}
+
+impl DeletionIndicator {
+    fn new() -> Self {
+        Self {
+            underlying: AtomicI64::new(0),
+        }
+    }
+
+    /// Mark that a new eviction batch has been submitted by a producer. Called on the producer
+    /// side *before* the `Evict` message is sent into the channel.
+    fn submit_batch(&self) {
+        self.underlying
+            .fetch_add(1 << 32, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Undo a `submit_batch` call. Used when the channel `try_send` fails after we already
+    /// incremented the pending-batch counter.
+    fn undo_submit_batch(&self) {
+        self.underlying
+            .fetch_sub(1 << 32, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Called by the worker when it begins processing an eviction batch. Atomically decrements
+    /// the pending-batch counter (upper half) by 1 and increments the active-deletion counter
+    /// (lower half) by `count`.
+    fn process_batch(&self, count: u32) {
+        self.underlying.fetch_add(
+            i64::from(count) - (1 << 32),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Called by a spawned deletion task when it finishes deleting one key.
+    fn observe_deletion(&self) {
+        self.underlying
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns `true` if there are any pending batches (submitted but not yet processed by the
+    /// worker). Used by producers to avoid enqueuing redundant eviction requests.
+    fn have_pending_batches(&self) -> bool {
+        self.underlying.load(std::sync::atomic::Ordering::Relaxed) >= 1 << 32
+    }
 }
 
 #[derive(Debug)]
@@ -205,7 +221,13 @@ impl<K: Copy + Eq + Hash + Send + 'static, C: Send + 'static, D: Deleter<K, C>>
                     // within a u32, min(MAX_U32, MAX_USIZE) == MAX_U32.
                     #[expect(clippy::cast_possible_truncation)]
                     let take_count = self.ordered_key_map.len().min(max_count as usize) as u32;
+
+                    // Atomically transition this batch from "pending" to "active deletions".
+                    // This decrements the upper half (pending batches) by 1 and increments the
+                    // lower half (active deletions) by take_count. If take_count is 0, this
+                    // still correctly clears the pending batch.
                     self.shared.active_deletions.process_batch(take_count);
+
                     for _ in 0..take_count {
                         let Some(e) = self.ordered_key_map.pop_front() else {
                             break;
@@ -246,6 +268,8 @@ impl<K: Copy + Eq + Hash + Send + 'static, C: Send + 'static, D: Deleter<K, C>>
 
 #[derive(Debug)]
 struct WorkerState {
+    /// Packed atomic tracking pending eviction batches (upper 32 bits) and active deletions
+    /// (lower 32 bits). See `DeletionIndicator` for the full protocol.
     active_deletions: DeletionIndicator,
     eviction_generation: AtomicUsize,
     worker: OnceLock<JoinHandle<()>>,
@@ -265,7 +289,7 @@ impl<K: Copy + Eq + Send + Hash + 'static, C: Send + 'static> LruEvictionTracker
         let (tx, rx) = tokio::sync::mpsc::channel(channel_size);
 
         let worker_state = Arc::new(WorkerState {
-            active_deletions: DeletionIndicator::default(),
+            active_deletions: DeletionIndicator::new(),
             eviction_generation: AtomicUsize::new(0),
             worker: OnceLock::new(),
         });
@@ -283,56 +307,57 @@ impl<K: Copy + Eq + Send + Hash + 'static, C: Send + 'static> LruEvictionTracker
     /// Notify the LRU eviction tracker that the given key was inserted.
     ///
     /// You MUST call this method for every new key that is inserted into the cache.
-    pub fn insert(&self, key: K, ctx: C) {
-        self.send_msg(Message::Inserted(key, ctx));
+    pub async fn insert(&self, key: K, ctx: C) {
+        self.send_msg(Message::Inserted(key, ctx)).await;
     }
 
     /// Notify the LRU eviction tracker that the given key was accessed.
     ///
     /// You MUST call this method for every read or update to a key.
-    pub fn access(&self, key: K) {
+    pub async fn access(&self, key: K) {
         self.send_msg(Message::Accessed(
             key,
             self.worker_state
                 .eviction_generation
                 .load(std::sync::atomic::Ordering::Relaxed),
-        ));
+        ))
+        .await;
     }
 
-    /// Cull the least recently used keys with the given deletion method.
-    pub fn cull(&self, max_count: u32) {
-        // Culling sets the top-most bit of the active deletion count to indicate that there are
-        // queued deletions.
+    /// Try to cull the least recently used keys with the given deletion method.
+    ///
+    /// Returns `true` if the eviction message was successfully enqueued, or `false` if the
+    /// channel is full. In the latter case, the caller should yield and retry.
+    ///
+    /// The ordering here is critical for correctness: we `submit_batch()` *before* `try_send()`
+    /// so that the `DeletionIndicator` is always in a state where `have_pending_batches()` returns
+    /// `true` by the time anyone observes the enqueued message. If the send fails, we roll back
+    /// with `undo_submit_batch()`, which is a net-zero delta on the packed atomic.
+    #[must_use]
+    pub fn try_cull(&self, max_count: u32) -> bool {
         self.worker_state.active_deletions.submit_batch();
-        self.send_msg(Message::Evict(max_count));
+        if self
+            .worker_message_sender
+            .try_send(Message::Evict(max_count))
+            .is_ok()
+        {
+            true
+        } else {
+            self.worker_state.active_deletions.undo_submit_batch();
+            false
+        }
     }
 
-    /// Check whether there are culls that are already scheduled.
+    /// Check whether there are culls that are already scheduled or actively in progress.
     #[must_use]
     pub fn have_pending_culls(&self) -> bool {
         self.worker_state.active_deletions.have_pending_batches()
     }
 
     /// Send a message to the worker. This is a helper method to reduce code duplication.
-    fn send_msg(&self, message: Message<K, C>) {
-        if self.worker_message_sender.blocking_send(message).is_err() {
+    async fn send_msg(&self, message: Message<K, C>) {
+        if self.worker_message_sender.send(message).await.is_err() {
             unreachable!();
         }
-    }
-
-    /// Get the total number of currently active deletions.
-    ///
-    /// Useful if you need to spinlock on this, for whatever reason.
-    ///
-    ///
-    /// # Note
-    ///
-    /// Does not guarantee ordering in respect to the deletion. The only guarantee this method
-    /// provides is whether any deletions are pending or not, but it is not safe to use this to
-    /// synchronize upon the results of your deletions, since the underlying atomic is used in a
-    /// relaxed manner.
-    #[must_use]
-    pub fn have_active_deletions(&self) -> bool {
-        self.worker_state.active_deletions.have_pending_deletions()
     }
 }

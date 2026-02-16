@@ -20,6 +20,23 @@ use thiserror::Error;
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+/// Drop guard that deletes an unregistered cache file if the insert task is cancelled or fails
+/// between file creation and map registration. Defused once the file is registered in the map.
+struct FileGuard {
+    path: Option<PathBuf>,
+}
+
+impl Drop for FileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take()
+            && let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            error!(error = ?e, path = ?path, "failed to clean up orphaned cache file");
+        }
+    }
+}
+
 struct FileCacheShared<K: Eq + Hash> {
     root_path: PathBuf,
     map: scc::HashMap<K, CacheMapEntry>,
@@ -310,7 +327,7 @@ impl<K: Eq + Hash + Copy + Send + Sync + Debug + 'static> AsyncReadableCache<K, 
                     error!(error = ?e, key = ?key, "IO error while reading file for cache key");
                 })
                 .ok()?;
-            self.lru_tracker.access(*key);
+            self.lru_tracker.access(*key).await;
             return Some(buf);
         }
 
@@ -366,21 +383,27 @@ impl<K: Eq + Hash + Copy + Send + Sync + 'static + Debug>
 
             // There are no culls in progress, but the cache is still too full for this new entry,
             // which means we need to evict some entries.
-            self.lru_tracker.cull(Self::LRU_EVICTION_MAX_BATCH_SIZE);
+            if !self.lru_tracker.try_cull(Self::LRU_EVICTION_MAX_BATCH_SIZE) {
+                tokio::task::yield_now().await;
+            }
         }
 
-        let mut new_file = self
-            .create_file(&self.shared.path_for(new_entry.fid))
-            .await?;
+        let path = self.shared.path_for(new_entry.fid);
+        let mut new_file = self.create_file(&path).await?;
+        let mut guard = FileGuard { path: Some(path) };
         new_file.write_all(&value).await?;
 
         let mut size_delta: isize = new_entry.size_bytes.cast_signed();
 
-        // Now we insert the new file ID into the map, and get the old file ID if it exists.
-        if let Some(old_entry) = self.shared.map.upsert_async(*key, new_entry).await {
+        // Register the file in the map. After this point, the map owns the file and the guard
+        // must not delete it.
+        let old_entry = self.shared.map.upsert_async(*key, new_entry).await;
+        guard.path = None;
+
+        if let Some(old_entry) = old_entry {
             // If there was an old file ID, we need to delete the old file and notify the LRU
             // tracker that the key was accessed.
-            self.lru_tracker.access(*key);
+            self.lru_tracker.access(*key).await;
             size_delta -= old_entry.size_bytes.cast_signed();
 
             // TODO(markovejnovic): Could stack allocate the path.
@@ -392,7 +415,8 @@ impl<K: Eq + Hash + Copy + Send + Sync + 'static + Debug>
             }
         } else {
             self.lru_tracker
-                .insert(*key, DeleterCtx { fid: new_entry.fid });
+                .insert(*key, DeleterCtx { fid: new_entry.fid })
+                .await;
         }
 
         if size_delta > 0 {
