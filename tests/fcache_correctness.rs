@@ -129,3 +129,61 @@ async fn insert_empty_value() {
     let val = cache.get(&1).await;
     assert_eq!(val.as_deref(), Some(b"".as_slice()));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eviction_removes_oldest_entries() {
+    // max_size = 100 bytes. Insert 5 × 30-byte entries (150 bytes total).
+    // After the last insert, eviction should have removed at least one early entry.
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = FileCache::<u64>::new(tmp.path(), 100).await.unwrap();
+
+    for i in 0u64..5 {
+        let value = vec![b'x'; 30];
+        cache.insert(&i, value).await.unwrap();
+    }
+
+    // Give the async eviction worker time to complete deletions.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // At least one of the earliest keys should have been evicted.
+    let mut present_count = 0;
+    for i in 0u64..5 {
+        if cache.get(&i).await.is_some() {
+            present_count += 1;
+        }
+    }
+
+    assert!(
+        present_count < 5,
+        "expected at least one eviction, but all 5 entries are still present"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn entry_larger_than_max_size_still_inserted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = FileCache::<u64>::new(tmp.path(), 10).await.unwrap();
+
+    // Value is 50 bytes, far exceeding max_size of 10.
+    let big_value = vec![b'A'; 50];
+    cache.insert(&1, big_value.clone()).await.unwrap();
+
+    let val = cache.get(&1).await;
+    assert_eq!(val, Some(big_value));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_removes_cache_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache_path = tmp.path().join("cache");
+
+    {
+        let cache = FileCache::<u64>::new(&cache_path, 4096).await.unwrap();
+        cache.insert(&1, b"data".to_vec()).await.unwrap();
+    }
+    // After drop, the cache directory should be gone.
+    assert!(
+        !cache_path.exists(),
+        "cache directory should have been removed on drop"
+    );
+}
