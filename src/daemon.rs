@@ -43,7 +43,7 @@ mod managed_fuse {
                     name: org_name.clone(),
                     api_key: org.api_key.clone(),
                 });
-            let mesa_fs = MesaFS::new(orgs, (config.uid, config.gid));
+            let mesa_fs = MesaFS::new(orgs, (config.uid, config.gid), &config.cache);
             let fuse_adapter = FuserAdapter::new(mesa_fs, handle);
             let mount_opts = [
                 fuser::MountOption::FSName("git-fs".to_owned()),

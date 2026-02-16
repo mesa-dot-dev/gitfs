@@ -12,6 +12,9 @@ use mesa_dev::low_level::content::{Content, DirEntry as MesaDirEntry};
 use num_traits::cast::ToPrimitive as _;
 use tracing::{Instrument as _, instrument, trace, warn};
 
+use git_fs::cache::fcache::FileCache;
+
+use crate::app_config::CacheConfig;
 use crate::fs::icache::{AsyncICache, FileTable, IcbResolver};
 use crate::fs::r#trait::{
     DirEntry, DirEntryType, FileAttr, FileHandle, FileOpenOptions, FilesystemStats, Fs, Inode,
@@ -183,6 +186,8 @@ pub struct RepoFs {
     file_table: FileTable,
     readdir_buf: Vec<DirEntry>,
     open_files: HashMap<FileHandle, Inode>,
+    #[expect(dead_code, reason = "will be used in RepoFs::read cache integration")]
+    file_cache: Option<FileCache<Inode>>,
 }
 
 impl RepoFs {
@@ -190,12 +195,13 @@ impl RepoFs {
     const BLOCK_SIZE: u32 = 4096;
 
     /// Create a new `RepoFs` for a specific org and repo.
-    pub fn new(
+    pub async fn new(
         client: MesaClient,
         org_name: String,
         repo_name: String,
         ref_: String,
         fs_owner: (u32, u32),
+        cache_config: CacheConfig,
     ) -> Self {
         let resolver = RepoResolver {
             client: client.clone(),
@@ -205,6 +211,22 @@ impl RepoFs {
             fs_owner,
             block_size: Self::BLOCK_SIZE,
         };
+
+        let file_cache = match cache_config.max_size {
+            Some(max_size) if max_size.as_u64() > 0 => {
+                let cache_dir = cache_config.path.join(&org_name).join(&repo_name);
+                let max_bytes = max_size.as_u64().try_into().unwrap_or(usize::MAX);
+                match FileCache::new(&cache_dir, max_bytes).await {
+                    Ok(cache) => Some(cache),
+                    Err(e) => {
+                        warn!(error = ?e, "failed to create file cache, continuing without caching");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         Self {
             client,
             org_name,
@@ -214,6 +236,7 @@ impl RepoFs {
             file_table: FileTable::new(),
             readdir_buf: Vec::new(),
             open_files: HashMap::new(),
+            file_cache,
         }
     }
 

@@ -10,6 +10,7 @@ use secrecy::ExposeSecret as _;
 use tracing::{Instrument as _, instrument, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
+use crate::app_config::CacheConfig;
 use crate::fs::icache::bridge::HashMapBridge;
 use crate::fs::icache::{AsyncICache, FileTable, IcbResolver};
 use crate::fs::r#trait::{
@@ -154,7 +155,11 @@ impl MesaFS {
 
     /// Create a new `MesaFS` instance.
     #[must_use]
-    pub fn new(orgs: impl Iterator<Item = OrgConfig>, fs_owner: (u32, u32)) -> Self {
+    pub fn new(
+        orgs: impl Iterator<Item = OrgConfig>,
+        fs_owner: (u32, u32),
+        cache: &CacheConfig,
+    ) -> Self {
         let resolver = MesaResolver {
             fs_owner,
             block_size: Self::BLOCK_SIZE,
@@ -174,7 +179,7 @@ impl MesaFS {
                 slots: orgs
                     .map(|org_conf| {
                         let client = build_mesa_client(org_conf.api_key.expose_secret());
-                        let org = OrgFs::new(org_conf.name, client, fs_owner);
+                        let org = OrgFs::new(org_conf.name, client, fs_owner, cache.clone());
                         ChildSlot {
                             inner: org,
                             bridge: HashMapBridge::new(),
