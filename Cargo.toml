@@ -52,9 +52,6 @@ opentelemetry-otlp = { version = "0.29", default-features = false, features = ["
 tracing-opentelemetry = { version = "0.30" }
 hashlink = "0.11.0"
 
-[target.'cfg(loom)'.dependencies]
-loom = "0.7"
-
 [features]
 default = []
 staging = []
@@ -63,7 +60,7 @@ staging = []
 vergen-gitcl = { version = "1", features = [] }
 
 [lints.rust]
-unexpected_cfgs            = { level = "warn", check-cfg = ['cfg(loom)'] }
+unexpected_cfgs            = "warn"
 unsafe_code                = "allow"
 missing_docs               = "warn"
 unreachable_pub            = "allow"

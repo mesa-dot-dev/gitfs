@@ -2,7 +2,10 @@
 
 use std::{future::Future, hash::Hash};
 
-use crate::sync::{Arc, OnceLock, atomic, atomic::AtomicI64, atomic::AtomicUsize};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{self, AtomicI64},
+};
 
 use hashlink::LinkedHashMap;
 use tokio::{
@@ -29,7 +32,7 @@ pub trait Deleter<K, Ctx>: Send + Clone + 'static {
 #[derive(Debug, Clone, Copy)]
 enum Message<K, C> {
     /// Notify the LRU eviction tracker that the given key was accessed.
-    Accessed(K, usize),
+    Accessed(K),
     /// Request an eviction set of the given size.
     Evict(u32),
     /// Notify the LRU eviction tracker that a key was inserted or overwritten.
@@ -142,82 +145,14 @@ impl<K: Copy + Eq + Hash + Send + 'static, C: Versioned + Send + 'static, D: Del
     #[must_use]
     fn service_message(&mut self, message: Message<K, C>) -> bool {
         match message {
-            Message::Accessed(k, ev_gen) => {
-                if ev_gen
-                    < self
-                        .shared
-                        .eviction_generation
-                        .load(atomic::Ordering::Relaxed)
-                {
-                    // This is a ghost access. Happens when one client sends an eviction, but
-                    // other clients add accesses to the same keys, before our worker thread had
-                    // a chance to clean up.
-                    return true;
-                }
-
+            Message::Accessed(k) => {
                 // The key may have been evicted between the access and this message arriving.
+                // If it was, the remove returns None and this is a no-op.
                 if let Some(entry) = self.ordered_key_map.remove(&k) {
                     self.ordered_key_map.insert(k, entry);
                 }
             }
             Message::Evict(max_count) => {
-                // We got an eviction notice. Bump the eviction generation to indicate that all
-                // accesses after this point are considered in the "future". Read the subsequent
-                // comment for an explanation of why we need to do this.
-                self.shared
-                    .eviction_generation
-                    .fetch_add(1, atomic::Ordering::Relaxed);
-                // Before we send off the eviction set, we actually need to remove the evicted
-                // keys from the pending queue. Read the following for an explanation.
-                //
-                // The client may access a key AFTER an eviction notice. Until the eviction
-                // notice is processed by the client, the client will have the key available to
-                // it.
-                //
-                // Consequently, the client may very well access the key after it sent out an
-                // eviction notice, but before the eviction notice is processed. This will
-                // result in the key being added as an access message after the eviction
-                // notice, but before the eviction set is sent to the client.
-                //
-                // The problem is, the LruProcessingTask has no way of knowing whether the
-                // message the client sent is a stale message, or a legit message.
-                //
-                // Consider the following queue state in between two loop iterations of the
-                // LruProcessingTask:
-                // A -- access
-                // B -- insert
-                // E -- eviction request
-                // C -- the client thread which made the request
-                //
-                // A1 A2 A3 E1 A1 B1 -- after this point, no clients can access A1
-                // C1 C1 C1 C1 C2 C1 ---------------------------------------------> time
-                //
-                // The scenario here is:
-                // - A1, A2, A3 are used by the clients.
-                // - C1 wants to add B1, but it doesn't have enough space, so it sends an
-                //   eviction request.
-                // - In parallel, C2 accesses A1, which is completely legal.
-                //
-                // The result is that our queue has A1, even after we sent out the eviction
-                // request, and we have no way of knowing whether A1 is a stale message or not.
-                //
-                // To prevent this whole "is this thing stale or not" problem, we need to
-                // "erase" keys evicted in the future. Unfortunately, you can't mutate queues,
-                // so the best we can do is simply mark the stupid keys as "evicted" and ignore
-                // any accesses from these keys until they're marked as "inserted" again.
-                //
-                // This is what the generation counter does -- it allows us to track which
-                // messages are considered "stale". There are some problems with the generation
-                // counter, however. We drop all messages that are "generationally old". Under
-                // high contention, this results in the eviction policy acting like a fuzzy LRU
-                // policy, rather than a strict LRU policy, but for the purposes of this cache,
-                // this is an acceptable tradeoff.
-                //
-                // TODO(markovejnovic): Make this a strict LRU.
-                //
-                // We cannot mutate the queue to mark messages as stale, so the best we can do
-                // is mark the keys as "evicted" and ignore any accesses from these keys until
-                // they're marked as "inserted" again.
                 {
                     // These integer casts are safe, since max_count is guaranteed to fit
                     // within a u32, min(MAX_U32, MAX_USIZE) == MAX_U32.
@@ -272,7 +207,6 @@ struct WorkerState {
     /// Packed atomic tracking pending eviction batches (upper 32 bits) and active deletions
     /// (lower 32 bits). See `DeletionIndicator` for the full protocol.
     active_deletions: DeletionIndicator,
-    eviction_generation: AtomicUsize,
     worker: OnceLock<JoinHandle<()>>,
 }
 
@@ -293,7 +227,6 @@ impl<K: Copy + Eq + Send + Hash + 'static, C: Versioned + Copy + Send + 'static>
 
         let worker_state = Arc::new(WorkerState {
             active_deletions: DeletionIndicator::new(),
-            eviction_generation: AtomicUsize::new(0),
             worker: OnceLock::new(),
         });
         let worker = LruProcessingTask::spawn_task(deleter, rx, Arc::clone(&worker_state));
@@ -331,13 +264,7 @@ impl<K: Copy + Eq + Send + Hash + 'static, C: Versioned + Copy + Send + 'static>
     /// Non-cancellable: uses `try_send` (sync) with a `tokio::spawn` fallback so that the
     /// notification cannot be lost to task cancellation.
     pub fn access(&self, key: K) {
-        let msg = Message::Accessed(
-            key,
-            self.worker_state
-                .eviction_generation
-                .load(atomic::Ordering::Relaxed),
-        );
-        match self.worker_message_sender.try_send(msg) {
+        match self.worker_message_sender.try_send(Message::Accessed(key)) {
             Ok(()) | Err(TrySendError::Closed(_)) => {}
             Err(TrySendError::Full(msg)) => {
                 let sender = self.worker_message_sender.clone();

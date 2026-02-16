@@ -6,7 +6,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::sync::{Arc, atomic, atomic::AtomicU64, atomic::AtomicUsize};
+use std::sync::{
+    Arc,
+    atomic::{self, AtomicU64, AtomicUsize},
+};
 
 use tracing::error;
 
