@@ -87,10 +87,10 @@ impl DeletionIndicator {
         self.underlying.fetch_sub(1, atomic::Ordering::Relaxed);
     }
 
-    /// Returns `true` if there are any pending batches (submitted but not yet processed by the
-    /// worker). Used by producers to avoid enqueuing redundant eviction requests.
-    fn have_pending_batches(&self) -> bool {
-        self.underlying.load(atomic::Ordering::Relaxed) >= 1 << 32
+    /// Returns `true` if there is any eviction work in progress — either batches waiting to be
+    /// processed by the worker, or individual deletions still in flight.
+    fn have_pending_work(&self) -> bool {
+        self.underlying.load(atomic::Ordering::Relaxed) != 0
     }
 }
 
@@ -237,8 +237,16 @@ impl<K: Copy + Eq + Hash + Send + 'static, C: Versioned + Send + 'static, D: Del
                         let mut deleter = self.deleter.clone();
                         let shared_clone = Arc::clone(&self.shared);
                         tokio::spawn(async move {
+                            // Drop guard ensures observe_deletion() runs even if the
+                            // deletion task is cancelled or panics.
+                            struct DeletionGuard(Arc<WorkerState>);
+                            impl Drop for DeletionGuard {
+                                fn drop(&mut self) {
+                                    self.0.active_deletions.observe_deletion();
+                                }
+                            }
+                            let _guard = DeletionGuard(shared_clone);
                             deleter.delete(key, ctx).await;
-                            shared_clone.active_deletions.observe_deletion();
                         });
                     }
                 }
@@ -320,15 +328,24 @@ impl<K: Copy + Eq + Send + Hash + 'static, C: Versioned + Copy + Send + 'static>
 
     /// Notify the LRU eviction tracker that the given key was accessed.
     ///
-    /// You MUST call this method for every read or update to a key.
-    pub async fn access(&self, key: K) {
-        self.send_msg(Message::Accessed(
+    /// Non-cancellable: uses `try_send` (sync) with a `tokio::spawn` fallback so that the
+    /// notification cannot be lost to task cancellation.
+    pub fn access(&self, key: K) {
+        let msg = Message::Accessed(
             key,
             self.worker_state
                 .eviction_generation
                 .load(atomic::Ordering::Relaxed),
-        ))
-        .await;
+        );
+        match self.worker_message_sender.try_send(msg) {
+            Ok(()) | Err(TrySendError::Closed(_)) => {}
+            Err(TrySendError::Full(msg)) => {
+                let sender = self.worker_message_sender.clone();
+                tokio::spawn(async move {
+                    let _ = sender.send(msg).await;
+                });
+            }
+        }
     }
 
     /// Try to cull the least recently used keys with the given deletion method.
@@ -358,13 +375,6 @@ impl<K: Copy + Eq + Send + Hash + 'static, C: Versioned + Copy + Send + 'static>
     /// Check whether there are culls that are already scheduled or actively in progress.
     #[must_use]
     pub fn have_pending_culls(&self) -> bool {
-        self.worker_state.active_deletions.have_pending_batches()
-    }
-
-    /// Send a message to the worker. This is a helper method to reduce code duplication.
-    async fn send_msg(&self, message: Message<K, C>) {
-        if self.worker_message_sender.send(message).await.is_err() {
-            unreachable!();
-        }
+        self.worker_state.active_deletions.have_pending_work()
     }
 }

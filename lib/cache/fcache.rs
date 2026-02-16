@@ -340,7 +340,7 @@ impl<K: Eq + Hash + Copy + Send + Sync + Debug + 'static> AsyncReadableCache<K, 
                     error!(error = ?e, key = ?key, "IO error while reading file for cache key");
                 })
                 .ok()?;
-            self.lru_tracker.access(*key).await;
+            self.lru_tracker.access(*key);
             return Some(buf);
         }
 
@@ -393,6 +393,8 @@ impl<K: Eq + Hash + Copy + Send + Sync + 'static + Debug>
 
         // Use entry_async to lock the bucket, then allocate version under the lock.
         // This ensures version monotonicity per key matches the actual mutation order.
+        // Size accounting is also done under the lock to prevent transient underflow
+        // when concurrent inserts to the same key interleave their deltas.
         let (old_entry, new_version) = match self.shared.map.entry_async(*key).await {
             scc::hash_map::Entry::Occupied(mut o) => {
                 let old = *o.get();
@@ -401,6 +403,18 @@ impl<K: Eq + Hash + Copy + Send + Sync + 'static + Debug>
                     fid: new_fid,
                     size_bytes: new_size,
                 };
+
+                let size_delta: isize = new_size.cast_signed() - old.size_bytes.cast_signed();
+                if size_delta > 0 {
+                    self.shared
+                        .size_bytes
+                        .fetch_add(size_delta.cast_unsigned(), atomic::Ordering::Relaxed);
+                } else if size_delta < 0 {
+                    self.shared
+                        .size_bytes
+                        .fetch_sub(size_delta.unsigned_abs(), atomic::Ordering::Relaxed);
+                }
+
                 (Some(old), v)
             }
             scc::hash_map::Entry::Vacant(vacant) => {
@@ -409,6 +423,11 @@ impl<K: Eq + Hash + Copy + Send + Sync + 'static + Debug>
                     fid: new_fid,
                     size_bytes: new_size,
                 });
+
+                self.shared
+                    .size_bytes
+                    .fetch_add(new_size, atomic::Ordering::Relaxed);
+
                 (None, v)
             }
         };
@@ -423,21 +442,6 @@ impl<K: Eq + Hash + Copy + Send + Sync + 'static + Debug>
                 version: new_version,
             },
         );
-
-        // Size accounting (sync atomic, non-cancellable).
-        let size_delta: isize = new_size.cast_signed()
-            - old_entry
-                .as_ref()
-                .map_or(0isize, |e| e.size_bytes.cast_signed());
-        if size_delta > 0 {
-            self.shared
-                .size_bytes
-                .fetch_add(size_delta.cast_unsigned(), atomic::Ordering::Relaxed);
-        } else if size_delta < 0 {
-            self.shared
-                .size_bytes
-                .fetch_sub(size_delta.unsigned_abs(), atomic::Ordering::Relaxed);
-        }
 
         // Deferrable: delete old file (safe to cancel — file is orphaned).
         if let Some(old_entry) = old_entry {
