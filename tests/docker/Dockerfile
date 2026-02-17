@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY .git/ .git/
+COPY lib/ lib/
 COPY src/ src/
 
 RUN cargo build --release

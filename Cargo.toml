@@ -7,12 +7,15 @@ license = "MIT"
 repository = "https://github.com/mesa-dot-dev/git-fs"
 authors = ["Marko Vejnovic <marko@mesa.dev>"]
 
+[lib]
+path = "lib/lib.rs"
+
 [dependencies]
 clap = { version = "4.5.54", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 fuser = { version = "0.16.0", features = ["libfuse"] }
 libc = "0.2"
-mesa-dev = "1.11.0"
+mesa-dev = "1.15.0"
 num-traits = "0.2"
 http = "1"
 reqwest = { version = "0.12", default-features = false }
@@ -47,15 +50,20 @@ opentelemetry = { version = "0.29" }
 opentelemetry_sdk = { version = "0.29", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.29", default-features = false, features = ["http-proto", "trace", "reqwest-blocking-client"] }
 tracing-opentelemetry = { version = "0.30" }
+hashlink = "0.11.0"
 
 [features]
 default = []
 staging = []
 
+[dev-dependencies]
+tempfile = "3"
+
 [build-dependencies]
 vergen-gitcl = { version = "1", features = [] }
 
 [lints.rust]
+unexpected_cfgs            = "warn"
 unsafe_code                = "allow"
 missing_docs               = "warn"
 unreachable_pub            = "allow"

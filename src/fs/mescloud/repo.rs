@@ -12,6 +12,10 @@ use mesa_dev::low_level::content::{Content, DirEntry as MesaDirEntry};
 use num_traits::cast::ToPrimitive as _;
 use tracing::{Instrument as _, instrument, trace, warn};
 
+use git_fs::cache::fcache::FileCache;
+use git_fs::cache::traits::{AsyncReadableCache as _, AsyncWritableCache as _};
+
+use crate::app_config::CacheConfig;
 use crate::fs::icache::{AsyncICache, FileTable, IcbResolver};
 use crate::fs::r#trait::{
     DirEntry, DirEntryType, FileAttr, FileHandle, FileOpenOptions, FilesystemStats, Fs, Inode,
@@ -183,6 +187,7 @@ pub struct RepoFs {
     file_table: FileTable,
     readdir_buf: Vec<DirEntry>,
     open_files: HashMap<FileHandle, Inode>,
+    file_cache: Option<FileCache<Inode>>,
 }
 
 impl RepoFs {
@@ -190,12 +195,13 @@ impl RepoFs {
     const BLOCK_SIZE: u32 = 4096;
 
     /// Create a new `RepoFs` for a specific org and repo.
-    pub fn new(
+    pub async fn new(
         client: MesaClient,
         org_name: String,
         repo_name: String,
         ref_: String,
         fs_owner: (u32, u32),
+        cache_config: CacheConfig,
     ) -> Self {
         let resolver = RepoResolver {
             client: client.clone(),
@@ -205,6 +211,23 @@ impl RepoFs {
             fs_owner,
             block_size: Self::BLOCK_SIZE,
         };
+
+        let file_cache = match cache_config.max_size {
+            Some(max_size) if max_size.as_u64() > 0 => {
+                let cache_dir = cache_config.path.join(&org_name).join(&repo_name);
+                let max_bytes = max_size.as_u64().try_into().unwrap_or(usize::MAX);
+                match FileCache::new(&cache_dir, max_bytes).await {
+                    Ok(cache) => Some(cache),
+                    Err(e) => {
+                        warn!(error = ?e, org = %org_name, repo = %repo_name,
+                            "failed to create file cache, continuing without caching",);
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         Self {
             client,
             org_name,
@@ -214,6 +237,7 @@ impl RepoFs {
             file_table: FileTable::new(),
             readdir_buf: Vec::new(),
             open_files: HashMap::new(),
+            file_cache,
         }
     }
 
@@ -419,9 +443,29 @@ impl Fs for RepoFs {
             "read: inode {ino} has non-file cached attr"
         );
 
+        // Try the file cache first.
+        if let Some(cache) = &self.file_cache
+            && let Some(data) = cache.get(&ino).await
+        {
+            let start = usize::try_from(offset)
+                .unwrap_or(data.len())
+                .min(data.len());
+            let end = start.saturating_add(size as usize).min(data.len());
+            trace!(
+                ino,
+                fh,
+                cached = true,
+                decoded_len = data.len(),
+                start,
+                end,
+                "read content"
+            );
+            return Ok(Bytes::copy_from_slice(&data[start..end]));
+        }
+
+        // Cache miss — fetch from the Mesa API.
         let file_path = self.path_of_inode(ino).await;
 
-        // Non-root inodes must have a resolvable path.
         if ino != Self::ROOT_INO && file_path.is_none() {
             warn!(ino, "read: path_of_inode returned None for non-root inode");
             return Err(ReadError::InodeNotFound);
@@ -451,8 +495,17 @@ impl Fs for RepoFs {
             .unwrap_or(decoded.len())
             .min(decoded.len());
         let end = start.saturating_add(size as usize).min(decoded.len());
-        trace!(ino, fh, path = ?file_path, decoded_len = decoded.len(), start, end, "read content");
-        Ok(Bytes::copy_from_slice(&decoded[start..end]))
+        let result = Bytes::copy_from_slice(&decoded[start..end]);
+        trace!(ino, fh, cached = false, path = ?file_path, decoded_len = decoded.len(), start, end, "read content");
+
+        // Store the decoded content in the cache for future reads.
+        if let Some(cache) = &self.file_cache
+            && let Err(e) = cache.insert(&ino, decoded).await
+        {
+            warn!(error = ?e, ino, "failed to cache file content");
+        }
+
+        Ok(result)
     }
 
     #[instrument(name = "RepoFs::release", skip(self), fields(repo = %self.repo_name))]

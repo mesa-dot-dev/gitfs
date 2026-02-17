@@ -17,6 +17,7 @@ use super::composite::{ChildSlot, CompositeFs};
 use super::icache as mescloud_icache;
 use super::icache::MescloudICache;
 use super::repo::RepoFs;
+use crate::app_config::CacheConfig;
 use crate::fs::icache::bridge::HashMapBridge;
 use crate::fs::icache::{AsyncICache, FileTable, IcbResolver};
 use crate::fs::r#trait::{
@@ -94,6 +95,7 @@ pub struct OrgFs {
     composite: CompositeFs<OrgResolver, RepoFs>,
     /// Maps org-level owner-dir inodes to owner name (github only).
     owner_inodes: HashMap<Inode, String>,
+    cache_config: CacheConfig,
 }
 
 impl OrgFs {
@@ -186,7 +188,12 @@ impl OrgFs {
     }
 
     #[must_use]
-    pub fn new(name: String, client: MesaClient, fs_owner: (u32, u32)) -> Self {
+    pub fn new(
+        name: String,
+        client: MesaClient,
+        fs_owner: (u32, u32),
+        cache_config: CacheConfig,
+    ) -> Self {
         let resolver = OrgResolver {
             fs_owner,
             block_size: Self::BLOCK_SIZE,
@@ -203,6 +210,7 @@ impl OrgFs {
                 slots: Vec::new(),
             },
             owner_inodes: HashMap::new(),
+            cache_config,
         }
     }
 
@@ -296,7 +304,11 @@ impl OrgFs {
             repo_name.to_owned(),
             default_branch.to_owned(),
             self.composite.icache.fs_owner(),
-        );
+            // TODO(markovejnovic): Unnecessary clone. Refactoring for clearer ownership semantics
+            //                      would be ideal.
+            self.cache_config.clone(),
+        )
+        .await;
 
         let mut bridge = HashMapBridge::new();
         bridge.insert_inode(ino, RepoFs::ROOT_INO);
