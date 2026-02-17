@@ -304,6 +304,8 @@ impl OrgFs {
             repo_name.to_owned(),
             default_branch.to_owned(),
             self.composite.icache.fs_owner(),
+            // TODO(markovejnovic): Unnecessary clone. Refactoring for clearer ownership semantics
+            //                      would be ideal.
             self.cache_config.clone(),
         )
         .await;

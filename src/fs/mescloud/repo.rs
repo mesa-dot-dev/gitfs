@@ -219,7 +219,8 @@ impl RepoFs {
                 match FileCache::new(&cache_dir, max_bytes).await {
                     Ok(cache) => Some(cache),
                     Err(e) => {
-                        warn!(error = ?e, org = %org_name, repo = %repo_name, "failed to create file cache, continuing without caching");
+                        warn!(error = ?e, org = %org_name, repo = %repo_name,
+                            "failed to create file cache, continuing without caching",);
                         None
                     }
                 }
