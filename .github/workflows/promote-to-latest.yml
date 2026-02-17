@@ -13,7 +13,7 @@ concurrency:
 jobs:
   promote:
     name: Promote canary to latest
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     outputs:
       version: ${{ steps.canary.outputs.version }}
       base_version: ${{ steps.canary.outputs.base_version }}
@@ -127,11 +127,12 @@ jobs:
   update-homebrew:
     name: Update Homebrew formula
     needs: [promote]
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          max-depth: 1
 
       - uses: mesa-dot-dev/homebrew-tap-action@main
         with:

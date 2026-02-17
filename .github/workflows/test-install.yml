@@ -16,7 +16,7 @@ concurrency:
 jobs:
   deb:
     name: DEB · ${{ matrix.distro.name }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     container:
       image: ${{ matrix.distro.image }}
       options: --user root
@@ -45,7 +45,7 @@ jobs:
 
   rpm:
     name: RPM · ${{ matrix.distro.name }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     container:
       image: ${{ matrix.distro.image }}
       options: --user root
@@ -75,7 +75,7 @@ jobs:
 
   tarball:
     name: Tarball · archlinux
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     container:
       image: archlinux:latest
       options: --user root
