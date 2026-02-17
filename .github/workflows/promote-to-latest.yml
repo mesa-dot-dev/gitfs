@@ -86,9 +86,13 @@ jobs:
         run: |
           if gh release view latest &>/dev/null; then
             echo "Deleting existing 'latest' release..."
-            gh release delete latest --yes --cleanup-tag
+            gh release delete latest --yes
           else
             echo "No existing 'latest' release found, skipping."
+          fi
+          if git ls-remote --tags origin latest | grep -q latest; then
+            echo "Deleting existing 'latest' tag..."
+            git push origin :refs/tags/latest
           fi
 
       - name: Create latest release
