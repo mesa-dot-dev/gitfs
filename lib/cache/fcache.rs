@@ -405,6 +405,7 @@ impl<K: Eq + Hash + Copy + Send + Sync + 'static + Debug>
         };
         let mut new_file = self.create_file(&path).await?;
         new_file.write_all(&value).await?;
+        new_file.flush().await?;
 
         // Use entry_async to lock the bucket, then allocate version under the lock.
         // This ensures version monotonicity per key matches the actual mutation order.
