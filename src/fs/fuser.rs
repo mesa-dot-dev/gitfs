@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::future::Future;
 use std::sync::Arc;
 
 use crate::fs::r#trait::{CommonFileAttr, DirEntryType, FileAttr, Fs, LockOwner, OpenFlags};
@@ -138,6 +139,14 @@ where
             runtime,
         }
     }
+
+    fn spawn<Fut>(&self, span: tracing::Span, f: impl FnOnce(Arc<F>) -> Fut + Send + 'static)
+    where
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let fs = Arc::clone(&self.fs);
+        self.runtime.spawn(f(fs).instrument(span));
+    }
 }
 
 impl<F: Fs + Send + Sync + 'static> fuser::Filesystem for FuserAdapter<F>
@@ -156,25 +165,21 @@ where
         name: &OsStr,
         reply: fuser::ReplyEntry,
     ) {
-        let fs = Arc::clone(&self.fs);
         let name = name.to_owned();
         let span = tracing::debug_span!("FuserAdapter::lookup", parent, ?name);
-        self.runtime.spawn(
-            async move {
-                match fs.lookup(parent, &name).await {
-                    Ok(attr) => {
-                        let f_attr: fuser::FileAttr = attr.into();
-                        debug!(?f_attr, "replying...");
-                        reply.entry(&SHAMEFUL_TTL, &f_attr, 0);
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "replying error");
-                        reply.error(e.into());
-                    }
+        self.spawn(span, move |fs| async move {
+            match fs.lookup(parent, &name).await {
+                Ok(attr) => {
+                    let f_attr: fuser::FileAttr = attr.into();
+                    debug!(?f_attr, "replying...");
+                    reply.entry(&SHAMEFUL_TTL, &f_attr, 0);
+                }
+                Err(e) => {
+                    debug!(error = %e, "replying error");
+                    reply.error(e.into());
                 }
             }
-            .instrument(span),
-        );
+        });
     }
 
     fn getattr(
@@ -184,23 +189,19 @@ where
         fh: Option<u64>,
         reply: fuser::ReplyAttr,
     ) {
-        let fs = Arc::clone(&self.fs);
         let span = tracing::debug_span!("FuserAdapter::getattr", ino);
-        self.runtime.spawn(
-            async move {
-                match fs.getattr(ino, fh).await {
-                    Ok(attr) => {
-                        debug!(?attr, "replying...");
-                        reply.attr(&SHAMEFUL_TTL, &attr.into());
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "replying error");
-                        reply.error(e.into());
-                    }
+        self.spawn(span, move |fs| async move {
+            match fs.getattr(ino, fh).await {
+                Ok(attr) => {
+                    debug!(?attr, "replying...");
+                    reply.attr(&SHAMEFUL_TTL, &attr.into());
+                }
+                Err(e) => {
+                    debug!(error = %e, "replying error");
+                    reply.error(e.into());
                 }
             }
-            .instrument(span),
-        );
+        });
     }
 
     fn readdir(
@@ -211,68 +212,60 @@ where
         offset: i64,
         mut reply: fuser::ReplyDirectory,
     ) {
-        let fs = Arc::clone(&self.fs);
         let span = tracing::debug_span!("FuserAdapter::readdir", ino);
-        self.runtime.spawn(
-            async move {
-                let entries = match fs.readdir(ino).await {
-                    Ok(entries) => entries,
-                    Err(e) => {
-                        debug!(error = %e, "replying error");
-                        reply.error(e.into());
-                        return;
-                    }
+        self.spawn(span, move |fs| async move {
+            let entries = match fs.readdir(ino).await {
+                Ok(entries) => entries,
+                Err(e) => {
+                    debug!(error = %e, "replying error");
+                    reply.error(e.into());
+                    return;
+                }
+            };
+
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "fuser offset is i64 but always non-negative"
+            )]
+            for (i, entry) in entries
+                .iter()
+                .enumerate()
+                .skip(offset.cast_unsigned() as usize)
+            {
+                let kind: fuser::FileType = entry.kind.into();
+                let Ok(idx): Result<i64, _> = (i + 1).try_into() else {
+                    error!("Directory entry index {} too large for fuser", i + 1);
+                    reply.error(libc::EIO);
+                    return;
                 };
 
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "fuser offset is i64 but always non-negative"
-                )]
-                for (i, entry) in entries
-                    .iter()
-                    .enumerate()
-                    .skip(offset.cast_unsigned() as usize)
-                {
-                    let kind: fuser::FileType = entry.kind.into();
-                    let Ok(idx): Result<i64, _> = (i + 1).try_into() else {
-                        error!("Directory entry index {} too large for fuser", i + 1);
-                        reply.error(libc::EIO);
-                        return;
-                    };
-
-                    debug!(?entry, "adding entry to reply...");
-                    if reply.add(entry.ino, idx, kind, &entry.name) {
-                        debug!("buffer full for now, stopping readdir");
-                        break;
-                    }
+                debug!(?entry, "adding entry to reply...");
+                if reply.add(entry.ino, idx, kind, &entry.name) {
+                    debug!("buffer full for now, stopping readdir");
+                    break;
                 }
-
-                debug!("finalizing reply...");
-                reply.ok();
             }
-            .instrument(span),
-        );
+
+            debug!("finalizing reply...");
+            reply.ok();
+        });
     }
 
     fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
-        let fs = Arc::clone(&self.fs);
         let flags: OpenFlags = flags.into();
         let span = tracing::debug_span!("FuserAdapter::open", ino);
-        self.runtime.spawn(
-            async move {
-                match fs.open(ino, flags).await {
-                    Ok(open_file) => {
-                        debug!(handle = open_file.handle, "replying...");
-                        reply.opened(open_file.handle, 0);
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "replying error");
-                        reply.error(e.into());
-                    }
+        self.spawn(span, move |fs| async move {
+            match fs.open(ino, flags).await {
+                Ok(open_file) => {
+                    debug!(handle = open_file.handle, "replying...");
+                    reply.opened(open_file.handle, 0);
+                }
+                Err(e) => {
+                    debug!(error = %e, "replying error");
+                    reply.error(e.into());
                 }
             }
-            .instrument(span),
-        );
+        });
     }
 
     fn read(
@@ -286,28 +279,24 @@ where
         lock_owner: Option<u64>,
         reply: fuser::ReplyData,
     ) {
-        let fs = Arc::clone(&self.fs);
         let flags: OpenFlags = flags.into();
         let lock_owner = lock_owner.map(LockOwner);
         let span = tracing::debug_span!("FuserAdapter::read", ino);
-        self.runtime.spawn(
-            async move {
-                match fs
-                    .read(ino, fh, offset.cast_unsigned(), size, flags, lock_owner)
-                    .await
-                {
-                    Ok(data) => {
-                        debug!(read_bytes = data.len(), "replying...");
-                        reply.data(&data);
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "replying error");
-                        reply.error(e.into());
-                    }
+        self.spawn(span, move |fs| async move {
+            match fs
+                .read(ino, fh, offset.cast_unsigned(), size, flags, lock_owner)
+                .await
+            {
+                Ok(data) => {
+                    debug!(read_bytes = data.len(), "replying...");
+                    reply.data(&data);
+                }
+                Err(e) => {
+                    debug!(error = %e, "replying error");
+                    reply.error(e.into());
                 }
             }
-            .instrument(span),
-        );
+        });
     }
 
     fn release(
@@ -320,63 +309,51 @@ where
         flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        let fs = Arc::clone(&self.fs);
         let flags: OpenFlags = flags.into();
         let span = tracing::debug_span!("FuserAdapter::release", ino, fh);
-        self.runtime.spawn(
-            async move {
-                match fs.release(ino, fh, flags, flush).await {
-                    Ok(()) => {
-                        debug!("replying ok");
-                        reply.ok();
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "replying error");
-                        reply.error(e.into());
-                    }
+        self.spawn(span, move |fs| async move {
+            match fs.release(ino, fh, flags, flush).await {
+                Ok(()) => {
+                    debug!("replying ok");
+                    reply.ok();
+                }
+                Err(e) => {
+                    debug!(error = %e, "replying error");
+                    reply.error(e.into());
                 }
             }
-            .instrument(span),
-        );
+        });
     }
 
     fn forget(&mut self, _req: &fuser::Request<'_>, ino: u64, nlookup: u64) {
-        let fs = Arc::clone(&self.fs);
         let span = tracing::debug_span!("FuserAdapter::forget", ino, nlookup);
-        self.runtime.spawn(
-            async move {
-                fs.forget(ino, nlookup).await;
-            }
-            .instrument(span),
-        );
+        self.spawn(span, move |fs| async move {
+            fs.forget(ino, nlookup).await;
+        });
     }
 
     fn statfs(&mut self, _req: &fuser::Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
-        let fs = Arc::clone(&self.fs);
         let span = tracing::debug_span!("FuserAdapter::statfs");
-        self.runtime.spawn(
-            async move {
-                match fs.statfs().await {
-                    Ok(statvfs) => {
-                        debug!(?statvfs, "replying...");
-                        reply.statfs(
-                            statvfs.total_blocks,
-                            statvfs.free_blocks,
-                            statvfs.available_blocks,
-                            statvfs.total_inodes,
-                            statvfs.free_inodes,
-                            statvfs.block_size,
-                            statvfs.max_filename_length,
-                            0,
-                        );
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "replying error");
-                        reply.error(e.raw_os_error().unwrap_or(libc::EIO));
-                    }
+        self.spawn(span, move |fs| async move {
+            match fs.statfs().await {
+                Ok(statvfs) => {
+                    debug!(?statvfs, "replying...");
+                    reply.statfs(
+                        statvfs.total_blocks,
+                        statvfs.free_blocks,
+                        statvfs.available_blocks,
+                        statvfs.total_inodes,
+                        statvfs.free_inodes,
+                        statvfs.block_size,
+                        statvfs.max_filename_length,
+                        0,
+                    );
+                }
+                Err(e) => {
+                    debug!(error = %e, "replying error");
+                    reply.error(e.raw_os_error().unwrap_or(libc::EIO));
                 }
             }
-            .instrument(span),
-        );
+        });
     }
 }
