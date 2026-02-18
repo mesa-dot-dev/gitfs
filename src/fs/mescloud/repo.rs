@@ -330,6 +330,8 @@ impl Fs for RepoFs {
         })
     }
 
+    // TODO(MES-737): Returning Vec here is very poor performance. The linked ticket proposes a
+    // better interface, but requires we change the trait.
     #[instrument(name = "RepoFs::readdir", skip(self), fields(repo = %self.repo_name))]
     async fn readdir(&self, ino: Inode) -> Result<Vec<DirEntry>, ReadDirError> {
         debug_assert!(

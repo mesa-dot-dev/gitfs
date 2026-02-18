@@ -9,7 +9,9 @@ use crate::fs::r#trait::{FileAttr, FileHandle, Inode};
 ///
 /// All methods take `&self`; internal synchronization via `parking_lot::RwLock`.
 pub struct HashMapBridge {
+    // TODO(MES-738): Obviously performance is awful.
     inode_map: RwLock<bimap::BiMap<Inode, Inode>>,
+    // TODO(MES-738): Obviously performance is awful.
     fh_map: RwLock<bimap::BiMap<FileHandle, FileHandle>>,
 }
 
