@@ -330,26 +330,26 @@ pub trait Fs {
 
     /// For each lookup call made by the kernel, it expects the icache to be updated with the
     /// returned `FileAttr`.
-    async fn lookup(&mut self, parent: Inode, name: &OsStr) -> Result<FileAttr, Self::LookupError>;
+    async fn lookup(&self, parent: Inode, name: &OsStr) -> Result<FileAttr, Self::LookupError>;
 
     /// Can be called in two contexts -- the file is not open (in which case `fh` is `None`),
     /// or the file is open (in which case `fh` is `Some`).
     async fn getattr(
-        &mut self,
+        &self,
         ino: Inode,
         fh: Option<FileHandle>,
     ) -> Result<FileAttr, Self::GetAttrError>;
 
     /// Read the contents of a directory.
-    async fn readdir(&mut self, ino: Inode) -> Result<&[DirEntry], Self::ReaddirError>;
+    async fn readdir(&self, ino: Inode) -> Result<Vec<DirEntry>, Self::ReaddirError>;
 
     /// Open a file for reading.
-    async fn open(&mut self, ino: Inode, flags: OpenFlags) -> Result<OpenFile, Self::OpenError>;
+    async fn open(&self, ino: Inode, flags: OpenFlags) -> Result<OpenFile, Self::OpenError>;
 
     /// Read data from an open file.
     #[expect(clippy::too_many_arguments, reason = "mirrors fuser read API")]
     async fn read(
-        &mut self,
+        &self,
         ino: Inode,
         fh: FileHandle,
         offset: u64,
@@ -360,7 +360,7 @@ pub trait Fs {
 
     /// Called when the kernel closes a file handle.
     async fn release(
-        &mut self,
+        &self,
         ino: Inode,
         fh: FileHandle,
         flags: OpenFlags,
@@ -368,8 +368,8 @@ pub trait Fs {
     ) -> Result<(), Self::ReleaseError>;
 
     /// Called when the kernel is done with an inode.
-    async fn forget(&mut self, ino: Inode, nlookups: u64);
+    async fn forget(&self, ino: Inode, nlookups: u64);
 
     /// Get filesystem statistics.
-    async fn statfs(&mut self) -> Result<FilesystemStats, std::io::Error>;
+    async fn statfs(&self) -> Result<FilesystemStats, std::io::Error>;
 }

@@ -1,11 +1,13 @@
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use bytes::Bytes;
 use mesa_dev::MesaClient;
 use opentelemetry::propagation::Injector;
+use parking_lot::RwLock;
+use scc::HashMap as ConcurrentHashMap;
 use secrecy::ExposeSecret as _;
 use tracing::{Instrument as _, instrument, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
@@ -173,19 +175,19 @@ impl MesaFS {
                     Self::BLOCK_SIZE,
                 ),
                 file_table: FileTable::new(),
-                readdir_buf: Vec::new(),
-                child_inodes: HashMap::new(),
-                inode_to_slot: HashMap::new(),
-                slots: orgs
-                    .map(|org_conf| {
+                child_inodes: ConcurrentHashMap::new(),
+                inode_to_slot: ConcurrentHashMap::new(),
+                slots: RwLock::new(
+                    orgs.map(|org_conf| {
                         let client = build_mesa_client(org_conf.api_key.expose_secret());
                         let org = OrgFs::new(org_conf.name, client, fs_owner, cache.clone());
-                        ChildSlot {
+                        Arc::new(ChildSlot {
                             inner: org,
                             bridge: HashMapBridge::new(),
-                        }
+                        })
                     })
                     .collect(),
+                ),
             },
         }
     }
@@ -195,7 +197,7 @@ impl MesaFS {
         if ino == Self::ROOT_NODE_INO {
             return Some(InodeRole::Root);
         }
-        if self.composite.child_inodes.contains_key(&ino) {
+        if self.composite.child_inodes.contains_sync(&ino) {
             return Some(InodeRole::OrgOwned);
         }
         if self.composite.slot_for_inode(ino).is_some() {
@@ -204,63 +206,83 @@ impl MesaFS {
         None
     }
 
+    /// Try to reuse an existing inode for `org_idx`. Returns `Some` if a valid
+    /// inode was found (or rebuilt), `None` if allocation is needed.
+    async fn try_reuse_org_inode(&self, org_idx: usize) -> Option<(Inode, FileAttr)> {
+        let mut existing_ino = None;
+        self.composite
+            .child_inodes
+            .any_async(|&ino, &idx| {
+                if idx == org_idx {
+                    existing_ino = Some(ino);
+                    true
+                } else {
+                    false
+                }
+            })
+            .await;
+        let existing_ino = existing_ino?;
+
+        if let Some(attr) = self.composite.icache.get_attr(existing_ino).await {
+            let rc = self
+                .composite
+                .icache
+                .get_icb(existing_ino, |icb| icb.rc)
+                .await
+                .unwrap_or(0);
+            trace!(
+                ino = existing_ino,
+                org_idx, rc, "ensure_org_inode: reusing existing inode"
+            );
+            return Some((existing_ino, attr));
+        }
+        if self.composite.icache.contains(existing_ino) {
+            warn!(
+                ino = existing_ino,
+                org_idx, "ensure_org_inode: attr missing, rebuilding"
+            );
+            let now = SystemTime::now();
+            let attr = FileAttr::Directory {
+                common: mescloud_icache::make_common_file_attr(
+                    existing_ino,
+                    0o755,
+                    now,
+                    now,
+                    self.composite.icache.fs_owner(),
+                    self.composite.icache.block_size(),
+                ),
+            };
+            self.composite.icache.cache_attr(existing_ino, attr).await;
+            return Some((existing_ino, attr));
+        }
+        warn!(
+            ino = existing_ino,
+            org_idx, "ensure_org_inode: ICB evicted, cleaning up stale entry"
+        );
+        self.composite
+            .child_inodes
+            .remove_async(&existing_ino)
+            .await;
+        self.composite
+            .inode_to_slot
+            .remove_async(&existing_ino)
+            .await;
+        None
+    }
+
     /// Ensure a mesa-level inode exists for the org at `org_idx`.
     /// Seeds the bridge with (`mesa_org_ino`, `OrgFs::ROOT_INO`).
     /// Does NOT bump rc.
-    async fn ensure_org_inode(&mut self, org_idx: usize) -> (Inode, FileAttr) {
-        // Check if an inode already exists.
-        let existing_ino = self
-            .composite
-            .child_inodes
-            .iter()
-            .find(|&(_, &idx)| idx == org_idx)
-            .map(|(&ino, _)| ino);
-
-        if let Some(existing_ino) = existing_ino {
-            if let Some(attr) = self.composite.icache.get_attr(existing_ino).await {
-                let rc = self
-                    .composite
-                    .icache
-                    .get_icb(existing_ino, |icb| icb.rc)
-                    .await
-                    .unwrap_or(0);
-                trace!(
-                    ino = existing_ino,
-                    org_idx, rc, "ensure_org_inode: reusing existing inode"
-                );
-                return (existing_ino, attr);
-            }
-            if self.composite.icache.contains(existing_ino) {
-                // ICB exists but attr missing — rebuild and cache.
-                warn!(
-                    ino = existing_ino,
-                    org_idx, "ensure_org_inode: attr missing, rebuilding"
-                );
-                let now = SystemTime::now();
-                let attr = FileAttr::Directory {
-                    common: mescloud_icache::make_common_file_attr(
-                        existing_ino,
-                        0o755,
-                        now,
-                        now,
-                        self.composite.icache.fs_owner(),
-                        self.composite.icache.block_size(),
-                    ),
-                };
-                self.composite.icache.cache_attr(existing_ino, attr).await;
-                return (existing_ino, attr);
-            }
-            // ICB was evicted — clean up stale tracking entries.
-            warn!(
-                ino = existing_ino,
-                org_idx, "ensure_org_inode: ICB evicted, cleaning up stale entry"
-            );
-            self.composite.child_inodes.remove(&existing_ino);
-            self.composite.inode_to_slot.remove(&existing_ino);
+    async fn ensure_org_inode(&self, org_idx: usize) -> (Inode, FileAttr) {
+        if let Some(result) = self.try_reuse_org_inode(org_idx).await {
+            return result;
         }
 
         // Allocate new.
-        let org_name = self.composite.slots[org_idx].inner.name().to_owned();
+        let org_name = {
+            let slots = self.composite.slots.read();
+            slots[org_idx].inner.name().to_owned()
+        };
         let ino = self.composite.icache.allocate_inode();
         trace!(ino, org_idx, org = %org_name, "ensure_org_inode: allocated new inode");
 
@@ -279,15 +301,21 @@ impl MesaFS {
             )
             .await;
 
-        self.composite.child_inodes.insert(ino, org_idx);
-        self.composite.inode_to_slot.insert(ino, org_idx);
+        let _ = self.composite.child_inodes.insert_async(ino, org_idx).await;
+        let _ = self
+            .composite
+            .inode_to_slot
+            .insert_async(ino, org_idx)
+            .await;
 
         // Reset bridge (may have stale mappings from a previous eviction cycle)
         // and seed: mesa org-root <-> OrgFs::ROOT_INO.
-        self.composite.slots[org_idx].bridge = HashMapBridge::new();
-        self.composite.slots[org_idx]
-            .bridge
-            .insert_inode(ino, OrgFs::ROOT_INO);
+        let slot = {
+            let slots = self.composite.slots.read();
+            Arc::clone(&slots[org_idx])
+        };
+        slot.bridge.reset();
+        slot.bridge.insert_inode(ino, OrgFs::ROOT_INO);
 
         let attr = FileAttr::Directory {
             common: mescloud_icache::make_common_file_attr(
@@ -314,17 +342,18 @@ impl Fs for MesaFS {
     type ReleaseError = ReleaseError;
 
     #[instrument(name = "MesaFS::lookup", skip(self))]
-    async fn lookup(&mut self, parent: Inode, name: &OsStr) -> Result<FileAttr, LookupError> {
+    async fn lookup(&self, parent: Inode, name: &OsStr) -> Result<FileAttr, LookupError> {
         let role = self.inode_role(parent).ok_or(LookupError::InodeNotFound)?;
         match role {
             InodeRole::Root => {
                 let org_name = name.to_str().ok_or(LookupError::InodeNotFound)?;
-                let org_idx = self
-                    .composite
-                    .slots
-                    .iter()
-                    .position(|s| s.inner.name() == org_name)
-                    .ok_or(LookupError::InodeNotFound)?;
+                let org_idx = {
+                    let slots = self.composite.slots.read();
+                    slots
+                        .iter()
+                        .position(|s| s.inner.name() == org_name)
+                        .ok_or(LookupError::InodeNotFound)?
+                };
 
                 trace!(org = org_name, "lookup: matched org");
                 let (ino, attr) = self.ensure_org_inode(org_idx).await;
@@ -342,26 +371,23 @@ impl Fs for MesaFS {
     }
 
     #[instrument(name = "MesaFS::getattr", skip(self))]
-    async fn getattr(
-        &mut self,
-        ino: Inode,
-        _fh: Option<FileHandle>,
-    ) -> Result<FileAttr, GetAttrError> {
+    async fn getattr(&self, ino: Inode, _fh: Option<FileHandle>) -> Result<FileAttr, GetAttrError> {
         self.composite.delegated_getattr(ino).await
     }
 
     #[instrument(name = "MesaFS::readdir", skip(self))]
-    async fn readdir(&mut self, ino: Inode) -> Result<&[DirEntry], ReadDirError> {
+    async fn readdir(&self, ino: Inode) -> Result<Vec<DirEntry>, ReadDirError> {
         let role = self.inode_role(ino).ok_or(ReadDirError::InodeNotFound)?;
         match role {
             InodeRole::Root => {
-                let org_info: Vec<(usize, String)> = self
-                    .composite
-                    .slots
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, s)| (idx, s.inner.name().to_owned()))
-                    .collect();
+                let org_info: Vec<(usize, String)> = {
+                    let slots = self.composite.slots.read();
+                    slots
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, s)| (idx, s.inner.name().to_owned()))
+                        .collect()
+                };
 
                 let mut entries = Vec::with_capacity(org_info.len());
                 for (org_idx, name) in &org_info {
@@ -374,21 +400,20 @@ impl Fs for MesaFS {
                 }
 
                 trace!(entry_count = entries.len(), "readdir: listing orgs");
-                self.composite.readdir_buf = entries;
-                Ok(&self.composite.readdir_buf)
+                Ok(entries)
             }
             InodeRole::OrgOwned => self.composite.delegated_readdir(ino).await,
         }
     }
 
     #[instrument(name = "MesaFS::open", skip(self))]
-    async fn open(&mut self, ino: Inode, flags: OpenFlags) -> Result<OpenFile, OpenError> {
+    async fn open(&self, ino: Inode, flags: OpenFlags) -> Result<OpenFile, OpenError> {
         self.composite.delegated_open(ino, flags).await
     }
 
     #[instrument(name = "MesaFS::read", skip(self))]
     async fn read(
-        &mut self,
+        &self,
         ino: Inode,
         fh: FileHandle,
         offset: u64,
@@ -403,7 +428,7 @@ impl Fs for MesaFS {
 
     #[instrument(name = "MesaFS::release", skip(self))]
     async fn release(
-        &mut self,
+        &self,
         ino: Inode,
         fh: FileHandle,
         flags: OpenFlags,
@@ -415,12 +440,12 @@ impl Fs for MesaFS {
     }
 
     #[instrument(name = "MesaFS::forget", skip(self))]
-    async fn forget(&mut self, ino: Inode, nlookups: u64) {
+    async fn forget(&self, ino: Inode, nlookups: u64) {
         // MesaFS has no extra state to clean up on eviction (unlike OrgFs::owner_inodes).
         let _ = self.composite.delegated_forget(ino, nlookups).await;
     }
 
-    async fn statfs(&mut self) -> Result<FilesystemStats, std::io::Error> {
+    async fn statfs(&self) -> Result<FilesystemStats, std::io::Error> {
         Ok(self.composite.delegated_statfs())
     }
 }
