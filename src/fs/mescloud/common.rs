@@ -1,11 +1,11 @@
 //! Shared types and helpers used by both `MesaFS` and `RepoFs`.
 
+use std::ffi::{OsStr, OsString};
+
+use bytes::Bytes;
+use git_fs::fs::{FileHandle, INode, InodeAddr, OpenFlags as LibOpenFlags};
 use mesa_dev::low_level::apis;
 use thiserror::Error;
-
-use crate::fs::r#trait::{FileAttr, Inode};
-
-pub(super) use super::icache::InodeControlBlock;
 
 /// A concrete error type that preserves the structure of `mesa_dev::low_level::apis::Error<T>`
 /// without the generic parameter.
@@ -51,20 +51,8 @@ pub enum LookupError {
     #[error("inode not found")]
     InodeNotFound,
 
-    #[error("file does not exist")]
-    FileDoesNotExist,
-
     #[error("remote mesa error")]
     RemoteMesaError(#[from] MesaApiError),
-}
-
-impl From<LookupError> for i32 {
-    fn from(e: LookupError) -> Self {
-        match e {
-            LookupError::InodeNotFound | LookupError::FileDoesNotExist => libc::ENOENT,
-            LookupError::RemoteMesaError(_) => libc::EIO,
-        }
-    }
 }
 
 #[derive(Debug, Error)]
@@ -73,26 +61,10 @@ pub enum GetAttrError {
     InodeNotFound,
 }
 
-impl From<GetAttrError> for i32 {
-    fn from(e: GetAttrError) -> Self {
-        match e {
-            GetAttrError::InodeNotFound => libc::ENOENT,
-        }
-    }
-}
-
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Copy, Error)]
 pub enum OpenError {
     #[error("inode not found")]
     InodeNotFound,
-}
-
-impl From<OpenError> for i32 {
-    fn from(e: OpenError) -> Self {
-        match e {
-            OpenError::InodeNotFound => libc::ENOENT,
-        }
-    }
 }
 
 #[derive(Debug, Error)]
@@ -111,17 +83,6 @@ pub enum ReadError {
 
     #[error("base64 decode error: {0}")]
     Base64Decode(#[from] base64::DecodeError),
-}
-
-impl From<ReadError> for i32 {
-    fn from(e: ReadError) -> Self {
-        match e {
-            ReadError::FileNotOpen => libc::EBADF,
-            ReadError::InodeNotFound => libc::ENOENT,
-            ReadError::RemoteMesaError(_) | ReadError::Base64Decode(_) => libc::EIO,
-            ReadError::NotAFile => libc::EISDIR,
-        }
-    }
 }
 
 #[derive(Debug, Error)]
@@ -143,18 +104,7 @@ impl From<LookupError> for ReadDirError {
     fn from(e: LookupError) -> Self {
         match e {
             LookupError::RemoteMesaError(api) => Self::RemoteMesaError(api),
-            LookupError::InodeNotFound | LookupError::FileDoesNotExist => Self::InodeNotFound,
-        }
-    }
-}
-
-impl From<ReadDirError> for i32 {
-    fn from(e: ReadDirError) -> Self {
-        match e {
-            ReadDirError::InodeNotFound => libc::ENOENT,
-            ReadDirError::RemoteMesaError(_) => libc::EIO,
-            ReadDirError::NotADirectory => libc::ENOTDIR,
-            ReadDirError::NotPermitted => libc::EPERM,
+            LookupError::InodeNotFound => Self::InodeNotFound,
         }
     }
 }
@@ -165,18 +115,38 @@ pub enum ReleaseError {
     FileNotOpen,
 }
 
-impl From<ReleaseError> for i32 {
-    fn from(e: ReleaseError) -> Self {
-        match e {
-            ReleaseError::FileNotOpen => libc::EBADF,
-        }
-    }
+/// A directory entry for readdir results, using lib types.
+pub struct FsDirEntry {
+    pub ino: InodeAddr,
+    pub name: OsString,
 }
 
-/// Allows a parent compositor to peek at cached attrs from a child filesystem.
+/// Trait for child filesystems composed by [`CompositeFs`](super::composite::CompositeFs).
+///
+/// Uses lib types (`INode`, `InodeAddr`) directly — no conversion to/from `FileAttr`.
+/// Replaces the old `Fs + InodeCachePeek` bound.
 #[async_trait::async_trait]
-pub(super) trait InodeCachePeek {
-    async fn peek_attr(&self, ino: Inode) -> Option<FileAttr>;
+pub(super) trait ChildFs: Send + Sync {
+    /// Look up a child by name within the given parent directory.
+    async fn lookup(&mut self, parent: InodeAddr, name: &OsStr) -> Result<INode, LookupError>;
+
+    /// List all children of a directory, returning full `INode` data for each.
+    async fn readdir(&mut self, ino: InodeAddr) -> Result<Vec<(OsString, INode)>, ReadDirError>;
+
+    /// Open a file for reading.
+    async fn open(&mut self, ino: InodeAddr, flags: LibOpenFlags) -> Result<FileHandle, OpenError>;
+
+    /// Read data from an open file.
+    async fn read(
+        &mut self,
+        ino: InodeAddr,
+        fh: FileHandle,
+        offset: u64,
+        size: u32,
+    ) -> Result<Bytes, ReadError>;
+
+    /// Release (close) a file handle.
+    async fn release(&mut self, ino: InodeAddr, fh: FileHandle) -> Result<(), ReleaseError>;
 }
 
 #[cfg(test)]
@@ -186,12 +156,6 @@ mod tests {
     #[test]
     fn lookup_inode_not_found_converts_to_readdir_inode_not_found() {
         let err: ReadDirError = LookupError::InodeNotFound.into();
-        assert!(matches!(err, ReadDirError::InodeNotFound));
-    }
-
-    #[test]
-    fn lookup_file_does_not_exist_converts_to_readdir_inode_not_found() {
-        let err: ReadDirError = LookupError::FileDoesNotExist.into();
         assert!(matches!(err, ReadDirError::InodeNotFound));
     }
 

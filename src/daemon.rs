@@ -14,9 +14,13 @@ mod managed_fuse {
 
     use nix::errno::Errno;
 
+    use git_fs::cache::async_backed::FutureBackedCache;
+    use git_fs::fs::{INode, INodeType, InodePerms};
+
     use super::{MesaFS, OrgConfig, app_config, debug, error};
-    use crate::fs::fuser::FuserAdapter;
+    use crate::fs::mescloud::MesaFsProvider;
     use fuser::BackgroundSession;
+    use git_fs::fs::fuser::FuserAdapter;
 
     pub struct FuseCoreScope {
         _session: BackgroundSession,
@@ -44,7 +48,24 @@ mod managed_fuse {
                     api_key: org.api_key.clone(),
                 });
             let mesa_fs = MesaFS::new(orgs, (config.uid, config.gid), &config.cache);
-            let fuse_adapter = FuserAdapter::new(mesa_fs, handle);
+
+            let table = FutureBackedCache::default();
+            let now = std::time::SystemTime::now();
+            let root = INode {
+                addr: 1,
+                permissions: InodePerms::from_bits_truncate(0o755),
+                uid: config.uid,
+                gid: config.gid,
+                create_time: now,
+                last_modified_at: now,
+                parent: None,
+                size: 0,
+                itype: INodeType::Directory,
+            };
+            table.insert_sync(1, root);
+
+            let provider = MesaFsProvider::new(mesa_fs);
+            let fuse_adapter = FuserAdapter::new(table, provider, handle);
             let mount_opts = [
                 fuser::MountOption::FSName("git-fs".to_owned()),
                 fuser::MountOption::RO,

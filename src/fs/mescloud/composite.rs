@@ -1,308 +1,460 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use tracing::{instrument, trace, warn};
-
-use crate::fs::icache::bridge::HashMapBridge;
-use crate::fs::icache::{FileTable, IcbResolver};
-use crate::fs::r#trait::{
-    DirEntry, FileAttr, FileHandle, FilesystemStats, Fs, Inode, LockOwner, OpenFile, OpenFlags,
+use git_fs::cache::async_backed::FutureBackedCache;
+use git_fs::fs::dcache::DCache;
+use git_fs::fs::{
+    AsyncFsStats, FileHandle, INode, INodeType, InodeAddr, InodePerms, LoadedAddr, OpenFlags,
 };
+use rustc_hash::FxHashMap;
+use tracing::{instrument, trace};
 
 use super::common::{
-    GetAttrError, InodeCachePeek, LookupError, OpenError, ReadDirError, ReadError, ReleaseError,
+    ChildFs, FsDirEntry, GetAttrError, LookupError, OpenError, ReadDirError, ReadError,
+    ReleaseError,
 };
-use super::icache::{InodeControlBlock, MescloudICache};
 
-/// A child filesystem slot: inner filesystem + bidirectional inode/fh bridge.
+/// Bidirectional inode mapping between outer (composite) and inner (child) address spaces.
+///
+/// Convention: **outer = left, inner = right**.
+pub(super) struct InodeBridge {
+    map: bimap::BiMap<InodeAddr, InodeAddr>,
+}
+
+impl InodeBridge {
+    pub fn new() -> Self {
+        Self {
+            map: bimap::BiMap::new(),
+        }
+    }
+
+    pub fn insert(&mut self, outer: InodeAddr, inner: InodeAddr) {
+        self.map.insert(outer, inner);
+    }
+
+    pub fn forward(&self, outer: InodeAddr) -> Option<InodeAddr> {
+        self.map.get_by_left(&outer).copied()
+    }
+
+    #[expect(dead_code, reason = "will be needed by future callers")]
+    pub fn backward(&self, inner: InodeAddr) -> Option<InodeAddr> {
+        self.map.get_by_right(&inner).copied()
+    }
+
+    /// Look up inner->outer, or allocate a new outer address if unmapped.
+    pub fn backward_or_insert(
+        &mut self,
+        inner: InodeAddr,
+        allocate: impl FnOnce() -> InodeAddr,
+    ) -> InodeAddr {
+        if let Some(&outer) = self.map.get_by_right(&inner) {
+            outer
+        } else {
+            let outer = allocate();
+            self.map.insert(outer, inner);
+            outer
+        }
+    }
+
+    pub fn remove_by_outer(&mut self, outer: InodeAddr) {
+        self.map.remove_by_left(&outer);
+    }
+
+    #[expect(dead_code, reason = "will be needed by future callers")]
+    pub fn get_inner(&self, outer: InodeAddr) -> Option<&InodeAddr> {
+        self.map.get_by_left(&outer)
+    }
+}
+
 pub(super) struct ChildSlot<Inner> {
     pub inner: Inner,
-    pub bridge: HashMapBridge,
+    pub bridge: InodeBridge,
 }
 
-/// Layered filesystem that presents multiple child filesystems under a single
-/// inode namespace.
-///
-/// `MesaCloud`'s filesystem is a hierarchy of compositions:
-///
-/// ```text
-/// MesaFS  (CompositeFs<_, OrgFs>)
-///  └─ OrgFs  (CompositeFs<_, RepoFs>)
-///      └─ RepoFs  (leaf — backed by git)
-/// ```
-///
-/// Each child filesystem numbers its inodes starting from 1, so the composite
-/// maintains a bidirectional inode/file-handle bridge per child (see
-/// [`ChildSlot`]) to translate between the outer namespace visible to FUSE and
-/// each child's internal namespace.
-pub(super) struct CompositeFs<R, Inner>
-where
-    R: IcbResolver<Icb = InodeControlBlock>,
-{
-    pub icache: MescloudICache<R>,
-    pub file_table: FileTable,
-    pub readdir_buf: Vec<DirEntry>,
-    /// Maps outer inode to index into `slots` for child-root inodes.
-    pub child_inodes: HashMap<Inode, usize>,
-    /// Maps every translated outer inode to its owning slot index.
-    pub inode_to_slot: HashMap<Inode, usize>,
-    pub slots: Vec<ChildSlot<Inner>>,
+/// Tracks an open file: which child slot owns it and the inner fh.
+struct OpenFileEntry {
+    slot_idx: usize,
+    inner_ino: InodeAddr,
+    inner_fh: FileHandle,
 }
 
-impl<R, Inner> CompositeFs<R, Inner>
-where
-    R: IcbResolver<Icb = InodeControlBlock>,
-    Inner: Fs<
-            LookupError = LookupError,
-            GetAttrError = GetAttrError,
-            OpenError = OpenError,
-            ReadError = ReadError,
-            ReaddirError = ReadDirError,
-            ReleaseError = ReleaseError,
-        > + InodeCachePeek
-        + Send
-        + Sync,
-{
-    /// Look up which child slot owns an inode via direct map.
-    #[instrument(name = "CompositeFs::slot_for_inode", skip(self))]
-    pub fn slot_for_inode(&self, ino: Inode) -> Option<usize> {
+pub(super) struct CompositeFs<Inner> {
+    pub(super) inode_table: FutureBackedCache<InodeAddr, INode>,
+    pub(super) directory_cache: DCache,
+    readdir_populated: FutureBackedCache<LoadedAddr, ()>,
+    next_ino: AtomicU64,
+    next_fh: AtomicU64,
+    refcounts: FxHashMap<InodeAddr, u64>,
+    pub(super) readdir_buf: Vec<FsDirEntry>,
+    open_files: HashMap<FileHandle, OpenFileEntry>,
+    pub(super) child_inodes: HashMap<InodeAddr, usize>,
+    pub(super) inode_to_slot: HashMap<InodeAddr, usize>,
+    pub(super) slots: Vec<ChildSlot<Inner>>,
+    fs_owner: (u32, u32),
+    block_size: u32,
+}
+
+impl<Inner> CompositeFs<Inner> {
+    pub const ROOT_INO: InodeAddr = 1;
+
+    pub fn new(fs_owner: (u32, u32), block_size: u32) -> Self {
+        let inode_table = FutureBackedCache::default();
+        let now = std::time::SystemTime::now();
+        let root = INode {
+            addr: Self::ROOT_INO,
+            permissions: InodePerms::from_bits_truncate(0o755),
+            uid: fs_owner.0,
+            gid: fs_owner.1,
+            create_time: now,
+            last_modified_at: now,
+            parent: None,
+            size: 0,
+            itype: INodeType::Directory,
+        };
+        inode_table.insert_sync(Self::ROOT_INO, root);
+
+        let mut refcounts = FxHashMap::default();
+        refcounts.insert(Self::ROOT_INO, 1);
+
+        Self {
+            inode_table,
+            directory_cache: DCache::new(),
+            readdir_populated: FutureBackedCache::default(),
+            next_ino: AtomicU64::new(Self::ROOT_INO + 1),
+            next_fh: AtomicU64::new(1),
+            refcounts,
+            readdir_buf: Vec::new(),
+            open_files: HashMap::new(),
+            child_inodes: HashMap::new(),
+            inode_to_slot: HashMap::new(),
+            slots: Vec::new(),
+            fs_owner,
+            block_size,
+        }
+    }
+
+    pub fn allocate_inode(&self) -> InodeAddr {
+        self.next_ino.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn fs_owner(&self) -> (u32, u32) {
+        self.fs_owner
+    }
+
+    #[expect(dead_code, reason = "available for future use")]
+    pub fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    pub fn add_child(&mut self, inner: Inner, child_root_ino: InodeAddr) -> InodeAddr {
+        self.add_child_with_parent(inner, child_root_ino, Self::ROOT_INO)
+    }
+
+    pub fn cache_inode(&self, inode: INode) {
+        self.inode_table.insert_sync(inode.addr, inode);
+    }
+
+    /// Insert the inode into the table and initialise its refcount to zero.
+    ///
+    /// The caller is responsible for bumping the refcount via [`inc_rc`](Self::inc_rc).
+    pub fn cache_inode_and_init_rc(&mut self, inode: INode) {
+        let addr = inode.addr;
+        self.inode_table.insert_sync(addr, inode);
+        self.refcounts.entry(addr).or_insert(0);
+    }
+
+    pub fn inc_rc(&mut self, addr: InodeAddr) -> Option<u64> {
+        let rc = self.refcounts.get_mut(&addr)?;
+        *rc += 1;
+        Some(*rc)
+    }
+
+    pub fn slot_for_inode(&self, ino: InodeAddr) -> Option<usize> {
         self.inode_to_slot.get(&ino).copied()
     }
 
-    /// Allocate an outer file handle and map it through the bridge.
-    #[must_use]
-    pub fn alloc_fh(&mut self, slot_idx: usize, inner_fh: FileHandle) -> FileHandle {
-        let fh = self.file_table.allocate();
-        self.slots[slot_idx].bridge.insert_fh(fh, inner_fh);
-        fh
-    }
-
-    /// Translate an inner inode to an outer inode, allocating if needed.
-    /// Also inserts a stub ICB into the outer icache when the inode is new.
-    #[instrument(name = "CompositeFs::translate_inner_ino", skip(self, name))]
-    pub async fn translate_inner_ino(
+    /// Like [`add_child`](Self::add_child) but sets a custom parent inode
+    /// instead of always using `ROOT_INO`.
+    pub fn add_child_with_parent(
         &mut self,
-        slot_idx: usize,
-        inner_ino: Inode,
-        parent_outer_ino: Inode,
-        name: &OsStr,
-    ) -> Inode {
-        let outer_ino = self.slots[slot_idx]
-            .bridge
-            .backward_or_insert_inode(inner_ino, || self.icache.allocate_inode());
-        self.inode_to_slot.insert(outer_ino, slot_idx);
-        self.icache
-            .entry_or_insert_icb(
-                outer_ino,
-                || InodeControlBlock {
-                    rc: 0,
-                    path: name.into(),
-                    parent: Some(parent_outer_ino),
-                    attr: None,
-                    children: None,
-                },
-                |_| {},
-            )
-            .await;
+        inner: Inner,
+        child_root_ino: InodeAddr,
+        parent_ino: InodeAddr,
+    ) -> InodeAddr {
+        let outer_ino = self.allocate_inode();
+        let now = std::time::SystemTime::now();
+        let inode = INode {
+            addr: outer_ino,
+            permissions: InodePerms::from_bits_truncate(0o755),
+            uid: self.fs_owner.0,
+            gid: self.fs_owner.1,
+            create_time: now,
+            last_modified_at: now,
+            parent: Some(parent_ino),
+            size: 0,
+            itype: INodeType::Directory,
+        };
+        self.inode_table.insert_sync(outer_ino, inode);
+
+        let mut bridge = InodeBridge::new();
+        bridge.insert(outer_ino, child_root_ino);
+
+        let idx = self.slots.len();
+        self.slots.push(ChildSlot { inner, bridge });
+        self.child_inodes.insert(outer_ino, idx);
+        self.inode_to_slot.insert(outer_ino, idx);
+
         outer_ino
     }
+}
 
-    /// Get cached file attributes for an inode.
-    #[instrument(name = "CompositeFs::delegated_getattr", skip(self))]
-    pub async fn delegated_getattr(&self, ino: Inode) -> Result<FileAttr, GetAttrError> {
-        self.icache.get_attr(ino).await.ok_or_else(|| {
-            warn!(ino, "getattr on unknown inode");
-            GetAttrError::InodeNotFound
-        })
-    }
-
-    /// Find slot, forward inode, delegate to inner, allocate outer file handle.
-    #[instrument(name = "CompositeFs::delegated_open", skip(self))]
-    pub async fn delegated_open(
-        &mut self,
-        ino: Inode,
-        flags: OpenFlags,
-    ) -> Result<OpenFile, OpenError> {
-        let idx = self.slot_for_inode(ino).ok_or_else(|| {
-            warn!(ino, "open on inode not belonging to any child");
-            OpenError::InodeNotFound
-        })?;
-        let inner_ino = self.slots[idx]
-            .bridge
-            .forward_or_insert_inode(ino, || unreachable!("open: ino should be mapped"));
-        let inner_open = self.slots[idx].inner.open(inner_ino, flags).await?;
-        let outer_fh = self.alloc_fh(idx, inner_open.handle);
-        trace!(
-            ino,
-            outer_fh,
-            inner_fh = inner_open.handle,
-            "open: assigned file handle"
-        );
-        Ok(OpenFile {
-            handle: outer_fh,
-            options: inner_open.options,
-        })
-    }
-
-    /// Find slot, forward inode and file handle, delegate read to inner.
-    #[expect(clippy::too_many_arguments, reason = "mirrors fuser read API")]
-    #[instrument(name = "CompositeFs::delegated_read", skip(self))]
-    pub async fn delegated_read(
-        &mut self,
-        ino: Inode,
-        fh: FileHandle,
-        offset: u64,
-        size: u32,
-        flags: OpenFlags,
-        lock_owner: Option<LockOwner>,
-    ) -> Result<Bytes, ReadError> {
-        let idx = self.slot_for_inode(ino).ok_or_else(|| {
-            warn!(ino, "read on inode not belonging to any child");
-            ReadError::InodeNotFound
-        })?;
-        let inner_ino = self.slots[idx]
-            .bridge
-            .forward_or_insert_inode(ino, || unreachable!("read: ino should be mapped"));
-        let inner_fh = self.slots[idx].bridge.fh_forward(fh).ok_or_else(|| {
-            warn!(fh, "read: no fh mapping found");
-            ReadError::FileNotOpen
-        })?;
-        self.slots[idx]
-            .inner
-            .read(inner_ino, inner_fh, offset, size, flags, lock_owner)
-            .await
-    }
-
-    /// Find slot, forward inode and file handle, delegate release to inner,
-    /// then clean up the file handle mapping.
-    #[instrument(name = "CompositeFs::delegated_release", skip(self))]
-    pub async fn delegated_release(
-        &mut self,
-        ino: Inode,
-        fh: FileHandle,
-        flags: OpenFlags,
-        flush: bool,
-    ) -> Result<(), ReleaseError> {
-        let idx = self.slot_for_inode(ino).ok_or_else(|| {
-            warn!(ino, "release on inode not belonging to any child");
-            ReleaseError::FileNotOpen
-        })?;
-        let inner_ino = self.slots[idx]
-            .bridge
-            .forward_or_insert_inode(ino, || unreachable!("release: ino should be mapped"));
-        let inner_fh = self.slots[idx].bridge.fh_forward(fh).ok_or_else(|| {
-            warn!(fh, "release: no fh mapping found");
-            ReleaseError::FileNotOpen
-        })?;
-        let result = self.slots[idx]
-            .inner
-            .release(inner_ino, inner_fh, flags, flush)
-            .await;
-        self.slots[idx].bridge.remove_fh_by_left(fh);
-        trace!(ino, fh, "release: cleaned up fh mapping");
-        result
-    }
-
-    /// Propagate forget to the inner filesystem, evict from icache, and clean
-    /// up bridge mappings. Returns `true` if the inode was evicted.
-    ///
-    /// Child-root inodes (those in `child_inodes`) do NOT propagate forget to
-    /// the inner filesystem: the inner root's `rc=1` is an initialization
-    /// invariant unrelated to outer FUSE lookup counts. Propagating would
-    /// evict the inner root, breaking all subsequent operations on that child.
-    #[must_use]
-    #[instrument(name = "CompositeFs::delegated_forget", skip(self))]
-    pub async fn delegated_forget(&mut self, ino: Inode, nlookups: u64) -> bool {
-        let slot_idx = self.slot_for_inode(ino);
-        let is_child_root = self.child_inodes.contains_key(&ino);
-        if !is_child_root
-            && let Some(idx) = slot_idx
-            && let Some(&inner_ino) = self.slots[idx].bridge.inode_map_get_by_left(ino)
-        {
-            self.slots[idx].inner.forget(inner_ino, nlookups).await;
-        }
-        if self.icache.forget(ino, nlookups).await.is_some() {
-            self.child_inodes.remove(&ino);
-            self.inode_to_slot.remove(&ino);
-            if let Some(idx) = slot_idx {
-                self.slots[idx].bridge.remove_inode_by_left(ino);
-            }
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Return filesystem statistics from the icache.
-    #[must_use]
-    pub fn delegated_statfs(&self) -> FilesystemStats {
-        self.icache.statfs()
-    }
-
-    /// Delegation branch for lookup when the parent is owned by a child slot.
+impl<Inner: ChildFs> CompositeFs<Inner> {
     #[instrument(name = "CompositeFs::delegated_lookup", skip(self, name))]
     pub async fn delegated_lookup(
         &mut self,
-        parent: Inode,
+        parent: InodeAddr,
         name: &OsStr,
-    ) -> Result<FileAttr, LookupError> {
+    ) -> Result<INode, LookupError> {
+        // Fast path: DCache hit + inode still in table
+        if let Some(dentry) = self.directory_cache.lookup(LoadedAddr(parent), name)
+            && let Some(inode) = self.inode_table.get(&dentry.ino.0).await
+        {
+            *self.refcounts.entry(inode.addr).or_insert(0) += 1;
+            return Ok(inode);
+        }
+
+        // Slow path: delegate to child
         let idx = self
-            .slot_for_inode(parent)
+            .inode_to_slot
+            .get(&parent)
+            .copied()
             .ok_or(LookupError::InodeNotFound)?;
         let inner_parent = self.slots[idx]
             .bridge
-            .forward_or_insert_inode(parent, || unreachable!("lookup: parent should be mapped"));
-        let inner_attr = self.slots[idx].inner.lookup(inner_parent, name).await?;
-        let inner_ino = inner_attr.common().ino;
-        let outer_ino = self.translate_inner_ino(idx, inner_ino, parent, name).await;
-        let outer_attr = self.slots[idx].bridge.attr_backward(inner_attr);
-        self.icache.cache_attr(outer_ino, outer_attr).await;
-        // None means the entry was concurrently evicted; fail the lookup so
-        // the kernel doesn't hold a ref the cache no longer tracks.
-        let rc = self
-            .icache
-            .inc_rc(outer_ino)
-            .await
+            .forward(parent)
             .ok_or(LookupError::InodeNotFound)?;
-        trace!(outer_ino, inner_ino, rc, "lookup: resolved via delegation");
-        Ok(outer_attr)
+        let inner_inode = self.slots[idx].inner.lookup(inner_parent, name).await?;
+
+        let next_ino = &self.next_ino;
+        let outer_ino = self.slots[idx]
+            .bridge
+            .backward_or_insert(inner_inode.addr, || {
+                next_ino.fetch_add(1, Ordering::Relaxed)
+            });
+        self.inode_to_slot.insert(outer_ino, idx);
+
+        let remapped = INode {
+            addr: outer_ino,
+            ..inner_inode
+        };
+        self.inode_table
+            .get_or_init(outer_ino, || async move { remapped })
+            .await;
+
+        let is_dir = matches!(inner_inode.itype, INodeType::Directory);
+        self.directory_cache
+            .insert(
+                LoadedAddr(parent),
+                name.to_os_string(),
+                LoadedAddr(outer_ino),
+                is_dir,
+            )
+            .await;
+
+        *self.refcounts.entry(outer_ino).or_insert(0) += 1;
+        let rc = self.refcounts[&outer_ino];
+        trace!(
+            outer_ino,
+            inner_ino = inner_inode.addr,
+            rc,
+            "lookup: resolved via delegation"
+        );
+
+        Ok(remapped)
     }
 
-    /// Delegation branch for readdir when the inode is owned by a child slot.
     #[instrument(name = "CompositeFs::delegated_readdir", skip(self))]
-    pub async fn delegated_readdir(&mut self, ino: Inode) -> Result<&[DirEntry], ReadDirError> {
+    pub async fn delegated_readdir(
+        &mut self,
+        ino: InodeAddr,
+    ) -> Result<&[FsDirEntry], ReadDirError> {
         let idx = self
-            .slot_for_inode(ino)
+            .inode_to_slot
+            .get(&ino)
+            .copied()
             .ok_or(ReadDirError::InodeNotFound)?;
+
+        if self.readdir_populated.get(&LoadedAddr(ino)).await.is_none() {
+            let inner_ino = self.slots[idx]
+                .bridge
+                .forward(ino)
+                .ok_or(ReadDirError::InodeNotFound)?;
+            let inner_entries = self.slots[idx].inner.readdir(inner_ino).await?;
+
+            for (name, child_inode) in &inner_entries {
+                let next_ino = &self.next_ino;
+                let outer_child = self.slots[idx]
+                    .bridge
+                    .backward_or_insert(child_inode.addr, || {
+                        next_ino.fetch_add(1, Ordering::Relaxed)
+                    });
+                self.inode_to_slot.insert(outer_child, idx);
+
+                let remapped = INode {
+                    addr: outer_child,
+                    ..*child_inode
+                };
+                self.inode_table
+                    .get_or_init(outer_child, || async move { remapped })
+                    .await;
+
+                let is_dir = matches!(child_inode.itype, INodeType::Directory);
+                self.directory_cache
+                    .insert(
+                        LoadedAddr(ino),
+                        name.clone(),
+                        LoadedAddr(outer_child),
+                        is_dir,
+                    )
+                    .await;
+            }
+
+            self.readdir_populated
+                .get_or_init(LoadedAddr(ino), || async {})
+                .await;
+        }
+
+        let mut children = self.directory_cache.readdir(LoadedAddr(ino)).await;
+        children.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+
+        let mut entries = Vec::with_capacity(children.len());
+        for (name, dvalue) in &children {
+            if let Some(inode) = self.inode_table.get(&dvalue.ino.0).await {
+                entries.push(FsDirEntry {
+                    ino: inode.addr,
+                    name: name.clone(),
+                });
+            }
+        }
+
+        self.readdir_buf = entries;
+        Ok(&self.readdir_buf)
+    }
+
+    #[instrument(name = "CompositeFs::delegated_getattr", skip(self))]
+    pub async fn delegated_getattr(&self, ino: InodeAddr) -> Result<INode, GetAttrError> {
+        self.inode_table
+            .get(&ino)
+            .await
+            .ok_or(GetAttrError::InodeNotFound)
+    }
+
+    #[expect(dead_code, reason = "will be needed by future callers")]
+    #[must_use]
+    pub fn delegated_statfs(&self) -> AsyncFsStats {
+        AsyncFsStats {
+            block_size: self.block_size,
+            total_blocks: 0,
+            free_blocks: 0,
+            available_blocks: 0,
+            total_inodes: self.inode_table.len() as u64,
+            free_inodes: 0,
+            max_filename_length: 255,
+        }
+    }
+
+    #[instrument(name = "CompositeFs::delegated_open", skip(self))]
+    pub async fn delegated_open(
+        &mut self,
+        ino: InodeAddr,
+        flags: OpenFlags,
+    ) -> Result<FileHandle, OpenError> {
+        let idx = self
+            .inode_to_slot
+            .get(&ino)
+            .copied()
+            .ok_or(OpenError::InodeNotFound)?;
         let inner_ino = self.slots[idx]
             .bridge
-            .forward_or_insert_inode(ino, || unreachable!("readdir: ino should be mapped"));
-        let inner_entries = self.slots[idx].inner.readdir(inner_ino).await?;
-        let inner_entries: Vec<DirEntry> = inner_entries.to_vec();
-        let evicted = self.icache.evict_zero_rc_children(ino).await;
-        for evicted_ino in evicted {
-            if let Some(slot) = self.inode_to_slot.remove(&evicted_ino) {
-                self.slots[slot].bridge.remove_inode_by_left(evicted_ino);
+            .forward(ino)
+            .ok_or(OpenError::InodeNotFound)?;
+        let inner_fh = self.slots[idx].inner.open(inner_ino, flags).await?;
+
+        let outer_fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        self.open_files.insert(
+            outer_fh,
+            OpenFileEntry {
+                slot_idx: idx,
+                inner_ino,
+                inner_fh,
+            },
+        );
+
+        trace!(ino, outer_fh, inner_fh, "open: assigned fh");
+        Ok(outer_fh)
+    }
+
+    #[instrument(name = "CompositeFs::delegated_read", skip(self))]
+    pub async fn delegated_read(
+        &mut self,
+        fh: FileHandle,
+        offset: u64,
+        size: u32,
+    ) -> Result<Bytes, ReadError> {
+        let entry = self.open_files.get(&fh).ok_or(ReadError::FileNotOpen)?;
+        let slot_idx = entry.slot_idx;
+        let inner_ino = entry.inner_ino;
+        let inner_fh = entry.inner_fh;
+        self.slots[slot_idx]
+            .inner
+            .read(inner_ino, inner_fh, offset, size)
+            .await
+    }
+
+    #[instrument(name = "CompositeFs::delegated_release", skip(self))]
+    pub async fn delegated_release(&mut self, fh: FileHandle) -> Result<(), ReleaseError> {
+        let entry = self
+            .open_files
+            .remove(&fh)
+            .ok_or(ReleaseError::FileNotOpen)?;
+        let result = self.slots[entry.slot_idx]
+            .inner
+            .release(entry.inner_ino, entry.inner_fh)
+            .await;
+        trace!(fh, "release: cleaned up fh mapping");
+        result
+    }
+
+    /// Returns `true` if the inode was evicted.
+    ///
+    /// The composite only manages its own refcounts and inode table.
+    /// Inner filesystem inodes are managed by the inner FS itself through
+    /// its own lifecycle; the composite does not propagate forget to children.
+    #[expect(dead_code, reason = "will be needed by future callers")]
+    #[must_use]
+    #[instrument(name = "CompositeFs::delegated_forget", skip(self))]
+    pub fn delegated_forget(&mut self, ino: InodeAddr, nlookups: u64) -> bool {
+        let slot_idx = self.inode_to_slot.get(&ino).copied();
+
+        if let Some(rc) = self.refcounts.get_mut(&ino) {
+            *rc = rc.saturating_sub(nlookups);
+            if *rc > 0 {
+                return false;
             }
-            self.child_inodes.remove(&evicted_ino);
+            self.refcounts.remove(&ino);
+        } else {
+            return false;
         }
-        let mut outer_entries = Vec::with_capacity(inner_entries.len());
-        for entry in &inner_entries {
-            let outer_child_ino = self
-                .translate_inner_ino(idx, entry.ino, ino, &entry.name)
-                .await;
-            if let Some(inner_attr) = self.slots[idx].inner.peek_attr(entry.ino).await {
-                let outer_attr = self.slots[idx].bridge.attr_backward(inner_attr);
-                self.icache.cache_attr(outer_child_ino, outer_attr).await;
-            }
-            outer_entries.push(DirEntry {
-                ino: outer_child_ino,
-                name: entry.name.clone(),
-                kind: entry.kind,
-            });
+
+        self.inode_table.remove_sync(&ino);
+        self.child_inodes.remove(&ino);
+        self.inode_to_slot.remove(&ino);
+        if let Some(idx) = slot_idx {
+            self.slots[idx].bridge.remove_by_outer(ino);
         }
-        self.readdir_buf = outer_entries;
-        Ok(&self.readdir_buf)
+
+        true
     }
 }

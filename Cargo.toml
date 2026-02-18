@@ -49,6 +49,7 @@ tracing-indicatif = "0.3.14"
 opentelemetry = { version = "0.29" }
 opentelemetry_sdk = { version = "0.29", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.29", default-features = false, features = ["http-proto", "trace", "reqwest-blocking-client"] }
+ouroboros = "0.18"
 tracing-opentelemetry = { version = "0.30" }
 hashlink = "0.11.0"
 
