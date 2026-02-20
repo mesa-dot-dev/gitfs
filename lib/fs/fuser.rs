@@ -291,22 +291,17 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
     #[instrument(name = "FuserAdapter::open", skip(self, _req, flags, reply))]
     fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
         let flags = OpenFlags::from_bits_truncate(flags);
-        let result = self.runtime.block_on(async {
-            let open_file = self.inner.get_fs().open(LoadedAddr(ino), flags).await?;
-            let fh = open_file.fh;
-            self.open_files.insert(fh, Arc::clone(&open_file.reader));
-            Ok::<_, std::io::Error>(fh)
-        });
-        match result {
-            Ok(fh) => {
+        self.runtime
+            .block_on(async {
+                let open_file = self.inner.get_fs().open(LoadedAddr(ino), flags).await?;
+                let fh = open_file.fh;
+                self.open_files.insert(fh, Arc::clone(&open_file.reader));
+                Ok::<_, std::io::Error>(fh)
+            })
+            .fuse_reply(reply, |fh, reply| {
                 debug!(handle = fh, "replying...");
                 reply.opened(fh, 0);
-            }
-            Err(e) => {
-                debug!(error = %e, "replying error");
-                reply.error(io_to_errno(&e));
-            }
-        }
+            });
     }
 
     #[instrument(
