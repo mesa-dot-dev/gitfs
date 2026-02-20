@@ -149,6 +149,9 @@ pub(super) trait ChildFs: Send + Sync {
     async fn release(&mut self, ino: InodeAddr, fh: FileHandle) -> Result<(), ReleaseError>;
 }
 
+// Tests kept inline: these types live in the binary crate and are not
+// re-exported through the `git_fs` lib, so integration tests in `tests/`
+// cannot access them.
 #[cfg(test)]
 mod tests {
     use super::*;
