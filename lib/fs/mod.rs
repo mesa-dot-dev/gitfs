@@ -1,6 +1,8 @@
 //! Useful filesystem generalizations.
 /// Async filesystem cache with concurrent inode management.
 pub mod async_fs;
+/// Lock-free bidirectional inode address mapping.
+pub mod bridge;
 /// Directory entry cache for fast parent-child lookups.
 pub mod dcache;
 /// FUSE adapter: maps [`fuser::Filesystem`] callbacks to [`async_fs::AsyncFs`].
