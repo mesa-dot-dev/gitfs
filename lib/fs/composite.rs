@@ -99,6 +99,7 @@ pub struct CompositeReader<R: FileReader> {
 
 impl<R: FileReader> CompositeReader<R> {
     /// Create a new `CompositeReader` wrapping the given reader.
+    #[must_use]
     pub fn new(inner: Arc<R>) -> Self {
         Self { inner }
     }
