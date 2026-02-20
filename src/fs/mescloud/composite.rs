@@ -83,7 +83,6 @@ struct OpenFileEntry {
 pub(super) struct CompositeFs<Inner> {
     pub(super) inode_table: FutureBackedCache<InodeAddr, INode>,
     pub(super) directory_cache: DCache,
-    readdir_populated: FutureBackedCache<LoadedAddr, ()>,
     next_ino: AtomicU64,
     next_fh: AtomicU64,
     refcounts: FxHashMap<InodeAddr, u64>,
@@ -121,7 +120,6 @@ impl<Inner> CompositeFs<Inner> {
         Self {
             inode_table,
             directory_cache: DCache::new(),
-            readdir_populated: FutureBackedCache::default(),
             next_ino: AtomicU64::new(Self::ROOT_INO + 1),
             next_fh: AtomicU64::new(1),
             refcounts,
@@ -286,7 +284,7 @@ impl<Inner: ChildFs> CompositeFs<Inner> {
             .copied()
             .ok_or(ReadDirError::InodeNotFound)?;
 
-        if self.readdir_populated.get(&LoadedAddr(ino)).await.is_none() {
+        if !self.directory_cache.is_populated(LoadedAddr(ino)) {
             let inner_ino = self.slots[idx]
                 .bridge
                 .forward(ino)
@@ -321,9 +319,7 @@ impl<Inner: ChildFs> CompositeFs<Inner> {
                     .await;
             }
 
-            self.readdir_populated
-                .get_or_init(LoadedAddr(ino), || async {})
-                .await;
+            self.directory_cache.mark_populated(LoadedAddr(ino));
         }
 
         let mut children = self.directory_cache.readdir(LoadedAddr(ino)).await;
