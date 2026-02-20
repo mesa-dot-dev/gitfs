@@ -53,10 +53,6 @@ impl_fuse_reply!(
 ///
 /// Centralizes the error-logging + errno-reply path so each FUSE callback
 /// only has to express its success path.
-#[expect(
-    dead_code,
-    reason = "will be used by FUSE callbacks in upcoming commits"
-)]
 trait FuseResultExt<T> {
     fn fuse_reply<R: FuseReply>(self, reply: R, on_ok: impl FnOnce(T, R));
 }
@@ -233,20 +229,13 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
         _fh: Option<u64>,
         reply: fuser::ReplyAttr,
     ) {
-        let result = self
-            .runtime
-            .block_on(async { self.inner.get_fs().getattr(LoadedAddr(ino)).await });
-        match result {
-            Ok(inode) => {
+        self.runtime
+            .block_on(async { self.inner.get_fs().getattr(LoadedAddr(ino)).await })
+            .fuse_reply(reply, |inode, reply| {
                 let attr = inode_to_fuser_attr(&inode, BLOCK_SIZE);
                 debug!(?attr, "replying...");
                 reply.attr(&Self::SHAMEFUL_TTL, &attr);
-            }
-            Err(e) => {
-                debug!(error = %e, "replying error");
-                reply.error(io_to_errno(&e));
-            }
-        }
+            });
     }
 
     #[instrument(name = "FuserAdapter::readdir", skip(self, _req, _fh, offset, reply))]
