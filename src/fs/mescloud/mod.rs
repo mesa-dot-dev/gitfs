@@ -32,6 +32,7 @@ pub use org::OrgConfig;
 use org::OrgFs;
 
 pub mod repo;
+mod roots;
 
 struct HeaderInjector<'a>(&'a mut reqwest::header::HeaderMap);
 
