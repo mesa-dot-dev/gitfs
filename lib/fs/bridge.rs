@@ -48,17 +48,22 @@ impl ConcurrentBridge {
     }
 
     /// Look up inner -> outer, or allocate a new outer address if unmapped.
+    #[must_use]
     pub fn backward_or_insert(
         &self,
         inner: InodeAddr,
         allocate: impl FnOnce() -> InodeAddr,
     ) -> InodeAddr {
-        if let Some(outer) = self.backward(inner) {
-            return outer;
+        match self.bwd.entry_sync(inner) {
+            scc::hash_map::Entry::Occupied(occ) => *occ.get(),
+            scc::hash_map::Entry::Vacant(vac) => {
+                let outer = allocate();
+                vac.insert_entry(outer);
+                // Populate forward map after backward is committed.
+                let _ = self.fwd.insert_sync(outer, inner);
+                outer
+            }
         }
-        let outer = allocate();
-        self.insert(outer, inner);
-        outer
     }
 
     /// Remove the mapping for the given outer address.
