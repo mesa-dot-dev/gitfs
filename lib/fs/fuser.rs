@@ -203,22 +203,17 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
         name: &OsStr,
         reply: fuser::ReplyEntry,
     ) {
-        let result = self.runtime.block_on(async {
-            let tracked = self.inner.get_fs().lookup(LoadedAddr(parent), name).await?;
-            self.inner.ward_inc(tracked.inode.addr);
-            Ok::<_, std::io::Error>(tracked.inode)
-        });
-        match result {
-            Ok(inode) => {
+        self.runtime
+            .block_on(async {
+                let tracked = self.inner.get_fs().lookup(LoadedAddr(parent), name).await?;
+                self.inner.ward_inc(tracked.inode.addr);
+                Ok::<_, std::io::Error>(tracked.inode)
+            })
+            .fuse_reply(reply, |inode, reply| {
                 let f_attr = inode_to_fuser_attr(&inode, BLOCK_SIZE);
                 debug!(?f_attr, "replying...");
                 reply.entry(&Self::SHAMEFUL_TTL, &f_attr, 0);
-            }
-            Err(e) => {
-                debug!(error = %e, "replying error");
-                reply.error(io_to_errno(&e));
-            }
-        }
+            });
     }
 
     #[instrument(name = "FuserAdapter::getattr", skip(self, _req, _fh, reply))]
