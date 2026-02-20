@@ -2,13 +2,12 @@
 //!
 //! This module directly accesses the mesa repo through the Rust SDK, on a per-repo basis.
 
-use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
-use std::{ffi::OsStr, path::PathBuf};
 
 use base64::Engine as _;
 use bytes::Bytes;
@@ -20,31 +19,12 @@ use tracing::warn;
 use git_fs::cache::fcache::FileCache;
 use git_fs::cache::traits::{AsyncReadableCache as _, AsyncWritableCache as _};
 use git_fs::fs::async_fs::{FileReader, FsDataProvider};
-use git_fs::fs::{
-    INode, INodeType, InodeAddr, InodePerms, LoadedAddr, OpenFlags as AsyncOpenFlags,
-};
+use git_fs::fs::{INode, INodeType, InodeAddr, InodePerms, OpenFlags as AsyncOpenFlags};
 
-use crate::app_config::CacheConfig;
-
-use super::common::MesaApiError;
-pub use super::common::{LookupError, OpenError, ReadDirError, ReadError, ReleaseError};
-
-fn mesa_api_error_to_io(e: MesaApiError) -> std::io::Error {
-    match &e {
-        MesaApiError::Response { status, .. } if *status == 404 => {
-            std::io::Error::from_raw_os_error(libc::ENOENT)
-        }
-        MesaApiError::Reqwest(_)
-        | MesaApiError::ReqwestMiddleware(_)
-        | MesaApiError::Serde(_)
-        | MesaApiError::SerdePath(_)
-        | MesaApiError::Io(_)
-        | MesaApiError::Response { .. } => std::io::Error::other(e),
-    }
-}
+use super::common::{MesaApiError, mesa_api_error_to_io};
 
 #[derive(Clone)]
-pub(super) struct MesRepoProvider {
+pub struct MesRepoProvider {
     inner: Arc<MesRepoProviderInner>,
 }
 
@@ -97,6 +77,10 @@ impl MesRepoProvider {
     }
 
     /// The name of the repository.
+    #[expect(
+        dead_code,
+        reason = "useful diagnostic accessor retained for future use"
+    )]
     pub(super) fn repo_name(&self) -> &str {
         &self.inner.repo_name
     }
@@ -294,7 +278,7 @@ impl FsDataProvider for MesRepoProvider {
     }
 }
 
-pub(super) struct MesFileReader {
+pub struct MesFileReader {
     client: MesaClient,
     org_name: String,
     repo_name: String,
@@ -381,217 +365,5 @@ impl FileReader for MesFileReader {
 
             Ok(result)
         }
-    }
-}
-
-mod repo_fs_inner {
-    #![allow(clippy::future_not_send, clippy::mem_forget)]
-    use git_fs::cache::async_backed::FutureBackedCache;
-    use git_fs::fs::async_fs::AsyncFs;
-    use git_fs::fs::{INode, InodeAddr};
-    use ouroboros::self_referencing;
-
-    use super::MesRepoProvider;
-
-    #[self_referencing]
-    pub struct RepoFsInner {
-        pub(super) inode_table: FutureBackedCache<InodeAddr, INode>,
-        #[borrows(inode_table)]
-        #[covariant]
-        pub(super) fs: AsyncFs<'this, MesRepoProvider>,
-    }
-
-    impl RepoFsInner {
-        pub fn create(
-            inode_table: FutureBackedCache<InodeAddr, INode>,
-            provider: MesRepoProvider,
-        ) -> Self {
-            RepoFsInnerBuilder {
-                inode_table,
-                fs_builder: |tbl| AsyncFs::new_preseeded(provider, tbl),
-            }
-            .build()
-        }
-    }
-}
-use repo_fs_inner::RepoFsInner;
-
-/// A filesystem rooted at a single mesa repository.
-///
-/// Wraps [`AsyncFs<MesRepoProvider>`] via ouroboros to co-locate the inode table
-/// and the filesystem that borrows it. Implements [`Fs`] as a thin adapter.
-pub struct RepoFs {
-    inner: RepoFsInner,
-    /// Reference counts for inodes held by the kernel.
-    refcounts: rustc_hash::FxHashMap<InodeAddr, u64>,
-    /// Open file handles mapped to readers.
-    open_files: HashMap<git_fs::fs::FileHandle, Arc<MesFileReader>>,
-    /// Provider clone for accessing `repo_name` and `path_map` cleanup.
-    provider: MesRepoProvider,
-}
-
-impl RepoFs {
-    pub(crate) const ROOT_INO: InodeAddr = 1;
-
-    /// Create a new `RepoFs` for a specific org and repo.
-    pub async fn new(
-        client: MesaClient,
-        org_name: String,
-        repo_name: String,
-        ref_: String,
-        fs_owner: (u32, u32),
-        cache_config: CacheConfig,
-    ) -> Self {
-        let file_cache = match cache_config.max_size {
-            Some(max_size) if max_size.as_u64() > 0 => {
-                let cache_dir = cache_config.path.join(&org_name).join(&repo_name);
-                let max_bytes = max_size.as_u64().try_into().unwrap_or(usize::MAX);
-                match FileCache::new(&cache_dir, max_bytes).await {
-                    Ok(cache) => Some(Arc::new(cache)),
-                    Err(e) => {
-                        warn!(error = ?e, org = %org_name, repo = %repo_name,
-                            "failed to create file cache, continuing without caching");
-                        None
-                    }
-                }
-            }
-            _ => None,
-        };
-
-        let provider =
-            MesRepoProvider::new(client, org_name, repo_name, ref_, fs_owner, file_cache);
-        provider.seed_root_path(Self::ROOT_INO);
-
-        let root = INode {
-            addr: Self::ROOT_INO,
-            permissions: InodePerms::from_bits_truncate(0o755),
-            uid: fs_owner.0,
-            gid: fs_owner.1,
-            create_time: SystemTime::now(),
-            last_modified_at: SystemTime::now(),
-            parent: None,
-            size: 0,
-            itype: INodeType::Directory,
-        };
-
-        let inode_table = git_fs::cache::async_backed::FutureBackedCache::default();
-        inode_table.insert_sync(root.addr, root);
-
-        let inner = RepoFsInner::create(inode_table, provider.clone());
-
-        let mut refcounts = rustc_hash::FxHashMap::default();
-        refcounts.insert(Self::ROOT_INO, 1);
-
-        Self {
-            inner,
-            refcounts,
-            open_files: HashMap::new(),
-            provider,
-        }
-    }
-
-    /// The name of the repository this filesystem is rooted at.
-    pub(crate) fn repo_name(&self) -> &str {
-        self.provider.repo_name()
-    }
-}
-
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "mapping all ErrorKind variants is impractical; EIO is the sensible default"
-)]
-fn io_error_to_errno(e: &std::io::Error) -> i32 {
-    e.raw_os_error().unwrap_or_else(|| match e.kind() {
-        std::io::ErrorKind::NotFound => libc::ENOENT,
-        std::io::ErrorKind::PermissionDenied => libc::EACCES,
-        std::io::ErrorKind::AlreadyExists => libc::EEXIST,
-        _ => libc::EIO,
-    })
-}
-
-#[async_trait::async_trait]
-impl super::common::ChildFs for RepoFs {
-    async fn lookup(&mut self, parent: InodeAddr, name: &OsStr) -> Result<INode, LookupError> {
-        let tracked = self
-            .inner
-            .borrow_fs()
-            .lookup(LoadedAddr(parent), name)
-            .await
-            .map_err(|e| {
-                if io_error_to_errno(&e) == libc::ENOENT {
-                    LookupError::InodeNotFound
-                } else {
-                    LookupError::RemoteMesaError(MesaApiError::Io(e))
-                }
-            })?;
-        *self.refcounts.entry(tracked.inode.addr).or_insert(0) += 1;
-        Ok(tracked.inode)
-    }
-
-    async fn readdir(&mut self, ino: InodeAddr) -> Result<Vec<(OsString, INode)>, ReadDirError> {
-        let mut entries = Vec::new();
-        self.inner
-            .borrow_fs()
-            .readdir(LoadedAddr(ino), 0, |de, _offset| {
-                entries.push((de.name.to_os_string(), de.inode));
-                false
-            })
-            .await
-            .map_err(|e| {
-                if io_error_to_errno(&e) == libc::ENOTDIR {
-                    ReadDirError::NotADirectory
-                } else if io_error_to_errno(&e) == libc::ENOENT {
-                    ReadDirError::InodeNotFound
-                } else {
-                    ReadDirError::RemoteMesaError(MesaApiError::Io(e))
-                }
-            })?;
-        Ok(entries)
-    }
-
-    async fn open(
-        &mut self,
-        ino: InodeAddr,
-        flags: AsyncOpenFlags,
-    ) -> Result<git_fs::fs::FileHandle, OpenError> {
-        let open_file = self
-            .inner
-            .borrow_fs()
-            .open(LoadedAddr(ino), flags)
-            .await
-            .map_err(|_| OpenError::InodeNotFound)?;
-        self.open_files
-            .insert(open_file.fh, Arc::clone(&open_file.reader));
-        Ok(open_file.fh)
-    }
-
-    async fn read(
-        &mut self,
-        _ino: InodeAddr,
-        fh: git_fs::fs::FileHandle,
-        offset: u64,
-        size: u32,
-    ) -> Result<Bytes, ReadError> {
-        let reader = self.open_files.get(&fh).ok_or(ReadError::FileNotOpen)?;
-        reader.read(offset, size).await.map_err(|e| {
-            if io_error_to_errno(&e) == libc::EISDIR {
-                ReadError::NotAFile
-            } else if io_error_to_errno(&e) == libc::ENOENT {
-                ReadError::InodeNotFound
-            } else {
-                ReadError::RemoteMesaError(MesaApiError::Io(e))
-            }
-        })
-    }
-
-    async fn release(
-        &mut self,
-        _ino: InodeAddr,
-        fh: git_fs::fs::FileHandle,
-    ) -> Result<(), ReleaseError> {
-        self.open_files
-            .remove(&fh)
-            .ok_or(ReleaseError::FileNotOpen)?;
-        Ok(())
     }
 }

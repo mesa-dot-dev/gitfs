@@ -3,10 +3,8 @@
 //! Bridges the generic `CompositeFs` from `lib/fs/composite.rs` with
 //! Mesa/GitHub-specific org and repo resolution logic.
 //!
-//! These types are not yet wired into the daemon entry point; they will be
-//! connected in a follow-up change that replaces the old `MesaFS` + `OrgFs`
-//! pipeline.
-#![expect(dead_code, reason = "wired in the follow-up daemon change")]
+//! These types are wired into the daemon entry point, replacing the old
+//! `MesaFS` + `OrgFs` pipeline.
 
 use std::ffi::{OsStr, OsString};
 use std::future::Future;
@@ -23,25 +21,11 @@ use git_fs::fs::async_fs::{FileReader, FsDataProvider};
 use git_fs::fs::composite::{ChildDescriptor, CompositeFs, CompositeReader, CompositeRoot};
 use git_fs::fs::{INode, INodeType, InodeAddr, InodePerms, OpenFlags};
 
-use super::common::MesaApiError;
+use super::common::{MesaApiError, mesa_api_error_to_io};
 use super::repo::{MesFileReader, MesRepoProvider};
 use crate::app_config::CacheConfig;
 
 const CHILD_ROOT_ADDR: InodeAddr = 1;
-
-fn mesa_api_error_to_io(e: MesaApiError) -> std::io::Error {
-    match &e {
-        MesaApiError::Response { status, .. } if *status == 404 => {
-            std::io::Error::from_raw_os_error(libc::ENOENT)
-        }
-        MesaApiError::Reqwest(_)
-        | MesaApiError::ReqwestMiddleware(_)
-        | MesaApiError::Serde(_)
-        | MesaApiError::SerdePath(_)
-        | MesaApiError::Io(_)
-        | MesaApiError::Response { .. } => std::io::Error::other(e),
-    }
-}
 
 /// Create a [`MesRepoProvider`] and its root [`INode`] for a given repo.
 async fn create_repo_provider(
@@ -111,7 +95,7 @@ fn check_not_found(e: MesaApiError) -> Result<(), std::io::Error> {
     }
 }
 
-pub(super) struct StandardOrgRoot {
+pub struct StandardOrgRoot {
     client: MesaClient,
     org_name: String,
     cache_config: CacheConfig,
@@ -119,7 +103,7 @@ pub(super) struct StandardOrgRoot {
 }
 
 impl StandardOrgRoot {
-    pub(super) fn new(
+    pub fn new(
         client: MesaClient,
         org_name: String,
         cache_config: CacheConfig,
@@ -222,7 +206,7 @@ impl CompositeRoot for StandardOrgRoot {
     }
 }
 
-pub(super) struct GithubRepoRoot {
+pub struct GithubRepoRoot {
     client: MesaClient,
     org_name: String,
     owner: String,
@@ -286,7 +270,7 @@ impl CompositeRoot for GithubRepoRoot {
     }
 }
 
-pub(super) struct GithubOrgRoot {
+pub struct GithubOrgRoot {
     client: MesaClient,
     org_name: String,
     cache_config: CacheConfig,
@@ -294,7 +278,7 @@ pub(super) struct GithubOrgRoot {
 }
 
 impl GithubOrgRoot {
-    pub(super) fn new(
+    pub fn new(
         client: MesaClient,
         org_name: String,
         cache_config: CacheConfig,
@@ -347,7 +331,7 @@ impl CompositeRoot for GithubOrgRoot {
 }
 
 #[derive(Clone)]
-pub(super) enum OrgChildDP {
+pub enum OrgChildDP {
     Standard(CompositeFs<StandardOrgRoot>),
     Github(CompositeFs<GithubOrgRoot>),
 }
@@ -407,7 +391,7 @@ impl FsDataProvider for OrgChildDP {
     }
 }
 
-pub(super) enum OrgChildReader {
+pub enum OrgChildReader {
     Standard(CompositeReader<MesFileReader>),
     Github(CompositeReader<CompositeReader<MesFileReader>>),
 }
@@ -441,12 +425,12 @@ impl FileReader for OrgChildReader {
     }
 }
 
-pub(super) struct MesaRoot {
+pub struct MesaRoot {
     orgs: Vec<(OsString, OrgChildDP)>,
 }
 
 impl MesaRoot {
-    pub(super) fn new(orgs: Vec<(OsString, OrgChildDP)>) -> Self {
+    pub fn new(orgs: Vec<(OsString, OrgChildDP)>) -> Self {
         Self { orgs }
     }
 }
