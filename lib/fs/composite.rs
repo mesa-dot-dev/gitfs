@@ -219,6 +219,39 @@ impl<R: CompositeRoot> CompositeFs<R> {
         }
     }
 
+    /// Allocate a new child slot with a fresh inode table and bridge mapping.
+    ///
+    /// Returns `(outer_ino, slot_idx)` for the newly created slot.
+    fn create_child_slot(&self, desc: &ChildDescriptor<R::ChildDP>) -> (InodeAddr, usize)
+    where
+        R::ChildDP: Clone,
+    {
+        let outer_ino = self.allocate_ino();
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "slot index fits in usize on 64-bit"
+        )]
+        let slot_idx = self.inner.next_slot.fetch_add(1, Ordering::Relaxed) as usize;
+
+        let table = FutureBackedCache::default();
+        table.insert_sync(desc.root_ino.addr, desc.root_ino);
+        let child_inner = Arc::new(ChildInner::create(table, desc.provider.clone()));
+
+        let bridge = ConcurrentBridge::new();
+        bridge.insert(outer_ino, desc.root_ino.addr);
+
+        drop(self.inner.slots.insert_sync(
+            slot_idx,
+            ChildSlot {
+                inner: child_inner,
+                bridge,
+            },
+        ));
+        let _ = self.inner.addr_to_slot.insert_sync(outer_ino, slot_idx);
+
+        (outer_ino, slot_idx)
+    }
+
     /// Register a child, returning the composite-level outer inode address.
     ///
     /// If the child is already registered by name, the existing outer address
@@ -246,62 +279,26 @@ impl<R: CompositeRoot> CompositeFs<R> {
                 // Slot exists but bridge has no mapping — should not happen,
                 // but fall through to create a fresh slot below.
                 // (Remove stale name entry so the vacant path can re-insert.)
+                //
+                // Race window: between `drop(occ)` and the `remove_sync` below,
+                // another thread could read the stale entry and resolve to a
+                // broken slot. In the worst case two threads create separate
+                // slots for the same child — the last writer to `name_to_slot`
+                // wins and the other slot becomes orphaned. This is functionally
+                // harmless: the orphaned slot is never reached via name lookup
+                // and will not serve any future requests.
                 drop(occ);
                 self.inner.name_to_slot.remove_sync(&desc.name);
             }
             scc::hash_map::Entry::Vacant(vac) => {
-                // Claim the name slot atomically.
-                let outer_ino = self.allocate_ino();
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "slot index fits in usize on 64-bit"
-                )]
-                let slot_idx = self.inner.next_slot.fetch_add(1, Ordering::Relaxed) as usize;
-
-                let table = FutureBackedCache::default();
-                table.insert_sync(desc.root_ino.addr, desc.root_ino);
-                let child_inner = Arc::new(ChildInner::create(table, desc.provider.clone()));
-
-                let bridge = ConcurrentBridge::new();
-                bridge.insert(outer_ino, desc.root_ino.addr);
-
-                drop(self.inner.slots.insert_sync(
-                    slot_idx,
-                    ChildSlot {
-                        inner: child_inner,
-                        bridge,
-                    },
-                ));
-                let _ = self.inner.addr_to_slot.insert_sync(outer_ino, slot_idx);
+                let (outer_ino, slot_idx) = self.create_child_slot(desc);
                 vac.insert_entry(slot_idx);
-
                 return outer_ino;
             }
         }
 
         // Fallback: name was stale, create fresh. This path is rare.
-        let outer_ino = self.allocate_ino();
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "slot index fits in usize on 64-bit"
-        )]
-        let slot_idx = self.inner.next_slot.fetch_add(1, Ordering::Relaxed) as usize;
-
-        let table = FutureBackedCache::default();
-        table.insert_sync(desc.root_ino.addr, desc.root_ino);
-        let child_inner = Arc::new(ChildInner::create(table, desc.provider.clone()));
-
-        let bridge = ConcurrentBridge::new();
-        bridge.insert(outer_ino, desc.root_ino.addr);
-
-        drop(self.inner.slots.insert_sync(
-            slot_idx,
-            ChildSlot {
-                inner: child_inner,
-                bridge,
-            },
-        ));
-        let _ = self.inner.addr_to_slot.insert_sync(outer_ino, slot_idx);
+        let (outer_ino, slot_idx) = self.create_child_slot(desc);
         drop(
             self.inner
                 .name_to_slot
