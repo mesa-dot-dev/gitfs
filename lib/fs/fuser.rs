@@ -9,60 +9,18 @@ use super::{FileHandle, INode, INodeType, InodeAddr, LoadedAddr, OpenFlags};
 use crate::cache::async_backed::FutureBackedCache;
 use tracing::{debug, error, instrument};
 
-/// Wrapper converting [`std::io::Error`] to errno.
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-struct FuseIoError(std::io::Error);
-
+/// Convert an I/O error to the corresponding errno value for FUSE replies.
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "ErrorKind is non_exhaustive; EIO is the safe default"
 )]
-impl From<FuseIoError> for i32 {
-    fn from(e: FuseIoError) -> Self {
-        e.0.raw_os_error().unwrap_or_else(|| match e.0.kind() {
-            std::io::ErrorKind::NotFound => libc::ENOENT,
-            std::io::ErrorKind::PermissionDenied => libc::EACCES,
-            std::io::ErrorKind::AlreadyExists => libc::EEXIST,
-            _ => libc::EIO,
-        })
-    }
-}
-
-/// Error for read operations.
-#[derive(Debug, thiserror::Error)]
-enum FuseReadError {
-    /// The file handle was not open.
-    #[error("file handle not open")]
-    NotOpen,
-    /// An I/O error occurred during the read.
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-}
-
-impl From<FuseReadError> for i32 {
-    fn from(e: FuseReadError) -> Self {
-        match e {
-            FuseReadError::NotOpen => libc::EBADF,
-            FuseReadError::Io(ref io) => io.raw_os_error().unwrap_or(libc::EIO),
-        }
-    }
-}
-
-/// Error for release operations.
-#[derive(Debug, thiserror::Error)]
-enum FuseReleaseError {
-    /// The file handle was not open.
-    #[error("file handle not open")]
-    NotOpen,
-}
-
-impl From<FuseReleaseError> for i32 {
-    fn from(e: FuseReleaseError) -> Self {
-        match e {
-            FuseReleaseError::NotOpen => libc::EBADF,
-        }
-    }
+fn io_to_errno(e: &std::io::Error) -> i32 {
+    e.raw_os_error().unwrap_or_else(|| match e.kind() {
+        std::io::ErrorKind::NotFound => libc::ENOENT,
+        std::io::ErrorKind::PermissionDenied => libc::EACCES,
+        std::io::ErrorKind::AlreadyExists => libc::EEXIST,
+        _ => libc::EIO,
+    })
 }
 
 mod inner {
@@ -200,14 +158,9 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
         reply: fuser::ReplyEntry,
     ) {
         let result = self.runtime.block_on(async {
-            let tracked = self
-                .inner
-                .get_fs()
-                .lookup(LoadedAddr(parent), name)
-                .await
-                .map_err(FuseIoError)?;
+            let tracked = self.inner.get_fs().lookup(LoadedAddr(parent), name).await?;
             self.inner.ward_inc(tracked.inode.addr);
-            Ok::<_, FuseIoError>(tracked.inode)
+            Ok::<_, std::io::Error>(tracked.inode)
         });
         match result {
             Ok(inode) => {
@@ -217,7 +170,7 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
             }
             Err(e) => {
                 debug!(error = %e, "replying error");
-                reply.error(e.into());
+                reply.error(io_to_errno(&e));
             }
         }
     }
@@ -230,13 +183,9 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
         _fh: Option<u64>,
         reply: fuser::ReplyAttr,
     ) {
-        let result = self.runtime.block_on(async {
-            self.inner
-                .get_fs()
-                .getattr(LoadedAddr(ino))
-                .await
-                .map_err(FuseIoError)
-        });
+        let result = self
+            .runtime
+            .block_on(async { self.inner.get_fs().getattr(LoadedAddr(ino)).await });
         match result {
             Ok(inode) => {
                 let attr = inode_to_fuser_attr(&inode, BLOCK_SIZE);
@@ -245,7 +194,7 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
             }
             Err(e) => {
                 debug!(error = %e, "replying error");
-                reply.error(e.into());
+                reply.error(io_to_errno(&e));
             }
         }
     }
@@ -268,16 +217,15 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
                     entries.push((de.inode.addr, de.name.to_os_string(), de.inode.itype));
                     false
                 })
-                .await
-                .map_err(FuseIoError)?;
-            Ok::<_, FuseIoError>(entries)
+                .await?;
+            Ok::<_, std::io::Error>(entries)
         });
 
         let entries = match result {
             Ok(entries) => entries,
             Err(e) => {
                 debug!(error = %e, "replying error");
-                reply.error(e.into());
+                reply.error(io_to_errno(&e));
                 return;
             }
         };
@@ -310,15 +258,10 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
     fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
         let flags = OpenFlags::from_bits_truncate(flags);
         let result = self.runtime.block_on(async {
-            let open_file = self
-                .inner
-                .get_fs()
-                .open(LoadedAddr(ino), flags)
-                .await
-                .map_err(FuseIoError)?;
+            let open_file = self.inner.get_fs().open(LoadedAddr(ino), flags).await?;
             let fh = open_file.fh;
             self.open_files.insert(fh, Arc::clone(&open_file.reader));
-            Ok::<_, FuseIoError>(fh)
+            Ok::<_, std::io::Error>(fh)
         });
         match result {
             Ok(fh) => {
@@ -327,7 +270,7 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
             }
             Err(e) => {
                 debug!(error = %e, "replying error");
-                reply.error(e.into());
+                reply.error(io_to_errno(&e));
             }
         }
     }
@@ -347,9 +290,12 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
         _lock_owner: Option<u64>,
         reply: fuser::ReplyData,
     ) {
-        let result: Result<_, FuseReadError> = self.runtime.block_on(async {
-            let reader = self.open_files.get(&fh).ok_or(FuseReadError::NotOpen)?;
-            Ok(reader.read(offset.cast_unsigned(), size).await?)
+        let result = self.runtime.block_on(async {
+            let reader = self
+                .open_files
+                .get(&fh)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EBADF))?;
+            reader.read(offset.cast_unsigned(), size).await
         });
         match result {
             Ok(data) => {
@@ -358,7 +304,7 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
             }
             Err(e) => {
                 debug!(error = %e, "replying error");
-                reply.error(e.into());
+                reply.error(io_to_errno(&e));
             }
         }
     }
@@ -377,24 +323,15 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        let result: Result<_, FuseReleaseError> = match self.open_files.remove(&fh) {
-            Some(reader) => {
-                if let Err(e) = self.runtime.block_on(reader.close()) {
-                    debug!(error = %e, "reader close reported error");
-                }
-                Ok(())
+        if let Some(reader) = self.open_files.remove(&fh) {
+            if let Err(e) = self.runtime.block_on(reader.close()) {
+                debug!(error = %e, "reader close reported error");
             }
-            None => Err(FuseReleaseError::NotOpen),
-        };
-        match result {
-            Ok(()) => {
-                debug!("replying ok");
-                reply.ok();
-            }
-            Err(e) => {
-                debug!(error = %e, "replying error");
-                reply.error(e.into());
-            }
+            debug!("replying ok");
+            reply.ok();
+        } else {
+            debug!("file handle not open, replying error");
+            reply.error(libc::EBADF);
         }
     }
 
