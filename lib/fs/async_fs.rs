@@ -368,7 +368,7 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
     ///
     /// # Concurrency
     ///
-    /// The `readdir_populated` check-then-populate is **not** atomic. If two
+    /// The `is_populated` check-then-populate is **not** atomic. If two
     /// concurrent callers invoke `readdir` for the same parent, both may call
     /// `dp.readdir()` and insert duplicate children. This is safe when the
     /// caller serializes access (e.g. via `&mut self` on the `Fs` trait).
