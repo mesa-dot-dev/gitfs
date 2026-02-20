@@ -319,23 +319,18 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
         _lock_owner: Option<u64>,
         reply: fuser::ReplyData,
     ) {
-        let result = self.runtime.block_on(async {
-            let reader = self
-                .open_files
-                .get(&fh)
-                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EBADF))?;
-            reader.read(offset.cast_unsigned(), size).await
-        });
-        match result {
-            Ok(data) => {
+        self.runtime
+            .block_on(async {
+                let reader = self
+                    .open_files
+                    .get(&fh)
+                    .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EBADF))?;
+                reader.read(offset.cast_unsigned(), size).await
+            })
+            .fuse_reply(reply, |data, reply| {
                 debug!(read_bytes = data.len(), "replying...");
                 reply.data(&data);
-            }
-            Err(e) => {
-                debug!(error = %e, "replying error");
-                reply.error(io_to_errno(&e));
-            }
-        }
+            });
     }
 
     #[instrument(
