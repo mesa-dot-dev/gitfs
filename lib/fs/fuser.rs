@@ -240,52 +240,45 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
         ino: u64,
         _fh: u64,
         offset: i64,
-        mut reply: fuser::ReplyDirectory,
+        reply: fuser::ReplyDirectory,
     ) {
         let offset_u64 = offset.cast_unsigned();
-        let result = self.runtime.block_on(async {
-            let mut entries = Vec::new();
-            self.inner
-                .get_fs()
-                .readdir(LoadedAddr(ino), offset_u64, |de, _next_offset| {
-                    entries.push((de.inode.addr, de.name.to_os_string(), de.inode.itype));
-                    false
-                })
-                .await?;
-            Ok::<_, std::io::Error>(entries)
-        });
+        self.runtime
+            .block_on(async {
+                let mut entries = Vec::new();
+                self.inner
+                    .get_fs()
+                    .readdir(LoadedAddr(ino), offset_u64, |de, _next_offset| {
+                        entries.push((de.inode.addr, de.name.to_os_string(), de.inode.itype));
+                        false
+                    })
+                    .await?;
+                Ok::<_, std::io::Error>(entries)
+            })
+            .fuse_reply(reply, |entries, mut reply| {
+                for (i, (entry_ino, entry_name, entry_itype)) in entries.iter().enumerate() {
+                    let kind = inode_type_to_fuser(*entry_itype);
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "offset fits in usize on supported 64-bit platforms"
+                    )]
+                    let abs_idx = offset_u64 as usize + i + 1;
+                    let Ok(idx): Result<i64, _> = abs_idx.try_into() else {
+                        error!("Directory entry index {} too large for fuser", abs_idx);
+                        reply.error(libc::EIO);
+                        return;
+                    };
 
-        let entries = match result {
-            Ok(entries) => entries,
-            Err(e) => {
-                debug!(error = %e, "replying error");
-                reply.error(io_to_errno(&e));
-                return;
-            }
-        };
+                    debug!(?entry_name, ino = entry_ino, "adding entry to reply...");
+                    if reply.add(*entry_ino, idx, kind, entry_name) {
+                        debug!("buffer full for now, stopping readdir");
+                        break;
+                    }
+                }
 
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "offset fits in usize on supported 64-bit platforms"
-        )]
-        for (i, (entry_ino, entry_name, entry_itype)) in entries.iter().enumerate() {
-            let kind = inode_type_to_fuser(*entry_itype);
-            let abs_idx = offset_u64 as usize + i + 1;
-            let Ok(idx): Result<i64, _> = abs_idx.try_into() else {
-                error!("Directory entry index {} too large for fuser", abs_idx);
-                reply.error(libc::EIO);
-                return;
-            };
-
-            debug!(?entry_name, ino = entry_ino, "adding entry to reply...");
-            if reply.add(*entry_ino, idx, kind, entry_name) {
-                debug!("buffer full for now, stopping readdir");
-                break;
-            }
-        }
-
-        debug!("finalizing reply...");
-        reply.ok();
+                debug!("finalizing reply...");
+                reply.ok();
+            });
     }
 
     #[instrument(name = "FuserAdapter::open", skip(self, _req, flags, reply))]
