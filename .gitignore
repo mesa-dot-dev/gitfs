@@ -1,8 +1,5 @@
 /target
 
-# Agent Blame local database (legacy)
-.agentblame/
-
 !.opencode/
 
 # Python
