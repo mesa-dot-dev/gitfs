@@ -3,6 +3,8 @@
 pub mod async_fs;
 /// Lock-free bidirectional inode address mapping.
 pub mod bridge;
+/// Generic composite filesystem types.
+pub mod composite;
 /// Directory entry cache for fast parent-child lookups.
 pub mod dcache;
 /// FUSE adapter: maps [`fuser::Filesystem`] callbacks to [`async_fs::AsyncFs`].
