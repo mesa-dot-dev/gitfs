@@ -23,6 +23,56 @@ fn io_to_errno(e: &std::io::Error) -> i32 {
     })
 }
 
+/// Trait abstracting the `.error(errno)` method common to all fuser reply types.
+trait FuseReply {
+    fn error(self, errno: i32);
+}
+
+macro_rules! impl_fuse_reply {
+    ($($ty:ty),* $(,)?) => {
+        $(impl FuseReply for $ty {
+            fn error(self, errno: i32) {
+                // Calls the inherent fuser method (not this trait method).
+                self.error(errno);
+            }
+        })*
+    };
+}
+
+// ReplyEmpty and ReplyStatfs are excluded: release and statfs
+// do not follow the block_on -> fuse_reply pattern.
+impl_fuse_reply!(
+    fuser::ReplyEntry,
+    fuser::ReplyAttr,
+    fuser::ReplyDirectory,
+    fuser::ReplyOpen,
+    fuser::ReplyData,
+);
+
+/// Extension trait on `Result<T, std::io::Error>` for FUSE reply handling.
+///
+/// Centralizes the error-logging + errno-reply path so each FUSE callback
+/// only has to express its success path.
+#[expect(
+    dead_code,
+    reason = "will be used by FUSE callbacks in upcoming commits"
+)]
+trait FuseResultExt<T> {
+    fn fuse_reply<R: FuseReply>(self, reply: R, on_ok: impl FnOnce(T, R));
+}
+
+impl<T> FuseResultExt<T> for Result<T, std::io::Error> {
+    fn fuse_reply<R: FuseReply>(self, reply: R, on_ok: impl FnOnce(T, R)) {
+        match self {
+            Ok(val) => on_ok(val, reply),
+            Err(e) => {
+                debug!(error = %e, "replying error");
+                reply.error(io_to_errno(&e));
+            }
+        }
+    }
+}
+
 mod inner {
     #![allow(clippy::future_not_send, clippy::mem_forget)]
 
