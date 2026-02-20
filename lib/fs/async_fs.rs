@@ -193,9 +193,6 @@ pub struct AsyncFs<'tbl, DP: FsDataProvider> {
 
     /// Monotonically increasing file handle counter. Starts at 1 (0 is reserved).
     next_fh: AtomicU64,
-
-    /// Tracks which directories have had their children fetched via `dp.readdir`.
-    readdir_populated: FutureBackedCache<LoadedAddr, ()>,
 }
 
 impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
@@ -215,7 +212,6 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
             directory_cache: DCache::new(),
             data_provider,
             next_fh: AtomicU64::new(1),
-            readdir_populated: FutureBackedCache::default(),
         }
     }
 
@@ -235,7 +231,6 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
             directory_cache: DCache::new(),
             data_provider,
             next_fh: AtomicU64::new(1),
-            readdir_populated: FutureBackedCache::default(),
         }
     }
 
@@ -392,7 +387,7 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
         }
 
         // Populate the directory cache on first readdir for this parent.
-        if self.readdir_populated.get(&parent).await.is_none() {
+        if !self.directory_cache.is_populated(parent) {
             let children = self.data_provider.readdir(parent_inode).await?;
             for (name, child_inode) in children {
                 self.inode_table
@@ -407,9 +402,7 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
                     )
                     .await;
             }
-            self.readdir_populated
-                .get_or_init(parent, || async {})
-                .await;
+            self.directory_cache.mark_populated(parent);
         }
 
         let mut children = self.directory_cache.readdir(parent).await;
