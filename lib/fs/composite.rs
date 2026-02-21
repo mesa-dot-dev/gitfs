@@ -128,7 +128,7 @@ impl<R: FileReader> FileReader for CompositeReader<R> {
 
 struct ChildSlot<DP: FsDataProvider> {
     inner: Arc<ChildInner<DP>>,
-    bridge: ConcurrentBridge,
+    bridge: Arc<ConcurrentBridge>,
 }
 
 struct CompositeFsInner<R: CompositeRoot> {
@@ -237,7 +237,7 @@ impl<R: CompositeRoot> CompositeFs<R> {
         table.insert_sync(desc.root_ino.addr, desc.root_ino);
         let child_inner = Arc::new(ChildInner::create(table, desc.provider.clone()));
 
-        let bridge = ConcurrentBridge::new();
+        let bridge = Arc::new(ConcurrentBridge::new());
         bridge.insert(outer_ino, desc.root_ino.addr);
 
         drop(self.inner.slots.insert_sync(
@@ -261,51 +261,29 @@ impl<R: CompositeRoot> CompositeFs<R> {
     where
         R::ChildDP: Clone,
     {
-        // Fast path: already registered by name.
         match self.inner.name_to_slot.entry_sync(desc.name.clone()) {
-            scc::hash_map::Entry::Occupied(occ) => {
+            scc::hash_map::Entry::Occupied(mut occ) => {
                 let slot_idx = *occ.get();
-                // Return existing outer address for this child's root inode.
-                if let Some(outer) = self
+                // Extract bridge Arc from the slot guard, then query outside.
+                let bridge = self
                     .inner
                     .slots
-                    .read_sync(&slot_idx, |_, slot| {
-                        slot.bridge.backward(desc.root_ino.addr)
-                    })
-                    .flatten()
-                {
+                    .read_sync(&slot_idx, |_, slot| Arc::clone(&slot.bridge));
+                if let Some(outer) = bridge.and_then(|b| b.backward(desc.root_ino.addr)) {
                     return outer;
                 }
-                // Slot exists but bridge has no mapping — should not happen,
-                // but fall through to create a fresh slot below.
-                // (Remove stale name entry so the vacant path can re-insert.)
-                //
-                // Race window: between `drop(occ)` and the `remove_sync` below,
-                // another thread could read the stale entry and resolve to a
-                // broken slot. In the worst case two threads create separate
-                // slots for the same child — the last writer to `name_to_slot`
-                // wins and the other slot becomes orphaned. This is functionally
-                // harmless: the orphaned slot is never reached via name lookup
-                // and will not serve any future requests.
-                drop(occ);
-                self.inner.name_to_slot.remove_sync(&desc.name);
+                // Slot exists but bridge has no mapping — replace in-place
+                // while still holding the entry guard to prevent races.
+                let (outer_ino, new_slot_idx) = self.create_child_slot(desc);
+                *occ.get_mut() = new_slot_idx;
+                outer_ino
             }
             scc::hash_map::Entry::Vacant(vac) => {
                 let (outer_ino, slot_idx) = self.create_child_slot(desc);
                 vac.insert_entry(slot_idx);
-                return outer_ino;
+                outer_ino
             }
         }
-
-        // Fallback: name was stale, create fresh. This path is rare.
-        let (outer_ino, slot_idx) = self.create_child_slot(desc);
-        drop(
-            self.inner
-                .name_to_slot
-                .insert_sync(desc.name.clone(), slot_idx),
-        );
-
-        outer_ino
     }
 }
 
@@ -334,12 +312,16 @@ where
                 .read_sync(&parent.addr, |_, &v| v)
                 .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
-            // Extract Arc<ChildInner> and inner parent address under the guard.
-            let (child, inner_parent) = self
+            // Extract Arc<ChildInner>, bridge, and inner parent address under the guard.
+            let (child, bridge, inner_parent) = self
                 .inner
                 .slots
                 .read_sync(&slot_idx, |_, slot| {
-                    (Arc::clone(&slot.inner), slot.bridge.forward(parent.addr))
+                    (
+                        Arc::clone(&slot.inner),
+                        Arc::clone(&slot.bridge),
+                        slot.bridge.forward(parent.addr),
+                    )
                 })
                 .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
@@ -353,17 +335,10 @@ where
                 .await?;
             let child_inode = tracked.inode;
 
-            // Translate inner address back to composite-level address.
-            let outer_ino = self
-                .inner
-                .slots
-                .read_sync(&slot_idx, |_, slot| {
-                    let next_ino = &self.inner.next_ino;
-                    slot.bridge.backward_or_insert(child_inode.addr, || {
-                        next_ino.fetch_add(1, Ordering::Relaxed)
-                    })
-                })
-                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+            // Translate inner address back to composite-level address (outside scc guard).
+            let outer_ino = bridge.backward_or_insert(child_inode.addr, || {
+                self.inner.next_ino.fetch_add(1, Ordering::Relaxed)
+            });
 
             let _ = self.inner.addr_to_slot.insert_sync(outer_ino, slot_idx);
 
@@ -390,11 +365,15 @@ where
                 .read_sync(&parent.addr, |_, &v| v)
                 .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
-            let (child, inner_parent) = self
+            let (child, bridge, inner_parent) = self
                 .inner
                 .slots
                 .read_sync(&slot_idx, |_, slot| {
-                    (Arc::clone(&slot.inner), slot.bridge.forward(parent.addr))
+                    (
+                        Arc::clone(&slot.inner),
+                        Arc::clone(&slot.bridge),
+                        slot.bridge.forward(parent.addr),
+                    )
                 })
                 .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
@@ -411,19 +390,12 @@ where
                 })
                 .await?;
 
-            // Translate all inner addresses to composite-level addresses.
+            // Translate all inner addresses to composite-level addresses (outside scc guard).
             let mut entries = Vec::with_capacity(child_entries.len());
             for (name, child_inode) in child_entries {
-                let outer_ino = self
-                    .inner
-                    .slots
-                    .read_sync(&slot_idx, |_, slot| {
-                        let next_ino = &self.inner.next_ino;
-                        slot.bridge.backward_or_insert(child_inode.addr, || {
-                            next_ino.fetch_add(1, Ordering::Relaxed)
-                        })
-                    })
-                    .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+                let outer_ino = bridge.backward_or_insert(child_inode.addr, || {
+                    self.inner.next_ino.fetch_add(1, Ordering::Relaxed)
+                });
 
                 let _ = self.inner.addr_to_slot.insert_sync(outer_ino, slot_idx);
                 entries.push((
@@ -461,5 +433,16 @@ where
         Ok(CompositeReader {
             inner: open_file.reader,
         })
+    }
+
+    fn forget(&self, addr: InodeAddr) {
+        if addr == Self::ROOT_INO {
+            return;
+        }
+        if let Some((_, slot_idx)) = self.inner.addr_to_slot.remove_sync(&addr) {
+            self.inner
+                .slots
+                .read_sync(&slot_idx, |_, slot| slot.bridge.remove_by_outer(addr));
+        }
     }
 }

@@ -389,6 +389,13 @@ impl FsDataProvider for OrgChildDP {
             }
         }
     }
+
+    fn forget(&self, addr: InodeAddr) {
+        match self {
+            Self::Standard(c) => c.forget(addr),
+            Self::Github(c) => c.forget(addr),
+        }
+    }
 }
 
 pub enum OrgChildReader {

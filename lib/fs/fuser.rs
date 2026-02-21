@@ -83,12 +83,16 @@ mod inner {
     ///
     /// Both `ward` and `fs` borrow from `table`. The ward manages inode
     /// refcounts; the fs serves lookup/readdir/open/read operations.
+    ///
+    /// The ward context is `(&table, DP)` so that [`InodeForget`] can both
+    /// remove the inode from the table and call `dp.forget()` to clean up
+    /// provider-internal maps (bridge mappings, path maps, etc.).
     #[self_referencing]
     pub(super) struct FuseBridgeInner<DP: FsDataProvider> {
         table: FutureBackedCache<InodeAddr, INode>,
         #[borrows(table)]
         #[not_covariant]
-        ward: DropWard<&'this FutureBackedCache<InodeAddr, INode>, InodeAddr, InodeForget>,
+        ward: DropWard<(&'this FutureBackedCache<InodeAddr, INode>, DP), InodeAddr, InodeForget>,
         #[borrows(table)]
         #[covariant]
         fs: AsyncFs<'this, DP>,
@@ -96,9 +100,10 @@ mod inner {
 
     impl<DP: FsDataProvider> FuseBridgeInner<DP> {
         pub(super) fn create(table: FutureBackedCache<InodeAddr, INode>, provider: DP) -> Self {
+            let ward_provider = provider.clone();
             FuseBridgeInnerBuilder {
                 table,
-                ward_builder: |tbl| DropWard::new(tbl),
+                ward_builder: |tbl| DropWard::new((tbl, ward_provider)),
                 fs_builder: |tbl| AsyncFs::new_preseeded(provider, tbl),
             }
             .build()

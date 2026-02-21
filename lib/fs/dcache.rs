@@ -1,6 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::fs::LoadedAddr;
 
@@ -13,17 +13,32 @@ pub struct DValue {
     pub is_dir: bool,
 }
 
+/// Population states for a directory.
+const POPULATE_UNCLAIMED: u8 = 0;
+const POPULATE_IN_PROGRESS: u8 = 1;
+const POPULATE_DONE: u8 = 2;
+
+/// Result of attempting to claim a directory for population.
+pub enum PopulateStatus {
+    /// This caller won the race and should populate the directory.
+    Claimed,
+    /// Another caller is currently populating; wait and re-check.
+    InProgress,
+    /// The directory is already fully populated.
+    Done,
+}
+
 /// Per-parent directory state holding child entries and a population flag.
 struct DirState {
     children: scc::HashMap<OsString, DValue>,
-    populated: AtomicBool,
+    populated: AtomicU8,
 }
 
 impl DirState {
     fn new() -> Self {
         Self {
             children: scc::HashMap::new(),
-            populated: AtomicBool::new(false),
+            populated: AtomicU8::new(POPULATE_UNCLAIMED),
         }
     }
 }
@@ -73,9 +88,7 @@ impl DCache {
     #[must_use]
     pub fn lookup(&self, parent_ino: LoadedAddr, name: &OsStr) -> Option<DValue> {
         let state = self.dirs.read_sync(&parent_ino, |_, v| Arc::clone(v))?;
-        state
-            .children
-            .read_sync(&name.to_os_string(), |_, v| v.clone())
+        state.children.read_sync(name, |_, v| v.clone())
     }
 
     /// Atomically inserts or overwrites a child entry in the cache.
@@ -107,17 +120,50 @@ impl DCache {
         entries
     }
 
-    /// Returns `true` if the directory at `parent_ino` has been fully populated.
-    #[must_use]
-    pub fn is_populated(&self, parent_ino: LoadedAddr) -> bool {
-        self.dirs
-            .read_sync(&parent_ino, |_, v| v.populated.load(Ordering::Acquire))
-            .unwrap_or(false)
+    /// Atomically try to claim a directory for population.
+    ///
+    /// Uses `compare_exchange` on the three-state flag:
+    /// - `UNCLAIMED → IN_PROGRESS`: returns `Claimed` (caller should populate)
+    /// - Already `IN_PROGRESS`: returns `InProgress` (caller should wait)
+    /// - Already `DONE`: returns `Done` (nothing to do)
+    pub fn try_claim_populate(&self, parent_ino: LoadedAddr) -> PopulateStatus {
+        let state = self.dir_state(parent_ino);
+        match state.populated.compare_exchange(
+            POPULATE_UNCLAIMED,
+            POPULATE_IN_PROGRESS,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => PopulateStatus::Claimed,
+            Err(POPULATE_IN_PROGRESS) => PopulateStatus::InProgress,
+            Err(_) => PopulateStatus::Done,
+        }
     }
 
-    /// Marks the directory at `parent_ino` as fully populated.
-    pub fn mark_populated(&self, parent_ino: LoadedAddr) {
+    /// Mark a directory as fully populated after successful population.
+    pub fn finish_populate(&self, parent_ino: LoadedAddr) {
         let state = self.dir_state(parent_ino);
-        state.populated.store(true, Ordering::Release);
+        state.populated.store(POPULATE_DONE, Ordering::Release);
+    }
+
+    /// Abort a population attempt, resetting back to unclaimed so another
+    /// caller can retry.
+    pub fn abort_populate(&self, parent_ino: LoadedAddr) {
+        let state = self.dir_state(parent_ino);
+        state.populated.store(POPULATE_UNCLAIMED, Ordering::Release);
+    }
+
+    /// Wait until a directory is no longer in the `InProgress` state.
+    pub async fn wait_populated(&self, parent_ino: LoadedAddr) {
+        loop {
+            let current = self
+                .dirs
+                .read_sync(&parent_ino, |_, v| v.populated.load(Ordering::Acquire))
+                .unwrap_or(POPULATE_UNCLAIMED);
+            if current != POPULATE_IN_PROGRESS {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
     }
 }

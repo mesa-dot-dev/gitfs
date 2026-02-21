@@ -64,6 +64,12 @@ pub trait FsDataProvider: Clone + Send + Sync + 'static {
         inode: INode,
         flags: OpenFlags,
     ) -> impl Future<Output = Result<Self::Reader, std::io::Error>> + Send;
+
+    /// Called when the kernel forgets an inode (refcount reaches zero).
+    ///
+    /// Implementations should clean up any internal mappings for the given
+    /// address (e.g. bridge maps, path maps). The default is a no-op.
+    fn forget(&self, _addr: InodeAddr) {}
 }
 
 /// Zero-sized tag whose [`StatelessDrop`] implementation automatically evicts
@@ -73,6 +79,15 @@ pub struct InodeForget;
 impl<'a> StatelessDrop<&'a FutureBackedCache<InodeAddr, INode>, InodeAddr> for InodeForget {
     fn delete(inode_table: &&'a FutureBackedCache<InodeAddr, INode>, addr: &InodeAddr) {
         inode_table.remove_sync(addr);
+    }
+}
+
+impl<'a, DP: FsDataProvider> StatelessDrop<(&'a FutureBackedCache<InodeAddr, INode>, DP), InodeAddr>
+    for InodeForget
+{
+    fn delete(ctx: &(&'a FutureBackedCache<InodeAddr, INode>, DP), key: &InodeAddr) {
+        ctx.0.remove_sync(key);
+        ctx.1.forget(*key);
     }
 }
 
@@ -283,14 +298,14 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
         // Inode was evicted from the table — fall through to the slow path.
 
         let name_owned = name.to_os_string();
-        let name_for_cache = name_owned.clone();
         let lookup_key = (parent.0, name_owned.clone());
         let dp = self.data_provider.clone();
 
         let child = self
             .lookup_cache
-            .get_or_try_init(lookup_key, || async move {
-                dp.lookup(parent_ino, &name_owned).await
+            .get_or_try_init(lookup_key, || {
+                let name_for_dp = name_owned.clone();
+                async move { dp.lookup(parent_ino, &name_for_dp).await }
             })
             .await?;
 
@@ -301,7 +316,7 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
         self.directory_cache
             .insert(
                 parent,
-                name_for_cache,
+                name_owned,
                 LoadedAddr(child.addr),
                 matches!(child.itype, INodeType::Directory),
             )
@@ -366,12 +381,6 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
     /// returns `true` (indicating the caller's buffer is full), iteration
     /// stops early.
     ///
-    /// # Concurrency
-    ///
-    /// The `is_populated` check-then-populate is **not** atomic. If two
-    /// concurrent callers invoke `readdir` for the same parent, both may call
-    /// `dp.readdir()` and insert duplicate children.
-    ///
     /// TODO(MES-746): Implement `opendir` and `releasedir` to snapshot directory contents and
     ///                avoid racing with `lookup`/`createfile`.
     pub async fn readdir(
@@ -380,28 +389,48 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
         offset: u64,
         mut filler: impl FnMut(DirEntry<'_>, u64) -> bool,
     ) -> Result<(), std::io::Error> {
+        use crate::fs::dcache::PopulateStatus;
+
         let parent_inode = self.loaded_inode(parent).await?;
         if parent_inode.itype != INodeType::Directory {
             return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
         }
 
         // Populate the directory cache on first readdir for this parent.
-        if !self.directory_cache.is_populated(parent) {
-            let children = self.data_provider.readdir(parent_inode).await?;
-            for (name, child_inode) in children {
-                self.inode_table
-                    .get_or_init(child_inode.addr, || async move { child_inode })
-                    .await;
-                self.directory_cache
-                    .insert(
-                        parent,
-                        name,
-                        LoadedAddr(child_inode.addr),
-                        child_inode.itype == INodeType::Directory,
-                    )
-                    .await;
+        // Uses a three-state CAS gate to prevent duplicate dp.readdir() calls.
+        loop {
+            match self.directory_cache.try_claim_populate(parent) {
+                PopulateStatus::Claimed => {
+                    match self.data_provider.readdir(parent_inode).await {
+                        Ok(children) => {
+                            for (name, child_inode) in children {
+                                self.inode_table
+                                    .get_or_init(child_inode.addr, || async move { child_inode })
+                                    .await;
+                                self.directory_cache
+                                    .insert(
+                                        parent,
+                                        name,
+                                        LoadedAddr(child_inode.addr),
+                                        child_inode.itype == INodeType::Directory,
+                                    )
+                                    .await;
+                            }
+                            self.directory_cache.finish_populate(parent);
+                        }
+                        Err(e) => {
+                            self.directory_cache.abort_populate(parent);
+                            return Err(e);
+                        }
+                    }
+                    break;
+                }
+                PopulateStatus::InProgress => {
+                    self.directory_cache.wait_populated(parent).await;
+                    // Re-check: the populator may have aborted.
+                }
+                PopulateStatus::Done => break,
             }
-            self.directory_cache.mark_populated(parent);
         }
 
         let mut children = self.directory_cache.readdir(parent).await;

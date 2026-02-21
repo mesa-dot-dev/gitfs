@@ -7,6 +7,7 @@
 //! Note that this cache does not support automatic eviction.
 
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fmt::Debug, future::Future, hash::Hash, pin::Pin};
 
 use futures::FutureExt as _;
@@ -17,10 +18,12 @@ type SharedFut<V> = Shared<Pin<Box<dyn Future<Output = Option<V>> + Send>>>;
 /// Two-state slot: `InFlight` while a factory future is running, then promoted to `Ready` once
 /// the future completes.
 ///
-/// The `InFlight` variant holds a `Shared<..., Output = Option<V>>` where `None` signals that the
-/// factory panicked (caught by `catch_unwind`). On `None`, callers remove the entry and retry.
+/// The `InFlight` variant holds a generation counter and a `Shared<..., Output = Option<V>>`
+/// where `None` signals that the factory panicked (caught by `catch_unwind`). On `None`, callers
+/// remove the entry only if the generation matches, avoiding destruction of a valid re-inserted
+/// entry.
 enum Slot<V: Clone + Send + 'static> {
-    InFlight(SharedFut<V>),
+    InFlight(u64, SharedFut<V>),
     Ready(V),
 }
 
@@ -30,6 +33,7 @@ enum Slot<V: Clone + Send + 'static> {
 /// invocation of the factory runs. All callers receive a clone of the result.
 pub struct FutureBackedCache<K, V: Clone + Send + 'static> {
     map: scc::HashMap<K, Slot<V>>,
+    next_gen: AtomicU64,
 }
 
 impl<K, V> Default for FutureBackedCache<K, V>
@@ -40,6 +44,7 @@ where
     fn default() -> Self {
         Self {
             map: scc::HashMap::default(),
+            next_gen: AtomicU64::new(0),
         }
     }
 }
@@ -69,14 +74,14 @@ where
             .map
             .read_async(&key, |_, slot| match slot {
                 Slot::Ready(v) => Ok(v.clone()),
-                Slot::InFlight(shared) => Err(shared.clone()),
+                Slot::InFlight(generation, shared) => Err((*generation, shared.clone())),
             })
             .await;
 
         match existing {
             Some(Ok(v)) => return v,
-            Some(Err(shared)) => {
-                if let Some(v) = self.await_shared(&key, shared).await {
+            Some(Err((generation, shared))) => {
+                if let Some(v) = self.await_shared(&key, generation, shared).await {
                     return v;
                 }
                 // Factory panicked; entry removed. Fall through to re-insert below.
@@ -85,20 +90,21 @@ where
         }
 
         // Slow path: use entry_async for atomic check-and-insert.
-        let shared = match self.map.entry_async(key.clone()).await {
+        let (generation, shared) = match self.map.entry_async(key.clone()).await {
             scc::hash_map::Entry::Occupied(occ) => match occ.get() {
                 Slot::Ready(v) => return v.clone(),
-                Slot::InFlight(shared) => shared.clone(),
+                Slot::InFlight(g, shared) => (*g, shared.clone()),
             },
             scc::hash_map::Entry::Vacant(vac) => {
+                let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
                 let shared = Self::make_shared(factory);
                 let ret = shared.clone();
-                vac.insert_entry(Slot::InFlight(shared));
-                ret
+                vac.insert_entry(Slot::InFlight(generation, shared));
+                (generation, ret)
             }
         };
 
-        if let Some(v) = self.await_shared(&key, shared).await {
+        if let Some(v) = self.await_shared(&key, generation, shared).await {
             return v;
         }
 
@@ -124,14 +130,14 @@ where
             .map
             .read_async(&key, |_, slot| match slot {
                 Slot::Ready(v) => Ok(v.clone()),
-                Slot::InFlight(shared) => Err(shared.clone()),
+                Slot::InFlight(generation, shared) => Err((*generation, shared.clone())),
             })
             .await;
 
         match existing {
             Some(Ok(v)) => return Ok(v),
-            Some(Err(shared)) => {
-                if let Some(v) = self.await_shared(&key, shared).await {
+            Some(Err((generation, shared))) => {
+                if let Some(v) = self.await_shared(&key, generation, shared).await {
                     return Ok(v);
                 }
                 // Factory panicked; entry was removed. Fall through to run our own factory.
@@ -147,10 +153,13 @@ where
         match self.map.entry_async(key).await {
             scc::hash_map::Entry::Occupied(occ) => match occ.get() {
                 Slot::Ready(v) => Ok(v.clone()),
-                Slot::InFlight(shared) => Ok(self
-                    .await_shared(occ.key(), shared.clone())
-                    .await
-                    .unwrap_or(val)),
+                Slot::InFlight(g, shared) => {
+                    let generation = *g;
+                    Ok(self
+                        .await_shared(occ.key(), generation, shared.clone())
+                        .await
+                        .unwrap_or(val))
+                }
             },
             scc::hash_map::Entry::Vacant(vac) => {
                 vac.insert_entry(Slot::Ready(val.clone()));
@@ -170,25 +179,30 @@ where
             .map
             .read_async(key, |_, slot| match slot {
                 Slot::Ready(v) => Ok(v.clone()),
-                Slot::InFlight(shared) => Err(shared.clone()),
+                Slot::InFlight(generation, shared) => Err((*generation, shared.clone())),
             })
             .await;
 
         match existing {
             Some(Ok(v)) => Some(v),
-            Some(Err(shared)) => self.await_shared(key, shared).await,
+            Some(Err((generation, shared))) => self.await_shared(key, generation, shared).await,
             None => None,
         }
     }
 
     /// Await a `Shared` future, handle promotion to `Ready`, and handle panic recovery.
     ///
+    /// The `observed_gen` parameter is the generation of the `InFlight` slot that was read.
+    /// On panic recovery, only the entry with this exact generation is removed, preventing
+    /// destruction of a valid entry re-inserted by a recovered thread.
+    ///
     /// Returns `Some(v)` on success. Returns `None` if the factory panicked, after removing
     /// the poisoned entry from the map.
-    async fn await_shared(&self, key: &K, shared: SharedFut<V>) -> Option<V> {
+    async fn await_shared(&self, key: &K, observed_gen: u64, shared: SharedFut<V>) -> Option<V> {
         let mut guard = PromoteGuard {
             map: &self.map,
             key,
+            observed_gen,
             value: None,
         };
 
@@ -199,7 +213,7 @@ where
 
             self.map
                 .update_async(key, |_, slot| {
-                    if matches!(slot, Slot::InFlight(_)) {
+                    if matches!(slot, Slot::InFlight(g, _) if *g == observed_gen) {
                         *slot = Slot::Ready(v.clone());
                     }
                 })
@@ -209,11 +223,11 @@ where
             Some(v)
         } else {
             // Factory panicked. Remove the poisoned InFlight entry so the next caller
-            // can retry.
-            drop(
-                self.map
-                    .remove_if_sync(key, |slot| matches!(slot, Slot::InFlight(_))),
-            );
+            // can retry — but only if the generation matches our observation.
+            drop(self.map.remove_if_sync(
+                key,
+                |slot| matches!(slot, Slot::InFlight(g, _) if *g == observed_gen),
+            ));
             None
         }
     }
@@ -270,6 +284,7 @@ where
 {
     map: &'a scc::HashMap<K, Slot<V>>,
     key: &'a K,
+    observed_gen: u64,
     value: Option<V>,
 }
 
@@ -280,8 +295,9 @@ where
 {
     fn drop(&mut self) {
         if let Some(v) = self.value.take() {
+            let generation = self.observed_gen;
             self.map.update_sync(self.key, |_, slot| {
-                if matches!(slot, Slot::InFlight(_)) {
+                if matches!(slot, Slot::InFlight(g, _) if *g == generation) {
                     *slot = Slot::Ready(v);
                 }
             });

@@ -71,8 +71,7 @@ impl MesRepoProvider {
     }
 
     /// Remove the path entry for an inode. Called during forget/cleanup.
-    #[expect(dead_code, reason = "will be needed when child forget is implemented")]
-    pub(super) fn remove_path(&self, addr: InodeAddr) {
+    fn remove_path(&self, addr: InodeAddr) {
         self.inner.path_map.remove_sync(&addr);
     }
 
@@ -275,6 +274,10 @@ impl FsDataProvider for MesRepoProvider {
                 inode_addr: inode.addr,
             })
         }
+    }
+
+    fn forget(&self, addr: InodeAddr) {
+        self.remove_path(addr);
     }
 }
 

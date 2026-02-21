@@ -3,7 +3,7 @@
 use std::ffi::{OsStr, OsString};
 
 use git_fs::fs::LoadedAddr;
-use git_fs::fs::dcache::DCache;
+use git_fs::fs::dcache::{DCache, PopulateStatus};
 
 #[tokio::test]
 async fn lookup_returns_none_for_missing_entry() {
@@ -51,16 +51,53 @@ async fn readdir_empty_parent_returns_empty() {
 }
 
 #[tokio::test]
-async fn is_populated_false_by_default() {
+async fn try_claim_populate_unclaimed_returns_claimed() {
     let cache = DCache::new();
-    assert!(!cache.is_populated(LoadedAddr(1)));
+    assert!(matches!(
+        cache.try_claim_populate(LoadedAddr(1)),
+        PopulateStatus::Claimed
+    ));
 }
 
 #[tokio::test]
-async fn mark_populated_then_check() {
+async fn finish_populate_then_claim_returns_done() {
     let cache = DCache::new();
-    cache.mark_populated(LoadedAddr(1));
-    assert!(cache.is_populated(LoadedAddr(1)));
+    assert!(matches!(
+        cache.try_claim_populate(LoadedAddr(1)),
+        PopulateStatus::Claimed
+    ));
+    cache.finish_populate(LoadedAddr(1));
+    assert!(matches!(
+        cache.try_claim_populate(LoadedAddr(1)),
+        PopulateStatus::Done
+    ));
+}
+
+#[tokio::test]
+async fn double_claim_returns_in_progress() {
+    let cache = DCache::new();
+    assert!(matches!(
+        cache.try_claim_populate(LoadedAddr(1)),
+        PopulateStatus::Claimed
+    ));
+    assert!(matches!(
+        cache.try_claim_populate(LoadedAddr(1)),
+        PopulateStatus::InProgress
+    ));
+}
+
+#[tokio::test]
+async fn abort_populate_allows_reclaim() {
+    let cache = DCache::new();
+    assert!(matches!(
+        cache.try_claim_populate(LoadedAddr(1)),
+        PopulateStatus::Claimed
+    ));
+    cache.abort_populate(LoadedAddr(1));
+    assert!(matches!(
+        cache.try_claim_populate(LoadedAddr(1)),
+        PopulateStatus::Claimed
+    ));
 }
 
 #[tokio::test]
@@ -70,7 +107,10 @@ async fn insert_does_not_mark_populated() {
         .insert(LoadedAddr(1), OsString::from("foo"), LoadedAddr(10), false)
         .await;
     assert!(
-        !cache.is_populated(LoadedAddr(1)),
+        matches!(
+            cache.try_claim_populate(LoadedAddr(1)),
+            PopulateStatus::Claimed
+        ),
         "insert alone should not mark a directory as populated"
     );
 }
