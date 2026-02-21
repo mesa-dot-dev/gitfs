@@ -47,12 +47,29 @@ impl ConcurrentBridge {
     }
 
     /// Resolve outer -> inner.
+    ///
+    /// This read is **not** serialized with mutations. A concurrent [`insert`]
+    /// may have completed the forward entry but not yet the backward entry (or
+    /// vice versa for [`remove_by_outer`]). Callers must tolerate stale or
+    /// transiently-missing results. Use [`backward_or_insert`] when
+    /// cross-map consistency is required.
+    ///
+    /// [`insert`]: Self::insert
+    /// [`remove_by_outer`]: Self::remove_by_outer
+    /// [`backward_or_insert`]: Self::backward_or_insert
     #[must_use]
     pub fn forward(&self, outer: InodeAddr) -> Option<InodeAddr> {
         self.fwd.read_sync(&outer, |_, &v| v)
     }
 
     /// Resolve inner -> outer.
+    ///
+    /// This read is **not** serialized with mutations. See [`forward`] for
+    /// the consistency caveats. Use [`backward_or_insert`] when cross-map
+    /// consistency is required.
+    ///
+    /// [`forward`]: Self::forward
+    /// [`backward_or_insert`]: Self::backward_or_insert
     #[must_use]
     pub fn backward(&self, inner: InodeAddr) -> Option<InodeAddr> {
         self.bwd.read_sync(&inner, |_, &v| v)

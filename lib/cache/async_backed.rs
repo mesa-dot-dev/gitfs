@@ -62,8 +62,10 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if this caller joins an in-flight factory that itself panicked (i.e. the caller
-    /// lost the race to insert a fresh entry after the poisoned slot was removed).
+    /// Panics only if *this* caller's own factory panicked (i.e. this caller won the `Vacant`
+    /// slot and the factory it spawned panicked). Joiners who observe a panicked factory loop
+    /// back to `entry_async` so a new owner is elected, matching the retry semantics of
+    /// [`get_or_try_init`](Self::get_or_try_init).
     pub async fn get_or_init<F, Fut>(&self, key: K, factory: F) -> V
     where
         F: FnOnce() -> Fut,
@@ -84,31 +86,50 @@ where
                 if let Some(v) = self.await_shared(&key, generation, shared).await {
                     return v;
                 }
-                // Factory panicked; entry removed. Fall through to re-insert below.
+                // Factory panicked; entry removed. Fall through to slow path.
             }
             None => {}
         }
 
-        // Slow path: use entry_async for atomic check-and-insert.
-        let (generation, shared) = match self.map.entry_async(key.clone()).await {
-            scc::hash_map::Entry::Occupied(occ) => match occ.get() {
-                Slot::Ready(v) => return v.clone(),
-                Slot::InFlight(g, shared) => (*g, shared.clone()),
-            },
-            scc::hash_map::Entry::Vacant(vac) => {
-                let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
-                let shared = Self::make_shared(factory);
-                let ret = shared.clone();
-                vac.insert_entry(Slot::InFlight(generation, shared));
-                (generation, ret)
+        // Slow path: claim a slot or join an existing in-flight computation.
+        // Wrapped in `Option` so the `FnOnce` factory can be consumed exactly
+        // once inside the loop (only in the `Vacant` branch, which always returns).
+        let mut factory = Some(factory);
+
+        loop {
+            match self.map.entry_async(key.clone()).await {
+                scc::hash_map::Entry::Occupied(occ) => match occ.get() {
+                    Slot::Ready(v) => return v.clone(),
+                    Slot::InFlight(g, shared) => {
+                        let (generation, shared) = (*g, shared.clone());
+                        drop(occ);
+                        if let Some(v) = self.await_shared(&key, generation, shared).await {
+                            return v;
+                        }
+                        // In-flight failed. Loop back to `entry_async` so the
+                        // next caller gets proper dedup instead of running
+                        // factory directly.
+                    }
+                },
+                scc::hash_map::Entry::Vacant(vac) => {
+                    let f = factory.take().unwrap_or_else(|| {
+                        unreachable!(
+                            "FutureBackedCache: factory already consumed but \
+                             reached Vacant branch again for key {key:?}"
+                        )
+                    });
+                    let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
+                    let shared = Self::make_shared(f);
+                    let ret = shared.clone();
+                    vac.insert_entry(Slot::InFlight(generation, shared));
+
+                    if let Some(v) = self.await_shared(&key, generation, ret).await {
+                        return v;
+                    }
+                    panic!("FutureBackedCache: factory for key {key:?} panicked");
+                }
             }
-        };
-
-        if let Some(v) = self.await_shared(&key, generation, shared).await {
-            return v;
         }
-
-        panic!("FutureBackedCache: joined an in-flight factory that panicked for key {key:?}");
     }
 
     /// Like [`get_or_init`](Self::get_or_init), but for fallible factories.

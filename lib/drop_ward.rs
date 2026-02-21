@@ -107,8 +107,11 @@ where
         let curr = *self.map.get(key)?;
         let new_count = curr.saturating_sub(by);
         if new_count == 0 {
-            self.map.remove(key);
+            // Delete before removing from the map: if `delete` panics the
+            // entry remains and a subsequent `dec` can retry cleanup. The
+            // reverse order would silently lose the entry.
             T::delete(&self.ctx, key);
+            self.map.remove(key);
         } else if let Some(slot) = self.map.get_mut(key) {
             *slot = new_count;
         }

@@ -138,6 +138,10 @@ struct CompositeFsInner<R: CompositeRoot> {
     /// Maps a composite-level outer inode to its child slot index.
     addr_to_slot: scc::HashMap<InodeAddr, usize>,
     /// Maps child name to slot index (for dedup on concurrent resolve).
+    ///
+    /// `register_child` uses `entry_sync` on this map for per-name
+    /// exclusion, serializing concurrent registrations of the same child
+    /// without a global lock. `forget` never touches this map.
     name_to_slot: scc::HashMap<OsString, usize>,
     /// Monotonically increasing slot counter.
     next_slot: AtomicU64,
@@ -257,6 +261,13 @@ impl<R: CompositeRoot> CompositeFs<R> {
     /// If the child is already registered by name, the existing outer address
     /// is returned. Otherwise a new slot is created with a fresh inode table
     /// and bridge mapping.
+    ///
+    /// Uses `entry_sync` on `name_to_slot` for per-name exclusion:
+    /// concurrent registrations of the same child are serialized by the
+    /// `scc::HashMap` bucket lock, while different names proceed in
+    /// parallel. `forget` never touches `name_to_slot` and is fully
+    /// independent — outer inode addresses are monotonic and never reused,
+    /// so `forget` cannot corrupt a replacement slot.
     fn register_child(&self, desc: &ChildDescriptor<R::ChildDP>) -> InodeAddr
     where
         R::ChildDP: Clone,
@@ -264,7 +275,6 @@ impl<R: CompositeRoot> CompositeFs<R> {
         match self.inner.name_to_slot.entry_sync(desc.name.clone()) {
             scc::hash_map::Entry::Occupied(mut occ) => {
                 let old_slot_idx = *occ.get();
-                // Extract bridge Arc from the slot guard, then query outside.
                 let bridge = self
                     .inner
                     .slots
@@ -272,11 +282,9 @@ impl<R: CompositeRoot> CompositeFs<R> {
                 if let Some(outer) = bridge.and_then(|b| b.backward(desc.root_ino.addr)) {
                     return outer;
                 }
-                // Slot exists but bridge has no mapping — replace in-place
-                // while still holding the entry guard to prevent races.
+                // Slot exists but bridge has no mapping — replace it.
                 let (outer_ino, new_slot_idx) = self.create_child_slot(desc);
                 *occ.get_mut() = new_slot_idx;
-                // Remove the orphaned old slot to prevent unbounded growth.
                 self.inner.slots.remove_sync(&old_slot_idx);
                 outer_ino
             }
@@ -440,6 +448,14 @@ where
     /// Removes the composite-level address from `addr_to_slot` and the
     /// child's bridge map. Called automatically by `InodeForget` when the
     /// FUSE refcount drops to zero. The root inode is never forgotten.
+    ///
+    /// Lock-free with respect to [`register_child`](CompositeFs::register_child):
+    /// outer inode addresses are monotonically increasing and never reused,
+    /// so `forget(addr)` can only affect the slot that originally owned
+    /// `addr`. If a concurrent `register_child` has already replaced the
+    /// slot, `slots.read_sync` returns `None` and the bridge cleanup is
+    /// skipped — the old slot's `Arc<ConcurrentBridge>` is dropped with its
+    /// `Arc` refcount.
     fn forget(&self, addr: InodeAddr) {
         if addr == Self::ROOT_INO {
             return;
