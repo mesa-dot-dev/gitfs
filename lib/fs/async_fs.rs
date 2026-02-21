@@ -323,12 +323,21 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
             "parent inode should be a directory"
         );
 
-        if let Some(dentry) = self.directory_cache.lookup(parent, name)
-            && let Some(inode) = self.inode_table.get(&dentry.ino.0).await
-        {
-            return Ok(TrackedINode { inode });
+        if let Some(dentry) = self.directory_cache.lookup(parent, name) {
+            if let Some(inode) = self.inode_table.get(&dentry.ino.0).await {
+                return Ok(TrackedINode { inode });
+            }
+            // Inode was evicted (e.g. by forget). Evict the stale lookup_cache
+            // entry so the slow path calls dp.lookup() fresh.
+            //
+            // Note: a concurrent task may re-insert into lookup_cache between
+            // our inode_table miss and this remove_sync. This is benign — it
+            // causes at most one redundant dp.lookup() call because all
+            // downstream operations (get_or_try_init, get_or_init) are
+            // idempotent or deduplicated.
+            self.lookup_cache
+                .remove_sync(&(parent.0, name.to_os_string()));
         }
-        // Inode was evicted from the table — fall through to the slow path.
 
         let name_owned = name.to_os_string();
         let lookup_key = (parent.0, name_owned.clone());

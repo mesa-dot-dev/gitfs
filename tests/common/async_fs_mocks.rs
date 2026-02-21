@@ -52,6 +52,10 @@ pub struct MockFsState {
     pub directories: HashMap<u64, Vec<(OsString, INode)>>,
     /// `inode_addr -> file content bytes`
     pub file_contents: HashMap<u64, Bytes>,
+    /// Mutable overrides for `lookups`. When populated, entries here take
+    /// precedence and are consumed on use (removed after the first hit).
+    /// Existing tests are unaffected because this defaults to empty.
+    pub refresh_lookups: scc::HashMap<(u64, OsString), INode>,
 }
 
 /// A clonable mock data provider for `AsyncFs` tests.
@@ -73,6 +77,10 @@ impl FsDataProvider for MockFsDataProvider {
 
     async fn lookup(&self, parent: INode, name: &OsStr) -> Result<INode, std::io::Error> {
         let key = (parent.addr, name.to_os_string());
+        // Check mutable overrides first (consumed on use).
+        if let Some((_, inode)) = self.state.refresh_lookups.remove_sync(&key) {
+            return Ok(inode);
+        }
         self.state
             .lookups
             .get(&key)

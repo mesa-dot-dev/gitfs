@@ -3,6 +3,7 @@
 mod common;
 
 use std::ffi::{OsStr, OsString};
+use std::sync::Arc;
 
 use git_fs::cache::async_backed::FutureBackedCache;
 use git_fs::fs::async_fs::{AsyncFs, InodeLifecycle};
@@ -577,6 +578,47 @@ async fn readdir_provides_correct_next_offsets() {
         vec![1, 2],
         "offsets should be 1-indexed and sequential"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lookup_after_eviction_returns_fresh_inode() {
+    let root = make_inode(1, INodeType::Directory, 0, None);
+    let child_v1 = make_inode(10, INodeType::File, 42, Some(1));
+    let child_v2 = make_inode(20, INodeType::File, 99, Some(1));
+
+    let mut state = MockFsState::default();
+    state.lookups.insert((1, "readme.md".into()), child_v1);
+    let dp = MockFsDataProvider::new(state);
+    let state_ref = Arc::clone(&dp.state);
+
+    let table = FutureBackedCache::default();
+    let fs = AsyncFs::new(dp, root, &table).await;
+
+    // First lookup → addr=10
+    let first = fs
+        .lookup(LoadedAddr(1), OsStr::new("readme.md"))
+        .await
+        .unwrap();
+    assert_eq!(first.inode.addr, 10);
+
+    // Simulate forget: remove the inode from the table.
+    table.remove_sync(&10);
+
+    // Insert the refresh entry *after* the first lookup so dp.lookup()
+    // returns child_v2 on the next call (refresh_lookups is checked first).
+    drop(
+        state_ref
+            .refresh_lookups
+            .insert_sync((1, "readme.md".into()), child_v2),
+    );
+
+    // Second lookup should NOT return the stale addr=10.
+    let second = fs
+        .lookup(LoadedAddr(1), OsStr::new("readme.md"))
+        .await
+        .unwrap();
+    assert_ne!(second.inode.addr, 10, "should not return stale inode");
+    assert_eq!(second.inode.addr, 20, "should return the fresh inode");
 }
 
 // lookup-after-readdir integration test

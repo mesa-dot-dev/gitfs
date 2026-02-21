@@ -7,7 +7,6 @@
 //! Note that this cache does not support automatic eviction.
 
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fmt::Debug, future::Future, hash::Hash, pin::Pin};
 
@@ -119,7 +118,9 @@ where
     ///
     /// Concurrent callers for the same key are deduplicated: only one factory invocation runs,
     /// and joiners await its shared result. If the factory fails, the poisoned `InFlight` entry
-    /// is removed and joiners fall through to run their own factory (non-deduplicated retry).
+    /// is removed and joiners retry by re-entering the `entry_async` gate, so a single new
+    /// owner is elected. Joiners never receive the original error — the retrying owner invokes
+    /// its own factory independently and may produce a different error or succeed.
     ///
     /// # Panics
     ///
@@ -151,53 +152,49 @@ where
         }
 
         // Slow path: claim a slot or join an existing in-flight computation.
-        // The error side-channel lets the owner retrieve the `Err(e)` from the
-        // shared future (which only produces `Option<V>`).
-        let error_cell: Arc<std::sync::Mutex<Option<E>>> = Arc::new(std::sync::Mutex::new(None));
+        // Wrapped in `Option` so the `FnOnce` factory can be consumed exactly
+        // once inside the loop (only in the `Vacant` branch, which always returns).
+        let mut factory = Some(factory);
 
-        match self.map.entry_async(key.clone()).await {
-            scc::hash_map::Entry::Occupied(occ) => match occ.get() {
-                Slot::Ready(v) => Ok(v.clone()),
-                Slot::InFlight(g, shared) => {
-                    let (generation, shared) = (*g, shared.clone());
-                    drop(occ);
-                    if let Some(v) = self.await_shared(&key, generation, shared).await {
+        loop {
+            match self.map.entry_async(key.clone()).await {
+                scc::hash_map::Entry::Occupied(occ) => match occ.get() {
+                    Slot::Ready(v) => return Ok(v.clone()),
+                    Slot::InFlight(g, shared) => {
+                        let (generation, shared) = (*g, shared.clone());
+                        drop(occ);
+                        if let Some(v) = self.await_shared(&key, generation, shared).await {
+                            return Ok(v);
+                        }
+                        // In-flight failed. Loop back to `entry_async` so the
+                        // next caller gets proper dedup instead of running
+                        // factory directly.
+                    }
+                },
+                scc::hash_map::Entry::Vacant(vac) => {
+                    let f = factory.take().unwrap_or_else(|| {
+                        unreachable!(
+                            "FutureBackedCache: factory already consumed but \
+                             reached Vacant branch again for key {key:?}"
+                        )
+                    });
+                    let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
+                    let (error_tx, mut error_rx) = tokio::sync::oneshot::channel();
+                    let shared = Self::make_shared_fallible(f, error_tx);
+                    let ret = shared.clone();
+                    vac.insert_entry(Slot::InFlight(generation, shared));
+
+                    if let Some(v) = self.await_shared(&key, generation, ret).await {
                         return Ok(v);
                     }
-                    // In-flight failed. We still have `factory` — run it ourselves.
-                    let val = factory().await?;
-                    match self.map.entry_async(key).await {
-                        scc::hash_map::Entry::Occupied(occ) => match occ.get() {
-                            Slot::Ready(v) => Ok(v.clone()),
-                            Slot::InFlight(..) => Ok(val),
-                        },
-                        scc::hash_map::Entry::Vacant(vac) => {
-                            vac.insert_entry(Slot::Ready(val.clone()));
-                            Ok(val)
-                        }
-                    }
-                }
-            },
-            scc::hash_map::Entry::Vacant(vac) => {
-                let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
-                let shared = Self::make_shared_fallible(factory, Arc::clone(&error_cell));
-                let ret = shared.clone();
-                vac.insert_entry(Slot::InFlight(generation, shared));
-
-                if let Some(v) = self.await_shared(&key, generation, ret).await {
-                    return Ok(v);
-                }
-                // Our factory returned `Err` — retrieve it from the side channel.
-                let captured = error_cell
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
-                match captured {
-                    Some(e) => Err(e),
-                    None => panic!(
-                        "FutureBackedCache: factory for key {key:?} resolved to None \
-                         but no error was captured (factory panicked)"
-                    ),
+                    // Our factory returned `Err` — retrieve it from the channel.
+                    return match error_rx.try_recv().ok() {
+                        Some(e) => Err(e),
+                        None => panic!(
+                            "FutureBackedCache: factory for key {key:?} resolved to None \
+                             but no error was captured (factory panicked)"
+                        ),
+                    };
                 }
             }
         }
@@ -282,10 +279,10 @@ where
     /// Like [`make_shared`](Self::make_shared), but for fallible factories.
     ///
     /// On `Ok(v)`, the shared future resolves to `Some(v)`. On `Err(e)`, the
-    /// error is captured in `error_cell` and the future resolves to `None`.
+    /// error is sent through `error_tx` and the future resolves to `None`.
     fn make_shared_fallible<F, Fut, E>(
         factory: F,
-        error_cell: Arc<std::sync::Mutex<Option<E>>>,
+        error_tx: tokio::sync::oneshot::Sender<E>,
     ) -> SharedFut<V>
     where
         F: FnOnce() -> Fut,
@@ -297,9 +294,7 @@ where
             match fut.await {
                 Ok(Ok(v)) => Some(v),
                 Ok(Err(e)) => {
-                    *error_cell
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
+                    drop(error_tx.send(e));
                     None
                 }
                 Err(_panic) => None,
