@@ -350,6 +350,11 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
                 .remove_sync(&(parent.addr(), Arc::from(name)));
         }
 
+        // Note: get_or_try_init deduplicates successful lookups but NOT
+        // failures. Under transient API errors, concurrent lookups for
+        // the same (parent, name) may each independently call dp.lookup().
+        // This is acceptable: the cost of a redundant API call on error is
+        // low compared to the complexity of error-channel deduplication.
         let name_arc: Arc<OsStr> = Arc::from(name);
         let lookup_key = (parent.addr(), Arc::clone(&name_arc));
         let dp = self.data_provider.clone();

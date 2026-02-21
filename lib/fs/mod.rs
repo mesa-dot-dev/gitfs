@@ -1,4 +1,24 @@
 //! Useful filesystem generalizations.
+//!
+//! # Cache invalidation
+//!
+//! The current implementation caches directory listings and inode data
+//! indefinitely once populated. Staleness is mitigated only by a short
+//! FUSE entry/attr TTL (currently 1 second in `FuserAdapter`).
+//!
+//! The intended long-term strategy is to use FUSE kernel notifications
+//! (`notify_inval_inode` / `notify_inval_entry`) to proactively invalidate
+//! specific entries when the backing data changes. This would allow a
+//! much higher TTL while still reflecting changes promptly. The key
+//! changes needed:
+//!
+//! 1. `DCache` needs a `remove` or `invalidate` method to reset a
+//!    parent's `PopulateStatus` back to `UNCLAIMED`.
+//! 2. `FuserAdapter` needs access to the `fuser::Session` handle to
+//!    send `notify_inval_entry` notifications.
+//! 3. Data providers need a way to signal when their backing data changes
+//!    (e.g. webhook, polling, or subscription).
+
 /// Async filesystem cache with concurrent inode management.
 pub mod async_fs;
 /// Lock-free bidirectional inode address mapping.

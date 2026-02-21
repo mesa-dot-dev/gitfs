@@ -143,6 +143,15 @@ where
     /// owner is elected. Joiners never receive the original error — the retrying owner invokes
     /// its own factory independently and may produce a different error or succeed.
     ///
+    /// # Deduplication of failures
+    ///
+    /// When the factory returns `Err`, the poisoned entry is removed and the
+    /// next caller becomes a new owner with its own factory invocation. This
+    /// means failures are **not deduplicated**: under transient errors, N
+    /// concurrent callers may each independently invoke their factory rather
+    /// than coalescing on the first error. This is intentional — callers
+    /// may have different retry or error-handling semantics.
+    ///
     /// # Panics
     ///
     /// Panics if the factory panics (caught internally via `catch_unwind`).
