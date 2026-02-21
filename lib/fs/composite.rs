@@ -141,7 +141,8 @@ struct CompositeFsInner<R: CompositeRoot> {
     ///
     /// `register_child` uses `entry_sync` on this map for per-name
     /// exclusion, serializing concurrent registrations of the same child
-    /// without a global lock. `forget` never touches this map.
+    /// without a global lock. `forget` cleans up entries when a slot's
+    /// bridge becomes empty.
     name_to_slot: scc::HashMap<OsString, usize>,
     /// Monotonically increasing slot counter.
     next_slot: AtomicU64,
@@ -265,8 +266,9 @@ impl<R: CompositeRoot> CompositeFs<R> {
     /// Uses `entry_sync` on `name_to_slot` for per-name exclusion:
     /// concurrent registrations of the same child are serialized by the
     /// `scc::HashMap` bucket lock, while different names proceed in
-    /// parallel. `forget` never touches `name_to_slot` and is fully
-    /// independent — outer inode addresses are monotonic and never reused,
+    /// parallel. `forget` may remove entries from `name_to_slot` when a
+    /// slot's bridge becomes empty, but this is safe — outer inode addresses
+    /// are monotonic and never reused,
     /// so `forget` cannot corrupt a replacement slot.
     fn register_child(&self, desc: &ChildDescriptor<R::ChildDP>) -> InodeAddr
     where
@@ -448,28 +450,41 @@ where
     }
 
     /// Removes the composite-level address from `addr_to_slot` and the
-    /// child's bridge map. Called automatically by `InodeForget` when the
-    /// FUSE refcount drops to zero. The root inode is never forgotten.
+    /// child's bridge map. When the bridge becomes empty, the slot and its
+    /// `name_to_slot` entry are garbage-collected.
     ///
-    /// Lock-free with respect to [`register_child`](CompositeFs::register_child):
-    /// outer inode addresses are monotonically increasing and never reused,
-    /// so `forget(addr)` can only affect the slot that originally owned
-    /// `addr`. If a concurrent `register_child` has already replaced the
-    /// slot, `slots.read_sync` returns `None` and the bridge cleanup is
-    /// skipped — the old slot's `Arc<ConcurrentBridge>` is dropped with its
-    /// `Arc` refcount.
+    /// The slot removal uses `remove_if_sync` with a re-check of
+    /// `bridge.is_empty()`, preventing a concurrent `backward_or_insert`
+    /// from inserting a new mapping between the bridge emptiness check
+    /// and the slot removal.
+    ///
+    /// The root inode is never forgotten.
     fn forget(&self, addr: InodeAddr) {
         if addr == Self::ROOT_INO {
             return;
         }
         if let Some((_, slot_idx)) = self.inner.addr_to_slot.remove_sync(&addr) {
+            // Remove the outer->inner mapping from the bridge. The bridge's
+            // internal mutex serializes this with `backward_or_insert`.
             let bridge_empty = self
                 .inner
                 .slots
                 .read_sync(&slot_idx, |_, slot| slot.bridge.remove_by_outer(addr))
                 .unwrap_or(false);
             if bridge_empty {
-                self.inner.slots.remove_sync(&slot_idx);
+                // Bridge is empty — atomically remove the slot only if no one
+                // has re-populated the bridge between our check and this removal.
+                // `remove_if_sync` holds the scc bucket lock during evaluation.
+                let removed = self
+                    .inner
+                    .slots
+                    .remove_if_sync(&slot_idx, |slot| slot.bridge.is_empty());
+                if removed.is_some() {
+                    // Clean up name_to_slot to prevent dead slot indices.
+                    self.inner
+                        .name_to_slot
+                        .retain_sync(|_, &mut idx| idx != slot_idx);
+                }
             }
         }
     }

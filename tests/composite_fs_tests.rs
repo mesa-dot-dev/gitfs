@@ -8,7 +8,7 @@ use std::ffi::{OsStr, OsString};
 use bytes::Bytes;
 
 use git_fs::cache::async_backed::FutureBackedCache;
-use git_fs::fs::async_fs::AsyncFs;
+use git_fs::fs::async_fs::{AsyncFs, FsDataProvider as _};
 use git_fs::fs::composite::CompositeFs;
 use git_fs::fs::{INode, INodeType, LoadedAddr, OpenFlags};
 
@@ -304,4 +304,50 @@ async fn composite_repeated_lookup_returns_same_addr() {
         first.inode.addr, second.inode.addr,
         "repeated lookups for the same child should return the same composite address"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn composite_forget_cleans_up_slot_and_name_mapping() {
+    // Setup: one child "repo" with a file.
+    let (provider, root_ino) = make_child_provider(100, &[("file.txt", 101, INodeType::File, 42)]);
+
+    let mut children = HashMap::new();
+    children.insert(OsString::from("repo"), (provider, root_ino));
+
+    let mock_root = MockRoot::new(children);
+    let composite = CompositeFs::new(mock_root, (1000, 1000));
+    let root_inode = composite.make_root_inode();
+
+    let table = FutureBackedCache::default();
+    table.insert_sync(1, root_inode);
+    let afs = AsyncFs::new_preseeded(composite.clone(), &table);
+
+    // Look up the child and a file inside it.
+    let child_dir = afs
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("repo"))
+        .await
+        .unwrap();
+    let child_addr = child_dir.inode.addr;
+
+    let file = afs
+        .lookup(
+            LoadedAddr::new_unchecked(child_addr),
+            OsStr::new("file.txt"),
+        )
+        .await
+        .unwrap();
+    let file_addr = file.inode.addr;
+
+    // Forget the file, then the child directory.
+    composite.forget(file_addr);
+    composite.forget(child_addr);
+
+    // Re-lookup the child — should succeed with a fresh slot.
+    let re_resolved = afs
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("repo"))
+        .await
+        .unwrap();
+
+    assert_eq!(re_resolved.inode.itype, INodeType::Directory);
+    // The new address may differ from the original (fresh slot allocated).
 }

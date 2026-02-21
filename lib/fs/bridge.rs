@@ -115,6 +115,17 @@ impl ConcurrentBridge {
         }
         self.fwd.is_empty()
     }
+
+    /// Returns `true` if the bridge contains no mappings.
+    ///
+    /// Reads are not serialized with mutations. The result is a
+    /// snapshot that may be immediately stale. Use under the
+    /// coordination lock or an external guard when consistency
+    /// with mutations is required.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.fwd.is_empty()
+    }
 }
 
 impl Default for ConcurrentBridge {
