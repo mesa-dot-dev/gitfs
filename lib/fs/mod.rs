@@ -42,6 +42,7 @@ impl LoadedAddr {
     /// - The address was previously inserted into an inode table, **or**
     /// - The address originates from the FUSE kernel (which only knows
     ///   addresses we previously returned to it).
+    #[doc(hidden)]
     #[must_use]
     pub fn new_unchecked(addr: InodeAddr) -> Self {
         Self(addr)
