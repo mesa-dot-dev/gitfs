@@ -248,7 +248,7 @@ pub struct AsyncFs<'tbl, DP: FsDataProvider> {
 
     /// Deduplicating lookup cache keyed by `(parent_addr, child_name)`. The factory is
     /// `dp.lookup()`, so the data provider is only called on a true cache miss.
-    lookup_cache: FutureBackedCache<(InodeAddr, OsString), INode>,
+    lookup_cache: FutureBackedCache<(InodeAddr, Arc<OsStr>), INode>,
 
     /// Directory entry cache, mapping `(parent, name)` to child inode address.
     directory_cache: DCache,
@@ -346,24 +346,18 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
             }
             // Inode was evicted (e.g. by forget). Evict the stale lookup_cache
             // entry so the slow path calls dp.lookup() fresh.
-            //
-            // Note: a concurrent task may re-insert into lookup_cache between
-            // our inode_table miss and this remove_sync. This is benign — it
-            // causes at most one redundant dp.lookup() call because all
-            // downstream operations (get_or_try_init, get_or_init) are
-            // idempotent or deduplicated.
             self.lookup_cache
-                .remove_sync(&(parent.addr(), name.to_os_string()));
+                .remove_sync(&(parent.addr(), Arc::from(name)));
         }
 
-        let name_owned = name.to_os_string();
-        let lookup_key = (parent.addr(), name_owned.clone());
+        let name_arc: Arc<OsStr> = Arc::from(name);
+        let lookup_key = (parent.addr(), Arc::clone(&name_arc));
         let dp = self.data_provider.clone();
 
         let child = self
             .lookup_cache
             .get_or_try_init(lookup_key, || {
-                let name_for_dp = name_owned.clone();
+                let name_for_dp = Arc::clone(&name_arc);
                 async move { dp.lookup(parent_ino, &name_for_dp).await }
             })
             .await?;
@@ -374,7 +368,7 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
 
         self.directory_cache.insert(
             parent,
-            name_owned,
+            name_arc.as_ref().to_os_string(),
             LoadedAddr::new_unchecked(child.addr),
             matches!(child.itype, INodeType::Directory),
         );
