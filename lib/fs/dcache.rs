@@ -2,6 +2,8 @@ use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use tokio::sync::Notify;
+
 use crate::fs::LoadedAddr;
 
 /// Cached metadata for a directory entry.
@@ -32,6 +34,8 @@ pub enum PopulateStatus {
 struct DirState {
     children: scc::HashMap<OsString, DValue>,
     populated: AtomicU8,
+    /// Wakes waiters when `populated` transitions out of `IN_PROGRESS`.
+    notify: Notify,
 }
 
 impl DirState {
@@ -39,6 +43,7 @@ impl DirState {
         Self {
             children: scc::HashMap::new(),
             populated: AtomicU8::new(POPULATE_UNCLAIMED),
+            notify: Notify::new(),
         }
     }
 }
@@ -46,7 +51,7 @@ impl DirState {
 /// In-memory directory entry cache with per-parent child maps.
 ///
 /// Each parent directory gets its own [`DirState`] containing a
-/// [`scc::HashMap`] of child entries and an [`AtomicBool`] population flag.
+/// [`scc::HashMap`] of child entries and an [`AtomicU8`] population flag.
 /// This makes `readdir` O(k) in the number of children rather than O(n)
 /// over the entire cache.
 pub struct DCache {
@@ -144,6 +149,7 @@ impl DCache {
     pub fn finish_populate(&self, parent_ino: LoadedAddr) {
         let state = self.dir_state(parent_ino);
         state.populated.store(POPULATE_DONE, Ordering::Release);
+        state.notify.notify_waiters();
     }
 
     /// Abort a population attempt, resetting back to unclaimed so another
@@ -151,19 +157,21 @@ impl DCache {
     pub fn abort_populate(&self, parent_ino: LoadedAddr) {
         let state = self.dir_state(parent_ino);
         state.populated.store(POPULATE_UNCLAIMED, Ordering::Release);
+        state.notify.notify_waiters();
     }
 
     /// Wait until a directory is no longer in the `InProgress` state.
+    ///
+    /// Uses [`Notify`] to sleep efficiently instead of spinning.
     pub async fn wait_populated(&self, parent_ino: LoadedAddr) {
+        let state = self.dir_state(parent_ino);
         loop {
-            let current = self
-                .dirs
-                .read_sync(&parent_ino, |_, v| v.populated.load(Ordering::Acquire))
-                .unwrap_or(POPULATE_UNCLAIMED);
+            let notified = state.notify.notified();
+            let current = state.populated.load(Ordering::Acquire);
             if current != POPULATE_IN_PROGRESS {
                 return;
             }
-            tokio::task::yield_now().await;
+            notified.await;
         }
     }
 }

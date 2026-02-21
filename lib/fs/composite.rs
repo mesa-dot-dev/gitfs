@@ -263,12 +263,12 @@ impl<R: CompositeRoot> CompositeFs<R> {
     {
         match self.inner.name_to_slot.entry_sync(desc.name.clone()) {
             scc::hash_map::Entry::Occupied(mut occ) => {
-                let slot_idx = *occ.get();
+                let old_slot_idx = *occ.get();
                 // Extract bridge Arc from the slot guard, then query outside.
                 let bridge = self
                     .inner
                     .slots
-                    .read_sync(&slot_idx, |_, slot| Arc::clone(&slot.bridge));
+                    .read_sync(&old_slot_idx, |_, slot| Arc::clone(&slot.bridge));
                 if let Some(outer) = bridge.and_then(|b| b.backward(desc.root_ino.addr)) {
                     return outer;
                 }
@@ -276,6 +276,8 @@ impl<R: CompositeRoot> CompositeFs<R> {
                 // while still holding the entry guard to prevent races.
                 let (outer_ino, new_slot_idx) = self.create_child_slot(desc);
                 *occ.get_mut() = new_slot_idx;
+                // Remove the orphaned old slot to prevent unbounded growth.
+                self.inner.slots.remove_sync(&old_slot_idx);
                 outer_ino
             }
             scc::hash_map::Entry::Vacant(vac) => {

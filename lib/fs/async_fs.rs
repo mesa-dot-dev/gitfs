@@ -184,6 +184,39 @@ impl InodeLifecycle {
     }
 }
 
+/// RAII guard that calls [`DCache::abort_populate`] on drop unless defused.
+///
+/// Prevents the populate flag from getting stuck in `IN_PROGRESS` if the
+/// populating future is cancelled (e.g. by a FUSE interrupt or `select!`).
+struct PopulateGuard<'a> {
+    dcache: &'a DCache,
+    parent: LoadedAddr,
+    armed: bool,
+}
+
+impl<'a> PopulateGuard<'a> {
+    fn new(dcache: &'a DCache, parent: LoadedAddr) -> Self {
+        Self {
+            dcache,
+            parent,
+            armed: true,
+        }
+    }
+
+    /// Defuse the guard after a successful `finish_populate`.
+    fn defuse(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PopulateGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.dcache.abort_populate(self.parent);
+        }
+    }
+}
+
 /// An asynchronous filesystem cache mapping `InodeAddr` to `INode`.
 ///
 /// Uses two [`FutureBackedCache`] layers:
@@ -401,28 +434,27 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
         loop {
             match self.directory_cache.try_claim_populate(parent) {
                 PopulateStatus::Claimed => {
-                    match self.data_provider.readdir(parent_inode).await {
-                        Ok(children) => {
-                            for (name, child_inode) in children {
-                                self.inode_table
-                                    .get_or_init(child_inode.addr, || async move { child_inode })
-                                    .await;
-                                self.directory_cache
-                                    .insert(
-                                        parent,
-                                        name,
-                                        LoadedAddr(child_inode.addr),
-                                        child_inode.itype == INodeType::Directory,
-                                    )
-                                    .await;
-                            }
-                            self.directory_cache.finish_populate(parent);
-                        }
-                        Err(e) => {
-                            self.directory_cache.abort_populate(parent);
-                            return Err(e);
-                        }
+                    // RAII guard: if this future is cancelled between Claimed
+                    // and finish_populate, automatically abort so other waiters
+                    // can retry instead of hanging forever.
+                    let mut guard = PopulateGuard::new(&self.directory_cache, parent);
+
+                    let children = self.data_provider.readdir(parent_inode).await?;
+                    for (name, child_inode) in children {
+                        self.inode_table
+                            .get_or_init(child_inode.addr, || async move { child_inode })
+                            .await;
+                        self.directory_cache
+                            .insert(
+                                parent,
+                                name,
+                                LoadedAddr(child_inode.addr),
+                                child_inode.itype == INodeType::Directory,
+                            )
+                            .await;
                     }
+                    self.directory_cache.finish_populate(parent);
+                    guard.defuse();
                     break;
                 }
                 PopulateStatus::InProgress => {

@@ -265,13 +265,15 @@ impl FsDataProvider for MesRepoProvider {
                 .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
             Ok(MesFileReader {
-                client: inner.client.clone(),
-                org_name: inner.org_name.clone(),
-                repo_name: inner.repo_name.clone(),
-                ref_: inner.ref_.clone(),
-                path,
-                file_cache: inner.file_cache.clone(),
-                inode_addr: inode.addr,
+                inner: Arc::new(MesFileReaderCtx {
+                    client: inner.client.clone(),
+                    org_name: inner.org_name.clone(),
+                    repo_name: inner.repo_name.clone(),
+                    ref_: inner.ref_.clone(),
+                    path,
+                    file_cache: inner.file_cache.clone(),
+                    inode_addr: inode.addr,
+                }),
             })
         }
     }
@@ -282,6 +284,10 @@ impl FsDataProvider for MesRepoProvider {
 }
 
 pub struct MesFileReader {
+    inner: Arc<MesFileReaderCtx>,
+}
+
+struct MesFileReaderCtx {
     client: MesaClient,
     org_name: String,
     repo_name: String,
@@ -297,18 +303,12 @@ impl FileReader for MesFileReader {
         offset: u64,
         size: u32,
     ) -> impl Future<Output = Result<Bytes, std::io::Error>> + Send {
-        let client = self.client.clone();
-        let org_name = self.org_name.clone();
-        let repo_name = self.repo_name.clone();
-        let ref_ = self.ref_.clone();
-        let path = self.path.clone();
-        let file_cache = self.file_cache.clone();
-        let inode_addr = self.inode_addr;
+        let ctx = Arc::clone(&self.inner);
 
         async move {
             // Try the file cache first.
-            if let Some(cache) = &file_cache
-                && let Some(data) = cache.get(&inode_addr).await
+            if let Some(cache) = &ctx.file_cache
+                && let Some(data) = cache.get(&ctx.inode_addr).await
             {
                 let start = usize::try_from(offset)
                     .unwrap_or(data.len())
@@ -318,7 +318,7 @@ impl FileReader for MesFileReader {
             }
 
             // Cache miss -- fetch from the Mesa API.
-            let path_str = path.to_str().ok_or_else(|| {
+            let path_str = ctx.path.to_str().ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "path contains non-UTF-8 characters",
@@ -331,12 +331,13 @@ impl FileReader for MesFileReader {
                 Some(path_str)
             };
 
-            let content = client
-                .org(&org_name)
+            let content = ctx
+                .client
+                .org(&ctx.org_name)
                 .repos()
-                .at(&repo_name)
+                .at(&ctx.repo_name)
                 .content()
-                .get(Some(ref_.as_str()), api_path, None)
+                .get(Some(ctx.ref_.as_str()), api_path, None)
                 .await
                 .map_err(MesaApiError::from)
                 .map_err(mesa_api_error_to_io)?;
@@ -360,10 +361,10 @@ impl FileReader for MesFileReader {
             let result = Bytes::copy_from_slice(&decoded[start..end]);
 
             // Store the decoded content in the cache for future reads.
-            if let Some(cache) = &file_cache
-                && let Err(e) = cache.insert(&inode_addr, decoded).await
+            if let Some(cache) = &ctx.file_cache
+                && let Err(e) = cache.insert(&ctx.inode_addr, decoded).await
             {
-                warn!(error = ?e, inode_addr, "failed to cache file content");
+                warn!(error = ?e, inode_addr = ctx.inode_addr, "failed to cache file content");
             }
 
             Ok(result)

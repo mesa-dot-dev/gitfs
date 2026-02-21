@@ -1,20 +1,26 @@
-//! Lock-free bidirectional inode address mapping.
+//! Bidirectional inode address mapping.
 //!
 //! [`ConcurrentBridge`] maps between "outer" (composite) and "inner" (child)
-//! inode address spaces using two [`scc::HashMap`]s.
+//! inode address spaces using two [`scc::HashMap`]s guarded by a coordination
+//! lock for cross-map atomicity.
+
+use std::sync::Mutex;
 
 use crate::fs::InodeAddr;
 
 /// Bidirectional inode mapping between outer (composite) and inner (child) address spaces.
 ///
-/// Uses two lock-free `scc::HashMap`s. Insertion order: forward map first,
-/// then backward map, so any observer that discovers an outer addr via
-/// `backward` can immediately resolve it via `forward`.
+/// Uses two concurrent `scc::HashMap`s for lock-free reads. Mutations that
+/// touch both maps are serialized by a `Mutex<()>` to prevent cross-map
+/// inconsistencies (e.g. a concurrent `remove_by_outer` between the two
+/// `insert_sync` calls in `insert` could leave orphaned entries).
 pub struct ConcurrentBridge {
     /// outer -> inner
     fwd: scc::HashMap<InodeAddr, InodeAddr>,
     /// inner -> outer
     bwd: scc::HashMap<InodeAddr, InodeAddr>,
+    /// Serializes mutations that touch both maps.
+    mu: Mutex<()>,
 }
 
 impl ConcurrentBridge {
@@ -24,13 +30,18 @@ impl ConcurrentBridge {
         Self {
             fwd: scc::HashMap::new(),
             bwd: scc::HashMap::new(),
+            mu: Mutex::new(()),
         }
     }
 
     /// Insert a mapping from outer to inner.
     ///
-    /// Inserts into the forward map first (see module docs for ordering rationale).
+    /// Serialized with other mutations via the coordination lock.
     pub fn insert(&self, outer: InodeAddr, inner: InodeAddr) {
+        let _guard = self
+            .mu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = self.fwd.insert_sync(outer, inner);
         let _ = self.bwd.insert_sync(inner, outer);
     }
@@ -48,18 +59,23 @@ impl ConcurrentBridge {
     }
 
     /// Look up inner -> outer, or allocate a new outer address if unmapped.
+    ///
+    /// Serialized with other mutations via the coordination lock.
     #[must_use]
     pub fn backward_or_insert(
         &self,
         inner: InodeAddr,
         allocate: impl FnOnce() -> InodeAddr,
     ) -> InodeAddr {
+        let _guard = self
+            .mu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match self.bwd.entry_sync(inner) {
             scc::hash_map::Entry::Occupied(occ) => *occ.get(),
             scc::hash_map::Entry::Vacant(vac) => {
                 let outer = allocate();
                 vac.insert_entry(outer);
-                // Populate forward map after backward is committed.
                 let _ = self.fwd.insert_sync(outer, inner);
                 outer
             }
@@ -67,7 +83,13 @@ impl ConcurrentBridge {
     }
 
     /// Remove the mapping for the given outer address.
+    ///
+    /// Serialized with other mutations via the coordination lock.
     pub fn remove_by_outer(&self, outer: InodeAddr) {
+        let _guard = self
+            .mu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some((_, inner)) = self.fwd.remove_sync(&outer) {
             self.bwd.remove_sync(&inner);
         }
