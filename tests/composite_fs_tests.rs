@@ -58,7 +58,7 @@ async fn composite_root_lookup_resolves_child() {
     let afs = AsyncFs::new_preseeded(composite, &table);
 
     let tracked = afs
-        .lookup(LoadedAddr(1), OsStr::new("repo-a"))
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("repo-a"))
         .await
         .unwrap();
 
@@ -96,7 +96,7 @@ async fn composite_root_readdir_lists_children() {
     let afs = AsyncFs::new_preseeded(composite, &table);
 
     let mut entries = Vec::new();
-    afs.readdir(LoadedAddr(1), 0, |de, _offset| {
+    afs.readdir(LoadedAddr::new_unchecked(1), 0, |de, _offset| {
         entries.push(de.name.to_os_string());
         false
     })
@@ -132,14 +132,17 @@ async fn composite_delegated_lookup_reaches_child() {
 
     // First, lookup the child at root level.
     let child_dir = afs
-        .lookup(LoadedAddr(1), OsStr::new("my-repo"))
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("my-repo"))
         .await
         .unwrap();
     let child_addr = child_dir.inode.addr;
 
     // Then, lookup a file inside the child.
     let file = afs
-        .lookup(LoadedAddr(child_addr), OsStr::new("readme.md"))
+        .lookup(
+            LoadedAddr::new_unchecked(child_addr),
+            OsStr::new("readme.md"),
+        )
         .await
         .unwrap();
 
@@ -148,7 +151,7 @@ async fn composite_delegated_lookup_reaches_child() {
 
     // Also lookup a subdirectory inside the child.
     let subdir = afs
-        .lookup(LoadedAddr(child_addr), OsStr::new("src"))
+        .lookup(LoadedAddr::new_unchecked(child_addr), OsStr::new("src"))
         .await
         .unwrap();
 
@@ -171,16 +174,22 @@ async fn composite_open_and_read_through_child() {
     let afs = AsyncFs::new_preseeded(composite, &table);
 
     // Navigate to the file.
-    let child_dir = afs.lookup(LoadedAddr(1), OsStr::new("repo")).await.unwrap();
+    let child_dir = afs
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("repo"))
+        .await
+        .unwrap();
     let file_tracked = afs
-        .lookup(LoadedAddr(child_dir.inode.addr), OsStr::new("hello.txt"))
+        .lookup(
+            LoadedAddr::new_unchecked(child_dir.inode.addr),
+            OsStr::new("hello.txt"),
+        )
         .await
         .unwrap();
     let file_addr = file_tracked.inode.addr;
 
     // Open and read.
     let open_file = afs
-        .open(LoadedAddr(file_addr), OpenFlags::empty())
+        .open(LoadedAddr::new_unchecked(file_addr), OpenFlags::empty())
         .await
         .unwrap();
     let data = open_file.read(0, 1024).await.unwrap();
@@ -208,7 +217,7 @@ async fn composite_lookup_unknown_child_returns_enoent() {
     let afs = AsyncFs::new_preseeded(composite, &table);
 
     let err = afs
-        .lookup(LoadedAddr(1), OsStr::new("nonexistent"))
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("nonexistent"))
         .await
         .unwrap_err();
 
@@ -242,14 +251,21 @@ async fn composite_readdir_delegated_lists_child_contents() {
     let afs = AsyncFs::new_preseeded(composite, &table);
 
     // Navigate into the child.
-    let child_dir = afs.lookup(LoadedAddr(1), OsStr::new("repo")).await.unwrap();
+    let child_dir = afs
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("repo"))
+        .await
+        .unwrap();
 
     // Readdir inside the child.
     let mut entries = Vec::new();
-    afs.readdir(LoadedAddr(child_dir.inode.addr), 0, |de, _offset| {
-        entries.push((de.name.to_os_string(), de.inode.itype));
-        false
-    })
+    afs.readdir(
+        LoadedAddr::new_unchecked(child_dir.inode.addr),
+        0,
+        |de, _offset| {
+            entries.push((de.name.to_os_string(), de.inode.itype));
+            false
+        },
+    )
     .await
     .unwrap();
 
@@ -275,8 +291,14 @@ async fn composite_repeated_lookup_returns_same_addr() {
     table.insert_sync(1, root_inode);
     let afs = AsyncFs::new_preseeded(composite, &table);
 
-    let first = afs.lookup(LoadedAddr(1), OsStr::new("repo")).await.unwrap();
-    let second = afs.lookup(LoadedAddr(1), OsStr::new("repo")).await.unwrap();
+    let first = afs
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("repo"))
+        .await
+        .unwrap();
+    let second = afs
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("repo"))
+        .await
+        .unwrap();
 
     assert_eq!(
         first.inode.addr, second.inode.addr,

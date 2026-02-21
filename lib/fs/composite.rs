@@ -341,7 +341,7 @@ where
             // Await the lookup outside any scc guard.
             let tracked = child
                 .get_fs()
-                .lookup(LoadedAddr(inner_parent), name)
+                .lookup(LoadedAddr::new_unchecked(inner_parent), name)
                 .await?;
             let child_inode = tracked.inode;
 
@@ -394,7 +394,7 @@ where
             let mut child_entries = Vec::new();
             child
                 .get_fs()
-                .readdir(LoadedAddr(inner_parent), 0, |de, _offset| {
+                .readdir(LoadedAddr::new_unchecked(inner_parent), 0, |de, _offset| {
                     child_entries.push((de.name.to_os_string(), de.inode));
                     false
                 })
@@ -437,8 +437,10 @@ where
 
         let inner_ino = inner_ino.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
-        let open_file: OpenFile<<<R as CompositeRoot>::ChildDP as FsDataProvider>::Reader> =
-            child.get_fs().open(LoadedAddr(inner_ino), flags).await?;
+        let open_file: OpenFile<<<R as CompositeRoot>::ChildDP as FsDataProvider>::Reader> = child
+            .get_fs()
+            .open(LoadedAddr::new_unchecked(inner_ino), flags)
+            .await?;
 
         Ok(CompositeReader {
             inner: open_file.reader,
@@ -461,9 +463,14 @@ where
             return;
         }
         if let Some((_, slot_idx)) = self.inner.addr_to_slot.remove_sync(&addr) {
-            self.inner
+            let bridge_empty = self
+                .inner
                 .slots
-                .read_sync(&slot_idx, |_, slot| slot.bridge.remove_by_outer(addr));
+                .read_sync(&slot_idx, |_, slot| slot.bridge.remove_by_outer(addr))
+                .unwrap_or(false);
+            if bridge_empty {
+                self.inner.slots.remove_sync(&slot_idx);
+            }
         }
     }
 }

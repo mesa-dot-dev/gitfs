@@ -101,8 +101,11 @@ impl ConcurrentBridge {
 
     /// Remove the mapping for the given outer address.
     ///
-    /// Serialized with other mutations via the coordination lock.
-    pub fn remove_by_outer(&self, outer: InodeAddr) {
+    /// Returns `true` if the bridge is empty after the removal — the caller
+    /// can use this to garbage-collect the owning slot. The emptiness check
+    /// is performed under the coordination lock so there is no TOCTOU gap
+    /// with the removal itself.
+    pub fn remove_by_outer(&self, outer: InodeAddr) -> bool {
         let _guard = self
             .mu
             .lock()
@@ -110,6 +113,7 @@ impl ConcurrentBridge {
         if let Some((_, inner)) = self.fwd.remove_sync(&outer) {
             self.bwd.remove_sync(&inner);
         }
+        self.fwd.is_empty()
     }
 }
 

@@ -24,8 +24,35 @@ pub type InodeAddr = u64;
 ///
 /// This newtype wrapper distinguishes inode addresses that are known to exist
 /// in the [`async_fs::AsyncFs`] inode table from raw [`InodeAddr`] values.
+///
+/// The inner field is private to prevent unchecked construction. Code within
+/// the crate may use [`LoadedAddr::new_unchecked`] at trusted boundaries
+/// (e.g. after inserting into the inode table, or at the FUSE adapter boundary
+/// where the kernel provides addresses it previously received from us).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct LoadedAddr(pub InodeAddr);
+pub struct LoadedAddr(InodeAddr);
+
+impl LoadedAddr {
+    /// Construct a `LoadedAddr` without validating that the address exists in
+    /// the inode table.
+    ///
+    /// # Safety contract (logical, not `unsafe`)
+    ///
+    /// The caller must ensure one of:
+    /// - The address was previously inserted into an inode table, **or**
+    /// - The address originates from the FUSE kernel (which only knows
+    ///   addresses we previously returned to it).
+    #[must_use]
+    pub fn new_unchecked(addr: InodeAddr) -> Self {
+        Self(addr)
+    }
+
+    /// Return the raw inode address.
+    #[must_use]
+    pub fn addr(self) -> InodeAddr {
+        self.0
+    }
+}
 
 /// Type representing a file handle.
 pub type FileHandle = u64;

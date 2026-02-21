@@ -210,7 +210,11 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
     ) {
         self.runtime
             .block_on(async {
-                let tracked = self.inner.get_fs().lookup(LoadedAddr(parent), name).await?;
+                let tracked = self
+                    .inner
+                    .get_fs()
+                    .lookup(LoadedAddr::new_unchecked(parent), name)
+                    .await?;
                 self.inner.ward_inc(tracked.inode.addr);
                 Ok::<_, std::io::Error>(tracked.inode)
             })
@@ -230,7 +234,12 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
         reply: fuser::ReplyAttr,
     ) {
         self.runtime
-            .block_on(async { self.inner.get_fs().getattr(LoadedAddr(ino)).await })
+            .block_on(async {
+                self.inner
+                    .get_fs()
+                    .getattr(LoadedAddr::new_unchecked(ino))
+                    .await
+            })
             .fuse_reply(reply, |inode, reply| {
                 let attr = inode_to_fuser_attr(&inode, BLOCK_SIZE);
                 debug!(?attr, "replying...");
@@ -253,10 +262,14 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
                 let mut entries = Vec::new();
                 self.inner
                     .get_fs()
-                    .readdir(LoadedAddr(ino), offset_u64, |de, _next_offset| {
-                        entries.push((de.inode.addr, de.name.to_os_string(), de.inode.itype));
-                        false
-                    })
+                    .readdir(
+                        LoadedAddr::new_unchecked(ino),
+                        offset_u64,
+                        |de, _next_offset| {
+                            entries.push((de.inode.addr, de.name.to_os_string(), de.inode.itype));
+                            false
+                        },
+                    )
                     .await?;
                 Ok::<_, std::io::Error>(entries)
             })
@@ -291,7 +304,11 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
         let flags = OpenFlags::from_bits_truncate(flags);
         self.runtime
             .block_on(async {
-                let open_file = self.inner.get_fs().open(LoadedAddr(ino), flags).await?;
+                let open_file = self
+                    .inner
+                    .get_fs()
+                    .open(LoadedAddr::new_unchecked(ino), flags)
+                    .await?;
                 let fh = open_file.fh;
                 self.open_files.insert(fh, Arc::clone(&open_file.reader));
                 Ok::<_, std::io::Error>(fh)

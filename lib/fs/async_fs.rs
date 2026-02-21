@@ -222,6 +222,11 @@ impl<'a> PopulateGuard<'a> {
 }
 
 impl Drop for PopulateGuard<'_> {
+    /// Fires when the populating future is cancelled before [`defuse`](Self::defuse)
+    /// is called, resetting the dcache populate flag from `IN_PROGRESS` back to
+    /// `UNCLAIMED` so a subsequent `readdir` can retry. This is a normal
+    /// occurrence under FUSE interrupts or `tokio::select!` cancellation —
+    /// not an error.
     fn drop(&mut self) {
         if self.armed {
             self.dcache.abort_populate(self.parent);
@@ -336,7 +341,7 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
         );
 
         if let Some(dentry) = self.directory_cache.lookup(parent, name) {
-            if let Some(inode) = self.inode_table.get(&dentry.ino.0).await {
+            if let Some(inode) = self.inode_table.get(&dentry.ino.addr()).await {
                 return Ok(TrackedINode { inode });
             }
             // Inode was evicted (e.g. by forget). Evict the stale lookup_cache
@@ -348,11 +353,11 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
             // downstream operations (get_or_try_init, get_or_init) are
             // idempotent or deduplicated.
             self.lookup_cache
-                .remove_sync(&(parent.0, name.to_os_string()));
+                .remove_sync(&(parent.addr(), name.to_os_string()));
         }
 
         let name_owned = name.to_os_string();
-        let lookup_key = (parent.0, name_owned.clone());
+        let lookup_key = (parent.addr(), name_owned.clone());
         let dp = self.data_provider.clone();
 
         let child = self
@@ -371,7 +376,7 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
             .insert(
                 parent,
                 name_owned,
-                LoadedAddr(child.addr),
+                LoadedAddr::new_unchecked(child.addr),
                 matches!(child.itype, INodeType::Directory),
             )
             .await;
@@ -384,9 +389,9 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
     /// If the inode is currently in-flight (being loaded by another caller), this awaits
     /// completion. Returns an error if the inode is not in the table at all.
     pub async fn loaded_inode(&self, addr: LoadedAddr) -> Result<INode, std::io::Error> {
-        self.inode_table.get(&addr.0).await.ok_or_else(|| {
+        self.inode_table.get(&addr.addr()).await.ok_or_else(|| {
             tracing::error!(
-                inode = ?addr.0,
+                inode = ?addr.addr(),
                 "inode not found in table — this is a programming bug"
             );
             std::io::Error::from_raw_os_error(libc::ENOENT)
@@ -469,7 +474,7 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
                             .insert(
                                 parent,
                                 name,
-                                LoadedAddr(child_inode.addr),
+                                LoadedAddr::new_unchecked(child_inode.addr),
                                 child_inode.itype == INodeType::Directory,
                             )
                             .await;
@@ -494,7 +499,12 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
             reason = "offset fits in usize on supported 64-bit platforms"
         )]
         for (i, (name, dvalue)) in children.iter().enumerate().skip(offset as usize) {
-            let inode = self.loaded_inode(dvalue.ino).await?;
+            let Some(inode) = self.inode_table.get(&dvalue.ino.addr()).await else {
+                // Inode was evicted between readdir collection and iteration
+                // (e.g. by a concurrent forget). Skip the stale entry.
+                tracing::debug!(addr = ?dvalue.ino.addr(), name = ?name, "inode evicted during readdir, skipping");
+                continue;
+            };
             let next_offset = (i + 1) as u64;
             if filler(DirEntry { name, inode }, next_offset) {
                 break;

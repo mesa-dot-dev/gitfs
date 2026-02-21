@@ -172,7 +172,7 @@ async fn loaded_inode_returns_seeded_inode() {
 
     let fs = AsyncFs::new(dp, root, &table).await;
 
-    let inode = fs.loaded_inode(LoadedAddr(1)).await.unwrap();
+    let inode = fs.loaded_inode(LoadedAddr::new_unchecked(1)).await.unwrap();
     assert_eq!(inode.addr, 1);
     assert_eq!(inode.itype, INodeType::Directory);
 }
@@ -185,7 +185,10 @@ async fn loaded_inode_returns_enoent_for_missing_addr() {
 
     let fs = AsyncFs::new(dp, root, &table).await;
 
-    let err = fs.loaded_inode(LoadedAddr(999)).await.unwrap_err();
+    let err = fs
+        .loaded_inode(LoadedAddr::new_unchecked(999))
+        .await
+        .unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
 }
 
@@ -197,7 +200,7 @@ async fn getattr_delegates_to_loaded_inode() {
 
     let fs = AsyncFs::new(dp, root, &table).await;
 
-    let inode = fs.getattr(LoadedAddr(1)).await.unwrap();
+    let inode = fs.getattr(LoadedAddr::new_unchecked(1)).await.unwrap();
     assert_eq!(inode.addr, 1);
     assert_eq!(inode.size, 4096);
 }
@@ -215,7 +218,7 @@ async fn lookup_resolves_child_via_data_provider() {
     let fs = AsyncFs::new(dp, root, &table).await;
 
     let tracked = fs
-        .lookup(LoadedAddr(1), OsStr::new("readme.md"))
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("readme.md"))
         .await
         .unwrap();
 
@@ -236,7 +239,7 @@ async fn lookup_populates_inode_table() {
     let table = FutureBackedCache::default();
     let fs = AsyncFs::new(dp, root, &table).await;
 
-    fs.lookup(LoadedAddr(1), OsStr::new("file.txt"))
+    fs.lookup(LoadedAddr::new_unchecked(1), OsStr::new("file.txt"))
         .await
         .unwrap();
 
@@ -262,11 +265,11 @@ async fn lookup_second_call_uses_cache() {
     let fs = AsyncFs::new(dp, root, &table).await;
 
     let first = fs
-        .lookup(LoadedAddr(1), OsStr::new("cached.txt"))
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("cached.txt"))
         .await
         .unwrap();
     let second = fs
-        .lookup(LoadedAddr(1), OsStr::new("cached.txt"))
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("cached.txt"))
         .await
         .unwrap();
 
@@ -283,7 +286,7 @@ async fn lookup_propagates_provider_error() {
     let fs = AsyncFs::new(dp, root, &table).await;
 
     let err = fs
-        .lookup(LoadedAddr(1), OsStr::new("nonexistent"))
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("nonexistent"))
         .await
         .unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
@@ -306,7 +309,10 @@ async fn open_returns_file_handle_and_reader() {
     table.insert_sync(10, file);
     let fs = AsyncFs::new(dp, root, &table).await;
 
-    let open_file = fs.open(LoadedAddr(10), OpenFlags::RDONLY).await.unwrap();
+    let open_file = fs
+        .open(LoadedAddr::new_unchecked(10), OpenFlags::RDONLY)
+        .await
+        .unwrap();
 
     assert!(open_file.fh >= 1, "file handle should start at 1");
     let data = open_file.read(0, 5).await.unwrap();
@@ -321,7 +327,10 @@ async fn open_returns_eisdir_for_directory() {
     let table = FutureBackedCache::default();
     let fs = AsyncFs::new(dp, root, &table).await;
 
-    let err = fs.open(LoadedAddr(1), OpenFlags::RDONLY).await.unwrap_err();
+    let err = fs
+        .open(LoadedAddr::new_unchecked(1), OpenFlags::RDONLY)
+        .await
+        .unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::EISDIR));
 }
 
@@ -334,7 +343,7 @@ async fn open_returns_enoent_for_missing_inode() {
     let fs = AsyncFs::new(dp, root, &table).await;
 
     let err = fs
-        .open(LoadedAddr(999), OpenFlags::RDONLY)
+        .open(LoadedAddr::new_unchecked(999), OpenFlags::RDONLY)
         .await
         .unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
@@ -351,8 +360,16 @@ async fn open_assigns_unique_file_handles() {
     table.insert_sync(10, file);
     let fs = AsyncFs::new(dp, root, &table).await;
 
-    let fh1 = fs.open(LoadedAddr(10), OpenFlags::RDONLY).await.unwrap().fh;
-    let fh2 = fs.open(LoadedAddr(10), OpenFlags::RDONLY).await.unwrap().fh;
+    let fh1 = fs
+        .open(LoadedAddr::new_unchecked(10), OpenFlags::RDONLY)
+        .await
+        .unwrap()
+        .fh;
+    let fh2 = fs
+        .open(LoadedAddr::new_unchecked(10), OpenFlags::RDONLY)
+        .await
+        .unwrap()
+        .fh;
 
     assert_ne!(fh1, fh2, "each open should produce a unique file handle");
 }
@@ -372,7 +389,10 @@ async fn open_file_read_with_offset() {
     table.insert_sync(10, file);
     let fs = AsyncFs::new(dp, root, &table).await;
 
-    let open_file = fs.open(LoadedAddr(10), OpenFlags::RDONLY).await.unwrap();
+    let open_file = fs
+        .open(LoadedAddr::new_unchecked(10), OpenFlags::RDONLY)
+        .await
+        .unwrap();
 
     let data = open_file.read(6, 5).await.unwrap();
     assert_eq!(&data[..], b"world");
@@ -400,7 +420,7 @@ async fn readdir_lists_children_sorted_by_name() {
     let fs = AsyncFs::new(dp, root, &table).await;
 
     let mut entries: Vec<(OsString, u64)> = Vec::new();
-    fs.readdir(LoadedAddr(1), 0, |entry, _offset| {
+    fs.readdir(LoadedAddr::new_unchecked(1), 0, |entry, _offset| {
         entries.push((entry.name.to_os_string(), entry.inode.addr));
         false // don't stop
     })
@@ -436,11 +456,13 @@ async fn readdir_respects_offset() {
     let fs = AsyncFs::new(dp, root, &table).await;
 
     // First readdir to populate cache
-    fs.readdir(LoadedAddr(1), 0, |_, _| false).await.unwrap();
+    fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, _| false)
+        .await
+        .unwrap();
 
     // Second readdir starting at offset 2 (skip first two)
     let mut entries: Vec<OsString> = Vec::new();
-    fs.readdir(LoadedAddr(1), 2, |entry, _| {
+    fs.readdir(LoadedAddr::new_unchecked(1), 2, |entry, _| {
         entries.push(entry.name.to_os_string());
         false
     })
@@ -472,7 +494,7 @@ async fn readdir_stops_when_filler_returns_true() {
     let fs = AsyncFs::new(dp, root, &table).await;
 
     let mut count = 0;
-    fs.readdir(LoadedAddr(1), 0, |_, _| {
+    fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, _| {
         count += 1;
         count >= 2 // stop after 2 entries
     })
@@ -494,7 +516,7 @@ async fn readdir_returns_enotdir_for_file() {
     let fs = AsyncFs::new(dp, root, &table).await;
 
     let err = fs
-        .readdir(LoadedAddr(10), 0, |_, _| false)
+        .readdir(LoadedAddr::new_unchecked(10), 0, |_, _| false)
         .await
         .unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
@@ -514,7 +536,9 @@ async fn readdir_populates_inode_table_with_children() {
     let table = FutureBackedCache::default();
     let fs = AsyncFs::new(dp, root, &table).await;
 
-    fs.readdir(LoadedAddr(1), 0, |_, _| false).await.unwrap();
+    fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, _| false)
+        .await
+        .unwrap();
 
     let cached = table.get(&10).await;
     assert_eq!(
@@ -536,7 +560,7 @@ async fn readdir_empty_directory() {
     let fs = AsyncFs::new(dp, root, &table).await;
 
     let mut count = 0;
-    fs.readdir(LoadedAddr(1), 0, |_, _| {
+    fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, _| {
         count += 1;
         false
     })
@@ -566,7 +590,7 @@ async fn readdir_provides_correct_next_offsets() {
     let fs = AsyncFs::new(dp, root, &table).await;
 
     let mut offsets: Vec<u64> = Vec::new();
-    fs.readdir(LoadedAddr(1), 0, |_, next_offset| {
+    fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, next_offset| {
         offsets.push(next_offset);
         false
     })
@@ -596,7 +620,7 @@ async fn lookup_after_eviction_returns_fresh_inode() {
 
     // First lookup → addr=10
     let first = fs
-        .lookup(LoadedAddr(1), OsStr::new("readme.md"))
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("readme.md"))
         .await
         .unwrap();
     assert_eq!(first.inode.addr, 10);
@@ -614,7 +638,7 @@ async fn lookup_after_eviction_returns_fresh_inode() {
 
     // Second lookup should NOT return the stale addr=10.
     let second = fs
-        .lookup(LoadedAddr(1), OsStr::new("readme.md"))
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("readme.md"))
         .await
         .unwrap();
     assert_ne!(second.inode.addr, 10, "should not return stale inode");
@@ -640,11 +664,13 @@ async fn lookup_after_readdir_uses_directory_cache() {
     let fs = AsyncFs::new(dp, root, &table).await;
 
     // readdir populates the directory cache.
-    fs.readdir(LoadedAddr(1), 0, |_, _| false).await.unwrap();
+    fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, _| false)
+        .await
+        .unwrap();
 
     // lookup should hit the directory cache fast path.
     let tracked = fs
-        .lookup(LoadedAddr(1), OsStr::new("file.txt"))
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("file.txt"))
         .await
         .unwrap();
     assert_eq!(tracked.inode.addr, 10);
