@@ -437,6 +437,9 @@ where
         })
     }
 
+    /// Removes the composite-level address from `addr_to_slot` and the
+    /// child's bridge map. Called automatically by `InodeForget` when the
+    /// FUSE refcount drops to zero. The root inode is never forgotten.
     fn forget(&self, addr: InodeAddr) {
         if addr == Self::ROOT_INO {
             return;

@@ -35,8 +35,19 @@ struct MesRepoProviderInner {
     ref_: String,
     fs_owner: (u32, u32),
     next_addr: AtomicU64,
-    /// Maps inode addresses to repo-relative paths (e.g., "src/main.rs").
-    /// Root directory maps to an empty `PathBuf`.
+    /// Maps inode addresses to repo-relative paths (e.g. `"src/main.rs"`).
+    /// Root maps to an empty `PathBuf`.
+    ///
+    /// Exists alongside the [`DCache`](git_fs::fs::dcache::DCache) because
+    /// they serve different purposes: the dcache maps
+    /// `(parent_addr, child_name) -> child_addr` (single-hop name resolution),
+    /// while this map provides the full repo-relative path needed for Mesa API
+    /// calls. Reconstructing the full path from the dcache would require
+    /// walking parent pointers to the root on every API call; this map
+    /// materializes that walk as an O(1) lookup.
+    ///
+    /// Entries are inserted during `lookup`/`readdir` and removed via
+    /// [`forget`](Self::remove_path) when the FUSE refcount reaches zero.
     path_map: scc::HashMap<InodeAddr, PathBuf>,
     file_cache: Option<Arc<FileCache<InodeAddr>>>,
 }
@@ -278,6 +289,8 @@ impl FsDataProvider for MesRepoProvider {
         }
     }
 
+    /// Evicts the inode's entry from [`path_map`](MesRepoProviderInner::path_map).
+    /// Called automatically by `InodeForget` when the FUSE refcount drops to zero.
     fn forget(&self, addr: InodeAddr) {
         self.remove_path(addr);
     }

@@ -65,23 +65,35 @@ pub trait FsDataProvider: Clone + Send + Sync + 'static {
         flags: OpenFlags,
     ) -> impl Future<Output = Result<Self::Reader, std::io::Error>> + Send;
 
-    /// Called when the kernel forgets an inode (refcount reaches zero).
+    /// Clean up provider-internal state for an evicted inode.
     ///
-    /// Implementations should clean up any internal mappings for the given
-    /// address (e.g. bridge maps, path maps). The default is a no-op.
+    /// The `DropWard`/`InodeForget` system automatically removes inodes from
+    /// the shared `inode_table` when the FUSE refcount reaches zero, but data
+    /// providers often maintain auxiliary structures (path maps, bridge maps)
+    /// that also need cleanup. This method is that extension point.
+    ///
+    /// Never called directly -- [`InodeForget::delete`] invokes it
+    /// automatically when the refcount drops to zero.
     fn forget(&self, _addr: InodeAddr) {}
 }
 
-/// Zero-sized tag whose [`StatelessDrop`] implementation automatically evicts
-/// an inode from the inode table when its reference count reaches zero.
+/// Zero-sized cleanup tag for inode eviction.
+///
+/// The [`StatelessDrop`] implementations on this type evict inodes from the
+/// inode table and, when a data provider is present, delegate to
+/// [`FsDataProvider::forget`] so the provider can clean up its own auxiliary
+/// structures (path maps, bridge maps, etc.).
 pub struct InodeForget;
 
+/// Evicts the inode from the table only. Used when no data provider is available.
 impl<'a> StatelessDrop<&'a FutureBackedCache<InodeAddr, INode>, InodeAddr> for InodeForget {
     fn delete(inode_table: &&'a FutureBackedCache<InodeAddr, INode>, addr: &InodeAddr) {
         inode_table.remove_sync(addr);
     }
 }
 
+/// Evicts the inode from the table and delegates to [`FsDataProvider::forget`]
+/// so the provider can clean up its own auxiliary state.
 impl<'a, DP: FsDataProvider> StatelessDrop<(&'a FutureBackedCache<InodeAddr, INode>, DP), InodeAddr>
     for InodeForget
 {
