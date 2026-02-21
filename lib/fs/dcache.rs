@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, RwLock};
 
 use tokio::sync::Notify;
 
@@ -32,7 +33,7 @@ pub enum PopulateStatus {
 
 /// Per-parent directory state holding child entries and a population flag.
 struct DirState {
-    children: scc::HashMap<OsString, DValue>,
+    children: RwLock<BTreeMap<OsString, DValue>>,
     populated: AtomicU8,
     /// Wakes waiters when `populated` transitions out of `IN_PROGRESS`.
     notify: Notify,
@@ -41,7 +42,7 @@ struct DirState {
 impl DirState {
     fn new() -> Self {
         Self {
-            children: scc::HashMap::new(),
+            children: RwLock::new(BTreeMap::new()),
             populated: AtomicU8::new(POPULATE_UNCLAIMED),
             notify: Notify::new(),
         }
@@ -51,9 +52,9 @@ impl DirState {
 /// In-memory directory entry cache with per-parent child maps.
 ///
 /// Each parent directory gets its own [`DirState`] containing a
-/// [`scc::HashMap`] of child entries and an [`AtomicU8`] population flag.
-/// This makes `readdir` O(k) in the number of children rather than O(n)
-/// over the entire cache.
+/// [`BTreeMap`] of child entries (kept in sorted order) and an [`AtomicU8`]
+/// population flag. This makes `readdir` O(k) in the number of children
+/// with zero sorting overhead.
 pub struct DCache {
     dirs: scc::HashMap<LoadedAddr, Arc<DirState>>,
 }
@@ -93,36 +94,39 @@ impl DCache {
     #[must_use]
     pub fn lookup(&self, parent_ino: LoadedAddr, name: &OsStr) -> Option<DValue> {
         let state = self.dirs.read_sync(&parent_ino, |_, v| Arc::clone(v))?;
-        state.children.read_sync(name, |_, v| v.clone())
+        let children = state
+            .children
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        children.get(name).cloned()
     }
 
     /// Atomically inserts or overwrites a child entry in the cache.
-    pub async fn insert(
-        &self,
-        parent_ino: LoadedAddr,
-        name: OsString,
-        ino: LoadedAddr,
-        is_dir: bool,
-    ) {
+    pub fn insert(&self, parent_ino: LoadedAddr, name: OsString, ino: LoadedAddr, is_dir: bool) {
         let state = self.dir_state(parent_ino);
         let value = DValue { ino, is_dir };
-        state.children.upsert_async(name, value).await;
+        let mut children = state
+            .children
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        children.insert(name, value);
     }
 
     /// Returns all cached children of `parent_ino` as `(name, value)` pairs.
-    pub async fn readdir(&self, parent_ino: LoadedAddr) -> Vec<(OsString, DValue)> {
+    ///
+    /// Entries are returned in name-sorted order (guaranteed by `BTreeMap`).
+    pub fn readdir(&self, parent_ino: LoadedAddr) -> Vec<(OsString, DValue)> {
         let Some(state) = self.dirs.read_sync(&parent_ino, |_, v| Arc::clone(v)) else {
             return Vec::new();
         };
-        let mut entries = Vec::new();
-        state
+        let children = state
             .children
-            .iter_async(|k, v| {
-                entries.push((k.clone(), v.clone()));
-                true
-            })
-            .await;
-        entries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        children
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// Atomically try to claim a directory for population.

@@ -372,14 +372,12 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
             .get_or_init(child.addr, || async move { child })
             .await;
 
-        self.directory_cache
-            .insert(
-                parent,
-                name_owned,
-                LoadedAddr::new_unchecked(child.addr),
-                matches!(child.itype, INodeType::Directory),
-            )
-            .await;
+        self.directory_cache.insert(
+            parent,
+            name_owned,
+            LoadedAddr::new_unchecked(child.addr),
+            matches!(child.itype, INodeType::Directory),
+        );
 
         Ok(TrackedINode { inode: child })
     }
@@ -470,14 +468,12 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
                         self.inode_table
                             .get_or_init(child_inode.addr, || async move { child_inode })
                             .await;
-                        self.directory_cache
-                            .insert(
-                                parent,
-                                name,
-                                LoadedAddr::new_unchecked(child_inode.addr),
-                                child_inode.itype == INodeType::Directory,
-                            )
-                            .await;
+                        self.directory_cache.insert(
+                            parent,
+                            name,
+                            LoadedAddr::new_unchecked(child_inode.addr),
+                            child_inode.itype == INodeType::Directory,
+                        );
                     }
                     self.directory_cache.finish_populate(parent);
                     guard.defuse();
@@ -491,8 +487,7 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
             }
         }
 
-        let mut children = self.directory_cache.readdir(parent).await;
-        children.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        let children = self.directory_cache.readdir(parent);
 
         #[expect(
             clippy::cast_possible_truncation,

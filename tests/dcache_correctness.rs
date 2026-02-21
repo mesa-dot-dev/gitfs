@@ -18,14 +18,12 @@ async fn lookup_returns_none_for_missing_entry() {
 #[tokio::test]
 async fn insert_then_lookup() {
     let cache = DCache::new();
-    cache
-        .insert(
-            LoadedAddr::new_unchecked(1),
-            OsString::from("foo"),
-            LoadedAddr::new_unchecked(10),
-            false,
-        )
-        .await;
+    cache.insert(
+        LoadedAddr::new_unchecked(1),
+        OsString::from("foo"),
+        LoadedAddr::new_unchecked(10),
+        false,
+    );
     let dv = cache.lookup(LoadedAddr::new_unchecked(1), OsStr::new("foo"));
     assert!(dv.is_some(), "entry should be present after insert");
     let dv = dv.expect("checked above");
@@ -36,31 +34,25 @@ async fn insert_then_lookup() {
 #[tokio::test]
 async fn readdir_returns_only_children_of_parent() {
     let cache = DCache::new();
-    cache
-        .insert(
-            LoadedAddr::new_unchecked(1),
-            OsString::from("a"),
-            LoadedAddr::new_unchecked(10),
-            false,
-        )
-        .await;
-    cache
-        .insert(
-            LoadedAddr::new_unchecked(1),
-            OsString::from("b"),
-            LoadedAddr::new_unchecked(11),
-            true,
-        )
-        .await;
-    cache
-        .insert(
-            LoadedAddr::new_unchecked(2),
-            OsString::from("c"),
-            LoadedAddr::new_unchecked(12),
-            false,
-        )
-        .await;
-    let children = cache.readdir(LoadedAddr::new_unchecked(1)).await;
+    cache.insert(
+        LoadedAddr::new_unchecked(1),
+        OsString::from("a"),
+        LoadedAddr::new_unchecked(10),
+        false,
+    );
+    cache.insert(
+        LoadedAddr::new_unchecked(1),
+        OsString::from("b"),
+        LoadedAddr::new_unchecked(11),
+        true,
+    );
+    cache.insert(
+        LoadedAddr::new_unchecked(2),
+        OsString::from("c"),
+        LoadedAddr::new_unchecked(12),
+        false,
+    );
+    let children = cache.readdir(LoadedAddr::new_unchecked(1));
     assert_eq!(children.len(), 2);
     let names: Vec<_> = children.iter().map(|(n, _)| n.clone()).collect();
     assert!(names.contains(&OsString::from("a")));
@@ -70,7 +62,7 @@ async fn readdir_returns_only_children_of_parent() {
 #[tokio::test]
 async fn readdir_empty_parent_returns_empty() {
     let cache = DCache::new();
-    let children = cache.readdir(LoadedAddr::new_unchecked(1)).await;
+    let children = cache.readdir(LoadedAddr::new_unchecked(1));
     assert!(children.is_empty());
 }
 
@@ -127,14 +119,12 @@ async fn abort_populate_allows_reclaim() {
 #[tokio::test]
 async fn insert_does_not_mark_populated() {
     let cache = DCache::new();
-    cache
-        .insert(
-            LoadedAddr::new_unchecked(1),
-            OsString::from("foo"),
-            LoadedAddr::new_unchecked(10),
-            false,
-        )
-        .await;
+    cache.insert(
+        LoadedAddr::new_unchecked(1),
+        OsString::from("foo"),
+        LoadedAddr::new_unchecked(10),
+        false,
+    );
     assert!(
         matches!(
             cache.try_claim_populate(LoadedAddr::new_unchecked(1)),
@@ -147,25 +137,37 @@ async fn insert_does_not_mark_populated() {
 #[tokio::test]
 async fn upsert_overwrites_existing_entry() {
     let cache = DCache::new();
-    cache
-        .insert(
-            LoadedAddr::new_unchecked(1),
-            OsString::from("foo"),
-            LoadedAddr::new_unchecked(10),
-            false,
-        )
-        .await;
-    cache
-        .insert(
-            LoadedAddr::new_unchecked(1),
-            OsString::from("foo"),
-            LoadedAddr::new_unchecked(20),
-            true,
-        )
-        .await;
+    cache.insert(
+        LoadedAddr::new_unchecked(1),
+        OsString::from("foo"),
+        LoadedAddr::new_unchecked(10),
+        false,
+    );
+    cache.insert(
+        LoadedAddr::new_unchecked(1),
+        OsString::from("foo"),
+        LoadedAddr::new_unchecked(20),
+        true,
+    );
     let dv = cache.lookup(LoadedAddr::new_unchecked(1), OsStr::new("foo"));
     assert!(dv.is_some(), "entry should still be present after upsert");
     let dv = dv.expect("checked above");
     assert_eq!(dv.ino, LoadedAddr::new_unchecked(20));
     assert!(dv.is_dir);
+}
+
+#[tokio::test]
+async fn readdir_returns_entries_in_sorted_order() {
+    let cache = DCache::new();
+    for name in ["zebra", "apple", "mango"] {
+        cache.insert(
+            LoadedAddr::new_unchecked(1),
+            OsString::from(name),
+            LoadedAddr::new_unchecked(10),
+            false,
+        );
+    }
+    let children = cache.readdir(LoadedAddr::new_unchecked(1));
+    let names: Vec<_> = children.iter().map(|(n, _)| n.to_str().unwrap()).collect();
+    assert_eq!(names, ["apple", "mango", "zebra"]);
 }
