@@ -103,13 +103,13 @@ impl<'a, DP: FsDataProvider> StatelessDrop<(&'a FutureBackedCache<InodeAddr, INo
     }
 }
 
-/// A looked-up inode whose lifetime must be managed by the caller.
+/// A looked-up inode returned by [`AsyncFs::lookup`].
 ///
-/// Each `TrackedINode` returned by [`AsyncFs::lookup`] represents one
-/// reference that the FUSE kernel holds. The caller must balance it by
-/// decrementing the [`InodeLifecycle`] ward when the kernel sends `forget`.
+/// Each `ResolvedINode` returned by lookup represents one reference that
+/// the FUSE kernel holds. The caller must balance it by decrementing the
+/// [`InodeLifecycle`] ward when the kernel sends `forget`.
 #[derive(Debug, Clone, Copy)]
-pub struct TrackedINode {
+pub struct ResolvedINode {
     /// The resolved inode data.
     pub inode: INode,
 }
@@ -333,7 +333,7 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
         &self,
         parent: LoadedAddr,
         name: &OsStr,
-    ) -> Result<TrackedINode, std::io::Error> {
+    ) -> Result<ResolvedINode, std::io::Error> {
         let parent_ino = self.loaded_inode(parent).await?;
         debug_assert!(
             matches!(parent_ino.itype, INodeType::Directory),
@@ -342,7 +342,7 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
 
         if let Some(dentry) = self.directory_cache.lookup(parent, name) {
             if let Some(inode) = self.inode_table.get(&dentry.ino.addr()).await {
-                return Ok(TrackedINode { inode });
+                return Ok(ResolvedINode { inode });
             }
             // Inode was evicted (e.g. by forget). Evict the stale lookup_cache
             // entry so the slow path calls dp.lookup() fresh.
@@ -379,7 +379,7 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
             matches!(child.itype, INodeType::Directory),
         );
 
-        Ok(TrackedINode { inode: child })
+        Ok(ResolvedINode { inode: child })
     }
 
     /// Retrieve an inode that is expected to already be loaded.

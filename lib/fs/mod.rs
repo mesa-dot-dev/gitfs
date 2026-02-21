@@ -10,7 +10,7 @@ pub mod dcache;
 /// FUSE adapter: maps [`fuser::Filesystem`] callbacks to [`async_fs::AsyncFs`].
 pub mod fuser;
 
-pub use async_fs::{InodeForget, InodeLifecycle, OpenFile, TrackedINode};
+pub use async_fs::{InodeForget, InodeLifecycle, OpenFile, ResolvedINode};
 
 use std::ffi::OsStr;
 use std::time::SystemTime;
