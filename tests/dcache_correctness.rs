@@ -342,3 +342,60 @@ async fn evict_removes_child_and_resets_populate_status() {
         PopulateStatus::Claimed
     ));
 }
+
+#[tokio::test]
+async fn evict_unknown_child_is_noop() {
+    let cache = DCache::new();
+    // Should not panic or corrupt state.
+    cache.evict(LoadedAddr::new_unchecked(999));
+}
+
+#[tokio::test]
+async fn evict_does_not_affect_siblings() {
+    let cache = DCache::new();
+    let parent = LoadedAddr::new_unchecked(1);
+    cache.insert(
+        parent,
+        OsString::from("a"),
+        LoadedAddr::new_unchecked(10),
+        false,
+    );
+    cache.insert(
+        parent,
+        OsString::from("b"),
+        LoadedAddr::new_unchecked(11),
+        true,
+    );
+    assert!(matches!(
+        cache.try_claim_populate(parent),
+        PopulateStatus::Claimed
+    ));
+    cache.finish_populate(parent);
+
+    cache.evict(LoadedAddr::new_unchecked(10));
+
+    // Sibling should survive.
+    assert!(cache.lookup(parent, OsStr::new("b")).is_some());
+    // But populate status should be reset.
+    assert!(matches!(
+        cache.try_claim_populate(parent),
+        PopulateStatus::Claimed
+    ));
+}
+
+#[tokio::test]
+async fn evict_child_from_multiple_parents_removes_from_correct_parent() {
+    let cache = DCache::new();
+    let parent_a = LoadedAddr::new_unchecked(1);
+    let parent_b = LoadedAddr::new_unchecked(2);
+    let child = LoadedAddr::new_unchecked(10);
+    // Same child addr under two parents — last insert wins in reverse index
+    // because upsert_sync overwrites.
+    cache.insert(parent_a, OsString::from("x"), child, false);
+    cache.insert(parent_b, OsString::from("y"), child, false);
+
+    cache.evict(child);
+
+    // The parent_b entry should be removed (last insert wins in reverse index).
+    assert!(cache.lookup(parent_b, OsStr::new("y")).is_none());
+}
