@@ -70,7 +70,11 @@ impl<T> FuseResultExt<T> for Result<T, std::io::Error> {
 }
 
 type FuseWard<DP> = crate::drop_ward::DropWard<
-    (Arc<FutureBackedCache<InodeAddr, INode>>, DP),
+    (
+        Arc<FutureBackedCache<InodeAddr, INode>>,
+        Arc<super::dcache::DCache>,
+        DP,
+    ),
     InodeAddr,
     super::async_fs::InodeForget,
 >;
@@ -83,8 +87,9 @@ struct FuseBridgeInner<DP: FsDataProvider> {
 impl<DP: FsDataProvider> FuseBridgeInner<DP> {
     fn create(table: FutureBackedCache<InodeAddr, INode>, provider: DP) -> Self {
         let table = Arc::new(table);
-        let ward = crate::drop_ward::DropWard::new((Arc::clone(&table), provider.clone()));
-        let fs = super::async_fs::AsyncFs::new_preseeded(provider, table);
+        let fs = super::async_fs::AsyncFs::new_preseeded(provider.clone(), Arc::clone(&table));
+        let dcache = fs.directory_cache();
+        let ward = crate::drop_ward::DropWard::new((table, dcache, provider));
         Self { ward, fs }
     }
 

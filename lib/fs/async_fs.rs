@@ -93,14 +93,17 @@ impl StatelessDrop<Arc<FutureBackedCache<InodeAddr, INode>>, InodeAddr> for Inod
     }
 }
 
-/// Evicts the inode from the table and delegates to [`FsDataProvider::forget`]
-/// so the provider can clean up its own auxiliary state.
-impl<DP: FsDataProvider> StatelessDrop<(Arc<FutureBackedCache<InodeAddr, INode>>, DP), InodeAddr>
+/// Evicts the inode from the table and the directory cache, then delegates to
+/// [`FsDataProvider::forget`] so the provider can clean up its own auxiliary
+/// state.
+impl<DP: FsDataProvider>
+    StatelessDrop<(Arc<FutureBackedCache<InodeAddr, INode>>, Arc<DCache>, DP), InodeAddr>
     for InodeForget
 {
-    fn delete(ctx: &(Arc<FutureBackedCache<InodeAddr, INode>>, DP), key: &InodeAddr) {
+    fn delete(ctx: &(Arc<FutureBackedCache<InodeAddr, INode>>, Arc<DCache>, DP), key: &InodeAddr) {
         ctx.0.remove_sync(key);
-        ctx.1.forget(*key);
+        ctx.1.evict(LoadedAddr::new_unchecked(*key));
+        ctx.2.forget(*key);
     }
 }
 
@@ -357,6 +360,16 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
                 prefetch_dir(child_addr, dcache, table, dp).await;
             });
         }
+    }
+
+    /// Returns a clone of the directory cache handle.
+    ///
+    /// Used by the FUSE adapter to pass the cache into the [`DropWard`]
+    /// context so that [`InodeForget`] can evict stale entries when the
+    /// kernel forgets an inode.
+    #[must_use]
+    pub fn directory_cache(&self) -> Arc<DCache> {
+        Arc::clone(&self.directory_cache)
     }
 
     /// Get the total number of inodes currently stored in the inode table.
