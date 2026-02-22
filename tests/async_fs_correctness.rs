@@ -770,3 +770,56 @@ async fn prefetch_failure_does_not_affect_parent_readdir() {
         .unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readdir_after_evict_re_fetches_from_provider() {
+    use std::sync::atomic::Ordering;
+
+    let root = make_inode(1, INodeType::Directory, 0, None);
+    let child_a = make_inode(10, INodeType::File, 42, Some(1));
+    let child_b = make_inode(11, INodeType::File, 99, Some(1));
+
+    let mut state = MockFsState::default();
+    state.directories.insert(
+        1,
+        vec![
+            (OsString::from("a.txt"), child_a),
+            (OsString::from("b.txt"), child_b),
+        ],
+    );
+    let dp = MockFsDataProvider::new(state);
+    let readdir_count = Arc::clone(&dp.state);
+
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+
+    // First readdir populates cache.
+    let mut entries = Vec::new();
+    fs.readdir(LoadedAddr::new_unchecked(1), 0, |entry, _| {
+        entries.push(entry.name.to_os_string());
+        false
+    })
+    .await
+    .unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(readdir_count.readdir_count.load(Ordering::Relaxed), 1);
+
+    // Simulate forget: evict all children.
+    fs.evict(10);
+    fs.evict(11);
+
+    // Second readdir should re-fetch from the data provider (not return empty).
+    let mut entries2 = Vec::new();
+    fs.readdir(LoadedAddr::new_unchecked(1), 0, |entry, _| {
+        entries2.push(entry.name.to_os_string());
+        false
+    })
+    .await
+    .unwrap();
+    assert_eq!(entries2.len(), 2, "second readdir must not return empty");
+    assert_eq!(
+        readdir_count.readdir_count.load(Ordering::Relaxed),
+        2,
+        "should have called dp.readdir again after eviction"
+    );
+}

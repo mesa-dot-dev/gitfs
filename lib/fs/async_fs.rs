@@ -494,6 +494,7 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
     /// structures (path maps, etc.).
     pub fn evict(&self, addr: InodeAddr) {
         self.inode_table.remove_sync(&addr);
+        self.directory_cache.evict(LoadedAddr::new_unchecked(addr));
         self.data_provider.forget(addr);
     }
 
