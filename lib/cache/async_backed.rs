@@ -156,9 +156,17 @@ where
     /// When the factory returns `Err`, the poisoned entry is removed and the
     /// next caller becomes a new owner with its own factory invocation. This
     /// means failures are **not deduplicated**: under transient errors, N
-    /// concurrent callers may each independently invoke their factory rather
-    /// than coalescing on the first error. This is intentional — callers
-    /// may have different retry or error-handling semantics.
+    /// concurrent callers may each *sequentially* invoke their factory (one
+    /// at a time via the `entry_async` gate) rather than coalescing on the
+    /// first error. This is intentional — callers may have different retry
+    /// or error-handling semantics.
+    ///
+    /// Note: this is serial retry, not a thundering herd. Each failed owner
+    /// is replaced by exactly one new owner from the pool of waiters.
+    ///
+    // TODO(MES-776): consider adding a negative cache with short TTL so that
+    // under sustained API errors, retries are bounded to 1/TTL per key
+    // rather than N sequential calls.
     ///
     /// # Panic safety
     ///

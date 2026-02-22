@@ -149,7 +149,7 @@ impl FsDataProvider for MesRepoProvider {
                 InodePerms::from_bits_truncate(0o644)
             };
 
-            // TODO(MES-697): Address allocation is racy — two concurrent lookups for the same
+            // TODO(MES-777): Address allocation is racy — two concurrent lookups for the same
             // child path each allocate a fresh address and insert into `path_map`, causing
             // the second insert to silently overwrite the first. The `AsyncFs` lookup cache
             // deduplicates in practice, but a content-addressed scheme (hash path → addr)
