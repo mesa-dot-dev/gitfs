@@ -114,7 +114,8 @@ impl DCache {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         children.insert(name, value);
-        let _ = self.child_to_parent.insert_sync(ino, parent_ino);
+        // Upsert: overwrite if this child was previously cached under a different parent.
+        self.child_to_parent.upsert_sync(ino, parent_ino);
     }
 
     /// Iterate all cached children of `parent_ino` in name-sorted order.
@@ -211,6 +212,10 @@ impl DCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         children.retain(|_, dv| dv.ino != child_ino);
         drop(children);
+        // Reset regardless of current state. If a populate is in flight,
+        // the concurrent caller will overwrite this with DONE when it
+        // finishes; that is acceptable because the next readdir will
+        // re-fetch again.
         state.populated.store(POPULATE_UNCLAIMED, Ordering::Release);
         state.notify.notify_waiters();
     }
