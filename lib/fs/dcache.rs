@@ -150,6 +150,28 @@ impl DCache {
             .collect()
     }
 
+    /// Removes a single child entry from the cache.
+    ///
+    /// Returns the removed [`DValue`] if it was present, or `None` if the
+    /// parent or child did not exist.
+    pub fn remove_child(&self, parent_ino: LoadedAddr, name: &OsStr) -> Option<DValue> {
+        let state = self.dirs.read_sync(&parent_ino, |_, v| Arc::clone(v))?;
+        let mut children = state
+            .children
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        children.remove(name)
+    }
+
+    /// Removes the entire [`DirState`] for `parent_ino`, resetting its
+    /// population status so the next `readdir` will re-fetch from the
+    /// data provider.
+    ///
+    /// Returns `true` if an entry was removed.
+    pub fn remove_parent(&self, parent_ino: LoadedAddr) -> bool {
+        self.dirs.remove_sync(&parent_ino).is_some()
+    }
+
     /// Atomically try to claim a directory for population.
     ///
     /// Uses `compare_exchange` on the three-state flag:

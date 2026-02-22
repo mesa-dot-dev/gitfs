@@ -308,6 +308,49 @@ async fn composite_repeated_lookup_returns_same_addr() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn composite_forget_propagates_to_child_inode_table() {
+    let (provider, root_ino) = make_child_provider(100, &[("file.txt", 101, INodeType::File, 42)]);
+    let mock_state = Arc::clone(&provider.state);
+
+    let mut children = HashMap::new();
+    children.insert(OsString::from("repo"), (provider, root_ino));
+
+    let mock_root = MockRoot::new(children);
+    let composite = CompositeFs::new(mock_root, (1000, 1000));
+    let root_inode = composite.make_root_inode();
+
+    let table = Arc::new(FutureBackedCache::default());
+    table.insert_sync(1, root_inode);
+    let afs = AsyncFs::new_preseeded(composite.clone(), Arc::clone(&table));
+
+    // Navigate to the file.
+    let child_dir = afs
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("repo"))
+        .await
+        .unwrap();
+    let child_addr = child_dir.inode.addr;
+
+    let file = afs
+        .lookup(
+            LoadedAddr::new_unchecked(child_addr),
+            OsStr::new("file.txt"),
+        )
+        .await
+        .unwrap();
+    let file_addr = file.inode.addr;
+
+    // Forget the file — this should propagate to the child.
+    composite.forget(file_addr);
+
+    // The child's data provider should have received the forget call
+    // for the inner address (101).
+    assert!(
+        mock_state.forgotten_addrs.contains_sync(&101),
+        "forget should propagate to child data provider"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn composite_forget_cleans_up_slot_and_name_mapping() {
     // Setup: one child "repo" with a file.
     let (provider, root_ino) = make_child_provider(100, &[("file.txt", 101, INodeType::File, 42)]);

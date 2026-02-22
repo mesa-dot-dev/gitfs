@@ -486,6 +486,17 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         })
     }
 
+    /// Evict an inode from the inode table and notify the data provider.
+    ///
+    /// Called by the composite layer when propagating `forget` to a child
+    /// filesystem. Removes the inode from the table and calls
+    /// [`FsDataProvider::forget`] so the provider can clean up auxiliary
+    /// structures (path maps, etc.).
+    pub fn evict(&self, addr: InodeAddr) {
+        self.inode_table.remove_sync(&addr);
+        self.data_provider.forget(addr);
+    }
+
     /// Iterate directory entries for `parent`, starting from `offset`.
     ///
     /// On the first call for a given parent, fetches the directory listing
@@ -497,8 +508,6 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
     /// returns `true` (indicating the caller's buffer is full), iteration
     /// stops early.
     ///
-    /// TODO(MES-746): Implement `opendir` and `releasedir` to snapshot directory contents and
-    ///                avoid racing with `lookup`/`createfile`.
     pub async fn readdir(
         &self,
         parent: LoadedAddr,

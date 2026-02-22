@@ -221,3 +221,97 @@ async fn child_dir_addrs_returns_empty_for_unknown_parent() {
     let dirs = cache.child_dir_addrs(LoadedAddr::new_unchecked(999));
     assert!(dirs.is_empty());
 }
+
+#[tokio::test]
+async fn remove_child_returns_removed_entry() {
+    let cache = DCache::new();
+    let parent = LoadedAddr::new_unchecked(1);
+    cache.insert(
+        parent,
+        OsString::from("foo"),
+        LoadedAddr::new_unchecked(10),
+        false,
+    );
+    let removed = cache.remove_child(parent, OsStr::new("foo"));
+    assert!(removed.is_some(), "should return the removed entry");
+    let dv = removed.unwrap();
+    assert_eq!(dv.ino, LoadedAddr::new_unchecked(10));
+    assert!(!dv.is_dir);
+    assert!(
+        cache.lookup(parent, OsStr::new("foo")).is_none(),
+        "entry should no longer be present after removal"
+    );
+}
+
+#[tokio::test]
+async fn remove_child_returns_none_for_missing_entry() {
+    let cache = DCache::new();
+    let parent = LoadedAddr::new_unchecked(1);
+    assert!(cache.remove_child(parent, OsStr::new("nope")).is_none());
+}
+
+#[tokio::test]
+async fn remove_child_does_not_affect_siblings() {
+    let cache = DCache::new();
+    let parent = LoadedAddr::new_unchecked(1);
+    cache.insert(
+        parent,
+        OsString::from("a"),
+        LoadedAddr::new_unchecked(10),
+        false,
+    );
+    cache.insert(
+        parent,
+        OsString::from("b"),
+        LoadedAddr::new_unchecked(11),
+        true,
+    );
+    cache.remove_child(parent, OsStr::new("a"));
+    assert!(
+        cache.lookup(parent, OsStr::new("b")).is_some(),
+        "sibling should survive removal of another child"
+    );
+}
+
+#[tokio::test]
+async fn remove_parent_resets_populate_status() {
+    let cache = DCache::new();
+    let parent = LoadedAddr::new_unchecked(1);
+    cache.insert(
+        parent,
+        OsString::from("x"),
+        LoadedAddr::new_unchecked(10),
+        false,
+    );
+    assert!(matches!(
+        cache.try_claim_populate(parent),
+        PopulateStatus::Claimed
+    ));
+    cache.finish_populate(parent);
+    assert!(matches!(
+        cache.try_claim_populate(parent),
+        PopulateStatus::Done
+    ));
+
+    assert!(
+        cache.remove_parent(parent),
+        "should return true for existing parent"
+    );
+
+    // After removal, the parent is gone, so populate returns Claimed again.
+    assert!(matches!(
+        cache.try_claim_populate(parent),
+        PopulateStatus::Claimed
+    ));
+    // Children should also be gone.
+    assert!(cache.lookup(parent, OsStr::new("x")).is_none());
+}
+
+#[tokio::test]
+async fn remove_parent_returns_false_for_unknown() {
+    let cache = DCache::new();
+    assert!(
+        !cache.remove_parent(LoadedAddr::new_unchecked(999)),
+        "should return false for unknown parent"
+    );
+}

@@ -58,6 +58,8 @@ pub struct MockFsState {
     pub refresh_lookups: scc::HashMap<(u64, OsString), INode>,
     /// Counts how many times `readdir` has been called on this provider.
     pub readdir_count: std::sync::atomic::AtomicU64,
+    /// Tracks addresses passed to `forget`. Used to verify propagation.
+    pub forgotten_addrs: scc::HashSet<u64>,
 }
 
 /// A clonable mock data provider for `AsyncFs` tests.
@@ -113,5 +115,9 @@ impl FsDataProvider for MockFsDataProvider {
             .cloned()
             .unwrap_or_default();
         Ok(MockFileReader { data })
+    }
+
+    fn forget(&self, addr: git_fs::fs::InodeAddr) {
+        let _ = self.state.forgotten_addrs.insert_sync(addr);
     }
 }

@@ -260,6 +260,13 @@ where
     ///
     /// Returns `Some(v)` on success. Returns `None` if the factory panicked, after removing
     /// the poisoned entry from the map.
+    ///
+    /// NOTE: Every joiner that reaches `await_shared` independently calls `update_async` to
+    /// attempt promotion from `InFlight` to `Ready`. Under high concurrency (N joiners), this
+    /// results in O(N) lock acquisitions on the same bucket — only the first succeeds, and the
+    /// rest are no-ops due to the generation check. A future optimization could use an
+    /// `AtomicBool` promoter-election flag so that only one joiner attempts the `update_async`
+    /// call, reducing contention from O(N) to O(1).
     async fn await_shared(&self, key: &K, observed_gen: u64, shared: SharedFut<V>) -> Option<V> {
         let mut guard = PromoteGuard {
             map: &self.map,

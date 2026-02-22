@@ -84,6 +84,9 @@ where
 
     /// Create a new ward that will pass `ctx` to `T::delete` on cleanup.
     pub fn new(ctx: Ctx) -> Self {
+        // Force evaluation of the compile-time ZST assertion. Without this
+        // reference the const is dead code and never checked.
+        const { assert!(size_of::<T>() == 0, "T must be zero-sized") }
         Self {
             map: FxHashMap::default(),
             ctx,

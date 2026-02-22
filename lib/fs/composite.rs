@@ -461,11 +461,20 @@ where
         // serializes this with `backward_or_insert`, ensuring that any
         // concurrent lookup that arrives after this point will allocate a
         // fresh outer address rather than reusing the forgotten `addr`.
-        let bridge_empty = self
+        let (removed_inner, bridge_empty) = self
             .inner
             .slots
             .read_sync(&slot_idx, |_, slot| slot.bridge.remove_by_outer(addr))
-            .unwrap_or(false);
+            .unwrap_or((None, false));
+
+        // Propagate forget to the child's inode table and data provider so
+        // inner inodes don't leak until the entire slot is GC'd.
+        if let Some(inner_addr) = removed_inner {
+            self.inner.slots.read_sync(&slot_idx, |_, slot| {
+                slot.inner.get_fs().evict(inner_addr);
+            });
+        }
+
         // Now safe to remove from addr_to_slot — concurrent lookups that
         // raced with us either:
         // (a) ran backward_or_insert BEFORE our bridge removal and got

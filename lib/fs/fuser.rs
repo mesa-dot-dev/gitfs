@@ -1,7 +1,7 @@
 //! FUSE adapter: maps [`fuser::Filesystem`] callbacks to [`AsyncFs`](super::async_fs::AsyncFs).
 
 use std::collections::HashMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
 
 use super::async_fs::{FileReader as _, FsDataProvider};
@@ -136,13 +136,24 @@ fn inode_type_to_fuser(itype: INodeType) -> fuser::FileType {
 
 const BLOCK_SIZE: u32 = 4096;
 
+/// Snapshot of a directory listing created by `opendir`.
+enum DirSnapshot {
+    /// Directory handle allocated but not yet populated.
+    Pending,
+    /// Fully materialized directory listing.
+    Ready(Vec<(InodeAddr, OsString, INodeType)>),
+}
+
 /// Bridges a generic [`FsDataProvider`] to the [`fuser::Filesystem`] trait.
 ///
 /// Owns a self-referential inode table + ward + [`AsyncFs`](super::async_fs::AsyncFs),
-/// plus an open-file map and a tokio runtime handle for blocking on async ops.
+/// plus an open-file map, a directory-handle map, and a tokio runtime handle
+/// for blocking on async ops.
 pub struct FuserAdapter<DP: FsDataProvider> {
     inner: FuseBridgeInner<DP>,
     open_files: HashMap<FileHandle, Arc<DP::Reader>>,
+    dir_handles: HashMap<FileHandle, DirSnapshot>,
+    next_dir_fh: u64,
     runtime: tokio::runtime::Handle,
 }
 
@@ -170,6 +181,8 @@ impl<DP: FsDataProvider> FuserAdapter<DP> {
         Self {
             inner: FuseBridgeInner::create(table, provider),
             open_files: HashMap::new(),
+            dir_handles: HashMap::new(),
+            next_dir_fh: 1,
             runtime,
         }
     }
@@ -223,56 +236,107 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
             });
     }
 
-    #[instrument(name = "FuserAdapter::readdir", skip(self, _req, _fh, offset, reply))]
+    #[instrument(name = "FuserAdapter::opendir", skip(self, _req, _ino, _flags, reply))]
+    fn opendir(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        _flags: i32,
+        reply: fuser::ReplyOpen,
+    ) {
+        let fh = self.next_dir_fh;
+        self.next_dir_fh += 1;
+        self.dir_handles.insert(fh, DirSnapshot::Pending);
+        debug!(handle = fh, "replying...");
+        reply.opened(fh, 0);
+    }
+
+    #[instrument(name = "FuserAdapter::readdir", skip(self, _req, fh, offset, reply))]
     fn readdir(
         &mut self,
         _req: &fuser::Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         reply: fuser::ReplyDirectory,
     ) {
         let offset_u64 = offset.cast_unsigned();
-        self.runtime
-            .block_on(async {
-                let mut entries = Vec::new();
-                self.inner
-                    .get_fs()
-                    .readdir(
-                        LoadedAddr::new_unchecked(ino),
-                        offset_u64,
-                        |de, _next_offset| {
+
+        // Lazily populate the snapshot on the first readdir call for this handle.
+        let snapshot = match self.dir_handles.get(&fh) {
+            Some(DirSnapshot::Pending) | None => {
+                // Populate from AsyncFs and transition to Ready.
+                let result = self.runtime.block_on(async {
+                    let mut entries = Vec::new();
+                    self.inner
+                        .get_fs()
+                        .readdir(LoadedAddr::new_unchecked(ino), 0, |de, _next_offset| {
                             entries.push((de.inode.addr, de.name.to_os_string(), de.inode.itype));
                             false
-                        },
-                    )
-                    .await?;
-                Ok::<_, std::io::Error>(entries)
-            })
-            .fuse_reply(reply, |entries, mut reply| {
-                for (i, (entry_ino, entry_name, entry_itype)) in entries.iter().enumerate() {
-                    let kind = inode_type_to_fuser(*entry_itype);
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "offset fits in usize on supported 64-bit platforms"
-                    )]
-                    let abs_idx = offset_u64 as usize + i + 1;
-                    let Ok(idx): Result<i64, _> = abs_idx.try_into() else {
-                        error!("Directory entry index {} too large for fuser", abs_idx);
-                        reply.error(libc::EIO);
+                        })
+                        .await?;
+                    Ok::<_, std::io::Error>(entries)
+                });
+                match result {
+                    Ok(entries) => {
+                        self.dir_handles.insert(fh, DirSnapshot::Ready(entries));
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "replying error");
+                        reply.error(io_to_errno(&e));
                         return;
-                    };
-
-                    debug!(?entry_name, ino = entry_ino, "adding entry to reply...");
-                    if reply.add(*entry_ino, idx, kind, entry_name) {
-                        debug!("buffer full for now, stopping readdir");
-                        break;
                     }
                 }
+                match self.dir_handles.get(&fh) {
+                    Some(DirSnapshot::Ready(entries)) => entries,
+                    _ => unreachable!("just inserted Ready"),
+                }
+            }
+            Some(DirSnapshot::Ready(entries)) => entries,
+        };
 
-                debug!("finalizing reply...");
-                reply.ok();
-            });
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "offset fits in usize on supported 64-bit platforms"
+        )]
+        let skip = offset_u64 as usize;
+        let mut reply = reply;
+
+        for (i, (entry_ino, entry_name, entry_itype)) in snapshot.iter().enumerate().skip(skip) {
+            let kind = inode_type_to_fuser(*entry_itype);
+            let abs_idx = i + 1;
+            let Ok(idx): Result<i64, _> = abs_idx.try_into() else {
+                error!("Directory entry index {} too large for fuser", abs_idx);
+                reply.error(libc::EIO);
+                return;
+            };
+
+            debug!(?entry_name, ino = entry_ino, "adding entry to reply...");
+            if reply.add(*entry_ino, idx, kind, entry_name) {
+                debug!("buffer full for now, stopping readdir");
+                break;
+            }
+        }
+
+        debug!("finalizing reply...");
+        reply.ok();
+    }
+
+    #[instrument(
+        name = "FuserAdapter::releasedir",
+        skip(self, _req, _ino, fh, _flags, reply)
+    )]
+    fn releasedir(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        fh: u64,
+        _flags: i32,
+        reply: fuser::ReplyEmpty,
+    ) {
+        self.dir_handles.remove(&fh);
+        debug!("replying ok");
+        reply.ok();
     }
 
     #[instrument(name = "FuserAdapter::open", skip(self, _req, flags, reply))]

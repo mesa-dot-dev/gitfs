@@ -100,19 +100,26 @@ impl ConcurrentBridge {
 
     /// Remove the mapping for the given outer address.
     ///
-    /// Returns `true` if the bridge is empty after the removal — the caller
-    /// can use this to garbage-collect the owning slot. The emptiness check
-    /// is performed under the coordination lock so there is no TOCTOU gap
-    /// with the removal itself.
-    pub fn remove_by_outer(&self, outer: InodeAddr) -> bool {
+    /// Returns `(removed_inner, bridge_empty)`:
+    /// - `removed_inner`: the inner address that was mapped, or `None` if the
+    ///   outer address was not present.
+    /// - `bridge_empty`: whether the bridge is empty after removal — the
+    ///   caller can use this to garbage-collect the owning slot.
+    ///
+    /// The emptiness check is performed under the coordination lock so there
+    /// is no TOCTOU gap with the removal itself.
+    pub fn remove_by_outer(&self, outer: InodeAddr) -> (Option<InodeAddr>, bool) {
         let _guard = self
             .mu
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((_, inner)) = self.fwd.remove_sync(&outer) {
+        let removed_inner = if let Some((_, inner)) = self.fwd.remove_sync(&outer) {
             self.bwd.remove_sync(&inner);
-        }
-        self.fwd.is_empty()
+            Some(inner)
+        } else {
+            None
+        };
+        (removed_inner, self.fwd.is_empty())
     }
 
     /// Returns `true` if the bridge contains no mappings.
