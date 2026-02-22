@@ -73,6 +73,7 @@ type FuseWard<DP> = crate::drop_ward::DropWard<
     (
         Arc<FutureBackedCache<InodeAddr, INode>>,
         Arc<super::dcache::DCache>,
+        Arc<super::async_fs::LookupCache>,
         DP,
     ),
     InodeAddr,
@@ -89,7 +90,8 @@ impl<DP: FsDataProvider> FuseBridgeInner<DP> {
         let table = Arc::new(table);
         let fs = super::async_fs::AsyncFs::new_preseeded(provider.clone(), Arc::clone(&table));
         let dcache = fs.directory_cache();
-        let ward = crate::drop_ward::DropWard::new((table, dcache, provider));
+        let lookup_cache = fs.lookup_cache();
+        let ward = crate::drop_ward::DropWard::new((table, dcache, lookup_cache, provider));
         Self { ward, fs }
     }
 

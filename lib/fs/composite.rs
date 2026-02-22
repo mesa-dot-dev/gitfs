@@ -464,10 +464,20 @@ where
 
         // Propagate forget to the child's inode table and data provider so
         // inner inodes don't leak until the entire slot is GC'd.
+        //
+        // Clone the `Arc<ChildInner>` out of the scc bucket guard before
+        // calling `evict`. `evict` does O(n) work (`retain_sync` on the
+        // lookup_cache), and holding the `slots` bucket lock for the
+        // entire duration would block concurrent lookups and forgets that
+        // hash to the same bucket.
         if let Some(inner_addr) = removed_inner {
-            self.inner.slots.read_sync(&slot_idx, |_, slot| {
-                slot.inner.get_fs().evict(inner_addr);
-            });
+            let child = self
+                .inner
+                .slots
+                .read_sync(&slot_idx, |_, slot| Arc::clone(&slot.inner));
+            if let Some(child) = child {
+                child.get_fs().evict(inner_addr);
+            }
         }
 
         // Now safe to remove from addr_to_slot — concurrent lookups that

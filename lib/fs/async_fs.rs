@@ -15,6 +15,13 @@ use crate::fs::{
     dcache::DCache,
 };
 
+/// The concrete type of the lookup cache used by [`AsyncFs`].
+///
+/// Keyed by `(parent_addr, child_name)`, valued by the resolved `INode`.
+/// Exposed as a type alias so [`InodeForget`] can include it in its
+/// `StatelessDrop` context without repeating the full generic signature.
+pub type LookupCache = FutureBackedCache<(InodeAddr, Arc<OsStr>), INode>;
+
 /// A reader for an open file, returned by [`FsDataProvider::open`].
 ///
 /// Implementors provide the actual data for read operations. The FUSE
@@ -93,17 +100,42 @@ impl StatelessDrop<Arc<FutureBackedCache<InodeAddr, INode>>, InodeAddr> for Inod
     }
 }
 
-/// Evicts the inode from the table and the directory cache, then delegates to
-/// [`FsDataProvider::forget`] so the provider can clean up its own auxiliary
-/// state.
+/// Evicts the inode from the table, directory cache, and lookup cache, then
+/// delegates to [`FsDataProvider::forget`] so the provider can clean up its
+/// own auxiliary state.
+///
+/// The lookup cache cleanup (`remove_ready_if_sync`) ensures that stale
+/// `(parent, name) → INode` entries do not survive after FUSE forgets an
+/// inode. Without this, a subsequent `lookup` would hit the stale cache
+/// entry, observe a missing inode table entry, and have to fall through to
+/// the slow path — correct but wasteful.
 impl<DP: FsDataProvider>
-    StatelessDrop<(Arc<FutureBackedCache<InodeAddr, INode>>, Arc<DCache>, DP), InodeAddr>
-    for InodeForget
+    StatelessDrop<
+        (
+            Arc<FutureBackedCache<InodeAddr, INode>>,
+            Arc<DCache>,
+            Arc<LookupCache>,
+            DP,
+        ),
+        InodeAddr,
+    > for InodeForget
 {
-    fn delete(ctx: &(Arc<FutureBackedCache<InodeAddr, INode>>, Arc<DCache>, DP), key: &InodeAddr) {
+    fn delete(
+        ctx: &(
+            Arc<FutureBackedCache<InodeAddr, INode>>,
+            Arc<DCache>,
+            Arc<LookupCache>,
+            DP,
+        ),
+        key: &InodeAddr,
+    ) {
+        let addr = *key;
         ctx.0.remove_sync(key);
-        ctx.1.evict(LoadedAddr::new_unchecked(*key));
-        ctx.2.forget(*key);
+        ctx.1.evict(LoadedAddr::new_unchecked(addr));
+        ctx.2.remove_ready_if_sync(|&(parent_addr, _), child| {
+            parent_addr == addr || child.addr == addr
+        });
+        ctx.3.forget(addr);
     }
 }
 
@@ -294,7 +326,11 @@ pub struct AsyncFs<DP: FsDataProvider> {
 
     /// Deduplicating lookup cache keyed by `(parent_addr, child_name)`. The factory is
     /// `dp.lookup()`, so the data provider is only called on a true cache miss.
-    lookup_cache: FutureBackedCache<(InodeAddr, Arc<OsStr>), INode>,
+    ///
+    /// Wrapped in `Arc` so that [`InodeForget`] can include it in its
+    /// `StatelessDrop` context and clean up stale entries when FUSE forgets
+    /// an inode.
+    lookup_cache: Arc<LookupCache>,
 
     /// Directory entry cache, mapping `(parent, name)` to child inode address.
     directory_cache: Arc<DCache>,
@@ -322,7 +358,7 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
 
         Self {
             inode_table,
-            lookup_cache: FutureBackedCache::default(),
+            lookup_cache: Arc::new(LookupCache::default()),
             directory_cache: Arc::new(DCache::new()),
             data_provider,
             next_fh: AtomicU64::new(1),
@@ -341,7 +377,7 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
     ) -> Self {
         Self {
             inode_table,
-            lookup_cache: FutureBackedCache::default(),
+            lookup_cache: Arc::new(LookupCache::default()),
             directory_cache: Arc::new(DCache::new()),
             data_provider,
             next_fh: AtomicU64::new(1),
@@ -378,6 +414,16 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
     #[must_use]
     pub fn directory_cache(&self) -> Arc<DCache> {
         Arc::clone(&self.directory_cache)
+    }
+
+    /// Returns a clone of the lookup cache handle.
+    ///
+    /// Used by the FUSE adapter to pass the cache into the [`DropWard`]
+    /// context so that [`InodeForget`] can clean up stale
+    /// `(parent, name) → INode` entries when the kernel forgets an inode.
+    #[must_use]
+    pub fn lookup_cache(&self) -> Arc<LookupCache> {
+        Arc::clone(&self.lookup_cache)
     }
 
     /// Get the total number of inodes currently stored in the inode table.
