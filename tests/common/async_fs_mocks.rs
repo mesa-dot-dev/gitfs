@@ -56,6 +56,8 @@ pub struct MockFsState {
     /// precedence and are consumed on use (removed after the first hit).
     /// Existing tests are unaffected because this defaults to empty.
     pub refresh_lookups: scc::HashMap<(u64, OsString), INode>,
+    /// Counts how many times `readdir` has been called on this provider.
+    pub readdir_count: std::sync::atomic::AtomicU64,
 }
 
 /// A clonable mock data provider for `AsyncFs` tests.
@@ -89,6 +91,9 @@ impl FsDataProvider for MockFsDataProvider {
     }
 
     async fn readdir(&self, parent: INode) -> Result<Vec<(OsString, INode)>, std::io::Error> {
+        self.state
+            .readdir_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.state
             .directories
             .get(&parent.addr)

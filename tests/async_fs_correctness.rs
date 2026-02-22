@@ -675,3 +675,98 @@ async fn lookup_after_readdir_uses_directory_cache() {
         .unwrap();
     assert_eq!(tracked.inode.addr, 10);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readdir_prefetches_child_directories() {
+    use std::sync::atomic::Ordering;
+
+    let root = make_inode(1, INodeType::Directory, 0, None);
+    let child_dir = make_inode(10, INodeType::Directory, 0, Some(1));
+    let child_file = make_inode(11, INodeType::File, 100, Some(1));
+    let grandchild = make_inode(20, INodeType::File, 50, Some(10));
+
+    let mut state = MockFsState::default();
+    state.directories.insert(
+        1,
+        vec![
+            (OsString::from("subdir"), child_dir),
+            (OsString::from("file.txt"), child_file),
+        ],
+    );
+    state
+        .directories
+        .insert(10, vec![(OsString::from("grandchild.txt"), grandchild)]);
+    let dp = MockFsDataProvider::new(state);
+    let readdir_count = Arc::clone(&dp.state);
+
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+
+    // readdir on root should trigger prefetch of child_dir (addr=10)
+    fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, _| false)
+        .await
+        .unwrap();
+
+    // Wait for prefetch to complete (mock is instant, just need task to run)
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // dp.readdir should have been called twice: once for root, once for child_dir prefetch
+    assert_eq!(
+        readdir_count.readdir_count.load(Ordering::Relaxed),
+        2,
+        "prefetch should have called readdir on the child directory"
+    );
+
+    // Now readdir on child_dir should NOT call dp.readdir again (served from cache)
+    let mut entries = Vec::new();
+    fs.readdir(LoadedAddr::new_unchecked(10), 0, |entry, _| {
+        entries.push(entry.name.to_os_string());
+        false
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(entries, vec![OsString::from("grandchild.txt")]);
+    assert_eq!(
+        readdir_count.readdir_count.load(Ordering::Relaxed),
+        2,
+        "cached readdir should not call dp.readdir again"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prefetch_failure_does_not_affect_parent_readdir() {
+    let root = make_inode(1, INodeType::Directory, 0, None);
+    let child_dir = make_inode(10, INodeType::Directory, 0, Some(1));
+
+    let mut state = MockFsState::default();
+    state
+        .directories
+        .insert(1, vec![(OsString::from("bad_dir"), child_dir)]);
+    // Don't configure readdir for addr=10 — mock will return ENOENT
+    let dp = MockFsDataProvider::new(state);
+
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+
+    // Parent readdir should succeed even though child prefetch will fail
+    let mut entries = Vec::new();
+    fs.readdir(LoadedAddr::new_unchecked(1), 0, |entry, _| {
+        entries.push(entry.name.to_os_string());
+        false
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(entries, vec![OsString::from("bad_dir")]);
+
+    // Wait for prefetch to attempt and fail
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Direct readdir on child should still work (CAS reset to UNCLAIMED by PopulateGuard)
+    let err = fs
+        .readdir(LoadedAddr::new_unchecked(10), 0, |_, _| false)
+        .await
+        .unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+}

@@ -219,6 +219,49 @@ impl Drop for PopulateGuard<'_> {
     }
 }
 
+/// Background-populate a single child directory into the caches.
+///
+/// Uses the same CAS gate as `readdir` so duplicate work is impossible.
+/// Errors are silently ignored — prefetch is best-effort.
+async fn prefetch_dir<DP: FsDataProvider>(
+    dir_addr: LoadedAddr,
+    directory_cache: Arc<DCache>,
+    inode_table: Arc<FutureBackedCache<InodeAddr, INode>>,
+    data_provider: DP,
+) {
+    use crate::fs::dcache::PopulateStatus;
+
+    match directory_cache.try_claim_populate(dir_addr) {
+        PopulateStatus::Claimed => {}
+        PopulateStatus::InProgress | PopulateStatus::Done => return,
+    }
+
+    let mut guard = PopulateGuard::new(&directory_cache, dir_addr);
+
+    let Some(dir_inode) = inode_table.get(&dir_addr.addr()).await else {
+        return;
+    };
+
+    let Ok(children) = data_provider.readdir(dir_inode).await else {
+        return;
+    };
+
+    for (name, child_inode) in children {
+        let is_dir = child_inode.itype == INodeType::Directory;
+        inode_table
+            .get_or_init(child_inode.addr, || async move { child_inode })
+            .await;
+        directory_cache.insert(
+            dir_addr,
+            name,
+            LoadedAddr::new_unchecked(child_inode.addr),
+            is_dir,
+        );
+    }
+    directory_cache.finish_populate(dir_addr);
+    guard.defuse();
+}
+
 /// An asynchronous filesystem cache mapping `InodeAddr` to `INode`.
 ///
 /// Uses two [`FutureBackedCache`] layers:
@@ -280,6 +323,17 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
             directory_cache: Arc::new(DCache::new()),
             data_provider,
             next_fh: AtomicU64::new(1),
+        }
+    }
+
+    /// Spawn background tasks to prefetch each child directory of `parent`.
+    fn spawn_prefetch_children(&self, parent: LoadedAddr) {
+        let child_dirs = self.directory_cache.child_dir_addrs(parent);
+        for child_addr in child_dirs {
+            let dcache = Arc::clone(&self.directory_cache);
+            let table = Arc::clone(&self.inode_table);
+            let dp = self.data_provider.clone();
+            tokio::spawn(prefetch_dir(child_addr, dcache, table, dp));
         }
     }
 
@@ -460,6 +514,7 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
                     }
                     self.directory_cache.finish_populate(parent);
                     guard.defuse();
+                    self.spawn_prefetch_children(parent);
                     break;
                 }
                 PopulateStatus::InProgress => {
