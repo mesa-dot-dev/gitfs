@@ -223,17 +223,46 @@ impl DCache {
     /// concurrent `readdir` is mid-populate (`IN_PROGRESS`), a blind store
     /// of `UNCLAIMED` would be overwritten by the populator's final `DONE`
     /// store, leaving the cache in a stale-but-marked-done state.
+    ///
+    /// # Ordering with concurrent `insert`
+    ///
+    /// The reverse-index removal and children-map removal are performed
+    /// while holding the parent's `children` write lock. This serializes
+    /// with `insert` (which also holds the write lock while updating the
+    /// reverse indices), preventing a race where a concurrent `insert`
+    /// for the same child inode could clobber freshly removed reverse-index
+    /// entries between `child_to_parent.remove_sync` and the write lock
+    /// acquisition.
     pub fn evict(&self, child_ino: LoadedAddr) {
-        let Some((_, parent_ino)) = self.child_to_parent.remove_sync(&child_ino) else {
+        // Read the parent without removing — we need the write lock first
+        // to serialize with concurrent `insert`.
+        let Some(parent_ino) = self.child_to_parent.read_sync(&child_ino, |_, &v| v) else {
             return;
         };
         let Some(state) = self.dirs.read_sync(&parent_ino, |_, v| Arc::clone(v)) else {
+            // Parent dir was removed; clean up reverse indices.
+            self.child_to_parent.remove_sync(&child_ino);
+            self.child_to_name.remove_sync(&child_ino);
             return;
         };
         let mut children = state
             .children
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Re-check that child_to_parent still points to this parent.
+        // A concurrent `insert` may have re-parented the child while we
+        // were waiting for the write lock.
+        let still_ours = self
+            .child_to_parent
+            .read_sync(&child_ino, |_, &v| v == parent_ino)
+            .unwrap_or(false);
+        if !still_ours {
+            // The child was re-parented by a concurrent insert.
+            // Nothing to do — the new parent owns the reverse indices.
+            return;
+        }
+        // Now atomically remove reverse indices and children entry.
+        self.child_to_parent.remove_sync(&child_ino);
         if let Some((_, name)) = self.child_to_name.remove_sync(&child_ino) {
             children.remove(&name);
         }

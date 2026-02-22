@@ -153,6 +153,11 @@ impl FsDataProvider for MesRepoProvider {
             // the second insert to silently overwrite the first. The `AsyncFs` lookup cache
             // deduplicates in practice, but a content-addressed scheme (hash path → addr)
             // would eliminate the race structurally.
+            //
+            // This also interacts badly with cache eviction: when an inode is evicted and
+            // later re-looked-up, a fresh address is minted, leaking stale bridge and
+            // addr_to_slot entries for the old address. A stable, content-addressed scheme
+            // would make re-lookup return the same address and avoid the leak.
             let addr = inner.next_addr.fetch_add(1, Ordering::Relaxed);
             drop(inner.path_map.insert_async(addr, child_path).await);
 

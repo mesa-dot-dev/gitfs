@@ -282,6 +282,12 @@ const MAX_PREFETCH_CONCURRENCY: usize = 8;
 ///   called on a true cache miss (not already cached or in-flight).
 ///
 /// The [`DCache`] sits in front as a synchronous fast path mapping `(parent, name)` to child addr.
+///
+/// **Known limitation:** Both `inode_table` and `lookup_cache` grow monotonically — entries are
+/// only removed when FUSE sends `forget`, which may never happen for long-lived mounts or
+/// recursive traversals (e.g. `find`, `tree`). Under sustained traversal the memory footprint
+/// grows without bound. Adding LRU or TTL-based eviction to these caches is a planned
+/// improvement.
 pub struct AsyncFs<DP: FsDataProvider> {
     /// Canonical addr -> `INode` map. Used by `loaded_inode()` to retrieve inodes by address.
     inode_table: Arc<FutureBackedCache<InodeAddr, INode>>,
