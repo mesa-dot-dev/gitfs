@@ -75,15 +75,15 @@ impl ConcurrentBridge {
         self.bwd.read_sync(&inner, |_, &v| v)
     }
 
-    /// Look up inner -> outer, or allocate a new outer address if unmapped.
+    /// Look up inner -> outer, or insert `fallback` as the new outer address.
+    ///
+    /// `fallback` is a pre-allocated address provided by the caller. If the
+    /// inner address already has a mapping, `fallback` is unused (the caller
+    /// accepts that the monotonic address counter may skip values).
     ///
     /// Serialized with other mutations via the coordination lock.
     #[must_use]
-    pub fn backward_or_insert(
-        &self,
-        inner: InodeAddr,
-        allocate: impl FnOnce() -> InodeAddr,
-    ) -> InodeAddr {
+    pub fn backward_or_insert(&self, inner: InodeAddr, fallback: InodeAddr) -> InodeAddr {
         let _guard = self
             .mu
             .lock()
@@ -91,10 +91,9 @@ impl ConcurrentBridge {
         match self.bwd.entry_sync(inner) {
             scc::hash_map::Entry::Occupied(occ) => *occ.get(),
             scc::hash_map::Entry::Vacant(vac) => {
-                let outer = allocate();
-                vac.insert_entry(outer);
-                let _ = self.fwd.insert_sync(outer, inner);
-                outer
+                vac.insert_entry(fallback);
+                let _ = self.fwd.insert_sync(fallback, inner);
+                fallback
             }
         }
     }

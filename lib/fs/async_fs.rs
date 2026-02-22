@@ -486,20 +486,31 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
             }
         }
 
-        let children = self.directory_cache.readdir(parent);
-
         #[expect(
             clippy::cast_possible_truncation,
             reason = "offset fits in usize on supported 64-bit platforms"
         )]
-        for (i, (name, dvalue)) in children.iter().enumerate().skip(offset as usize) {
-            let Some(inode) = self.inode_table.get(&dvalue.ino.addr()).await else {
+        let skip = offset as usize;
+
+        // Collect only entries at or past `offset`, avoiding clones for
+        // entries that will be skipped during paginated readdir.
+        let mut entries: Vec<(OsString, LoadedAddr)> = Vec::new();
+        let mut idx = 0usize;
+        self.directory_cache.readdir(parent, |name, dvalue| {
+            if idx >= skip {
+                entries.push((name.to_os_string(), dvalue.ino));
+            }
+            idx += 1;
+        });
+
+        for (i, (name, child_addr)) in entries.iter().enumerate() {
+            let Some(inode) = self.inode_table.get(&child_addr.addr()).await else {
                 // Inode was evicted between readdir collection and iteration
                 // (e.g. by a concurrent forget). Skip the stale entry.
-                tracing::debug!(addr = ?dvalue.ino.addr(), name = ?name, "inode evicted during readdir, skipping");
+                tracing::debug!(addr = ?child_addr.addr(), name = ?name, "inode evicted during readdir, skipping");
                 continue;
             };
-            let next_offset = (i + 1) as u64;
+            let next_offset = (skip + i + 1) as u64;
             if filler(DirEntry { name, inode }, next_offset) {
                 break;
             }

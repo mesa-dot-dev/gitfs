@@ -129,6 +129,9 @@ impl<R: FileReader> FileReader for CompositeReader<R> {
 struct ChildSlot<DP: FsDataProvider> {
     inner: Arc<ChildInner<DP>>,
     bridge: Arc<ConcurrentBridge>,
+    /// The name under which this child was registered in `name_to_slot`.
+    /// Stored here so `forget` can do O(1) removal instead of a linear scan.
+    name: OsString,
 }
 
 struct CompositeFsInner<R: CompositeRoot> {
@@ -250,6 +253,7 @@ impl<R: CompositeRoot> CompositeFs<R> {
             ChildSlot {
                 inner: child_inner,
                 bridge,
+                name: desc.name.clone(),
             },
         ));
         let _ = self.inner.addr_to_slot.insert_sync(outer_ino, slot_idx);
@@ -348,9 +352,8 @@ where
             let child_inode = tracked.inode;
 
             // Translate inner address back to composite-level address (outside scc guard).
-            let outer_ino = bridge.backward_or_insert(child_inode.addr, || {
-                self.inner.next_ino.fetch_add(1, Ordering::Relaxed)
-            });
+            let fallback = self.allocate_ino();
+            let outer_ino = bridge.backward_or_insert(child_inode.addr, fallback);
 
             let _ = self.inner.addr_to_slot.insert_sync(outer_ino, slot_idx);
 
@@ -405,9 +408,8 @@ where
             // Translate all inner addresses to composite-level addresses (outside scc guard).
             let mut entries = Vec::with_capacity(child_entries.len());
             for (name, child_inode) in child_entries {
-                let outer_ino = bridge.backward_or_insert(child_inode.addr, || {
-                    self.inner.next_ino.fetch_add(1, Ordering::Relaxed)
-                });
+                let fallback = self.allocate_ino();
+                let outer_ino = bridge.backward_or_insert(child_inode.addr, fallback);
 
                 let _ = self.inner.addr_to_slot.insert_sync(outer_ino, slot_idx);
                 entries.push((
@@ -479,11 +481,8 @@ where
                     .inner
                     .slots
                     .remove_if_sync(&slot_idx, |slot| slot.bridge.is_empty());
-                if removed.is_some() {
-                    // Clean up name_to_slot to prevent dead slot indices.
-                    self.inner
-                        .name_to_slot
-                        .retain_sync(|_, &mut idx| idx != slot_idx);
+                if let Some((_, slot)) = removed {
+                    self.inner.name_to_slot.remove_sync(&slot.name);
                 }
             }
         }

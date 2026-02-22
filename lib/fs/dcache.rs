@@ -112,21 +112,22 @@ impl DCache {
         children.insert(name, value);
     }
 
-    /// Returns all cached children of `parent_ino` as `(name, value)` pairs.
+    /// Iterate all cached children of `parent_ino` in name-sorted order.
     ///
-    /// Entries are returned in name-sorted order (guaranteed by `BTreeMap`).
-    pub fn readdir(&self, parent_ino: LoadedAddr) -> Vec<(OsString, DValue)> {
+    /// Calls `f` for each `(name, value)` pair while holding the read lock.
+    /// Callers decide what to collect, avoiding unnecessary allocations for
+    /// entries that will be skipped (e.g. by offset-based pagination).
+    pub fn readdir(&self, parent_ino: LoadedAddr, mut f: impl FnMut(&OsStr, &DValue)) {
         let Some(state) = self.dirs.read_sync(&parent_ino, |_, v| Arc::clone(v)) else {
-            return Vec::new();
+            return;
         };
         let children = state
             .children
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        children
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+        for (name, value) in children.iter() {
+            f(name, value);
+        }
     }
 
     /// Atomically try to claim a directory for population.

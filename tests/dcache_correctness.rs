@@ -52,7 +52,10 @@ async fn readdir_returns_only_children_of_parent() {
         LoadedAddr::new_unchecked(12),
         false,
     );
-    let children = cache.readdir(LoadedAddr::new_unchecked(1));
+    let mut children = Vec::new();
+    cache.readdir(LoadedAddr::new_unchecked(1), |name, dvalue| {
+        children.push((name.to_os_string(), dvalue.clone()));
+    });
     assert_eq!(children.len(), 2);
     let names: Vec<_> = children.iter().map(|(n, _)| n.clone()).collect();
     assert!(names.contains(&OsString::from("a")));
@@ -62,7 +65,10 @@ async fn readdir_returns_only_children_of_parent() {
 #[tokio::test]
 async fn readdir_empty_parent_returns_empty() {
     let cache = DCache::new();
-    let children = cache.readdir(LoadedAddr::new_unchecked(1));
+    let mut children = Vec::new();
+    cache.readdir(LoadedAddr::new_unchecked(1), |name, dvalue| {
+        children.push((name.to_os_string(), dvalue.clone()));
+    });
     assert!(children.is_empty());
 }
 
@@ -167,7 +173,9 @@ async fn readdir_returns_entries_in_sorted_order() {
             false,
         );
     }
-    let children = cache.readdir(LoadedAddr::new_unchecked(1));
-    let names: Vec<_> = children.iter().map(|(n, _)| n.to_str().unwrap()).collect();
+    let mut names = Vec::new();
+    cache.readdir(LoadedAddr::new_unchecked(1), |name, _| {
+        names.push(name.to_str().unwrap().to_owned());
+    });
     assert_eq!(names, ["apple", "mango", "zebra"]);
 }

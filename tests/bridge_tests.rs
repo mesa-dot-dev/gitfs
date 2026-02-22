@@ -26,15 +26,15 @@ fn forward_missing_returns_none() {
 fn backward_or_insert_existing_returns_cached() {
     let bridge = ConcurrentBridge::new();
     bridge.insert(10, 100);
-    let outer = bridge.backward_or_insert(100, || 999);
+    let outer = bridge.backward_or_insert(100, 999);
     assert_eq!(outer, 10, "should return existing outer addr");
 }
 
 #[test]
 fn backward_or_insert_new_allocates() {
     let bridge = ConcurrentBridge::new();
-    let outer = bridge.backward_or_insert(200, || 50);
-    assert_eq!(outer, 50, "should use allocator");
+    let outer = bridge.backward_or_insert(200, 50);
+    assert_eq!(outer, 50, "should use fallback address");
     assert_eq!(bridge.forward(50), Some(200));
     assert_eq!(bridge.backward(200), Some(50));
 }
