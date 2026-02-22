@@ -188,14 +188,23 @@ impl DCache {
     /// Wait until a directory is no longer in the `InProgress` state.
     ///
     /// Uses [`Notify`] to sleep efficiently instead of spinning.
+    ///
+    /// The `Notified` future is pinned and `enable()`d before checking the
+    /// flag so that the waiter is registered with the `Notify` *before* the
+    /// state check. Without this, a `notify_waiters()` firing between
+    /// `notified()` and the first poll would be lost (since
+    /// `notify_waiters` does not store a permit), causing a permanent hang.
     pub async fn wait_populated(&self, parent_ino: LoadedAddr) {
         let state = self.dir_state(parent_ino);
         loop {
-            let notified = state.notify.notified();
+            let mut notified = std::pin::pin!(state.notify.notified());
+            notified.as_mut().enable();
             let current = state.populated.load(Ordering::Acquire);
             if current != POPULATE_IN_PROGRESS {
                 return;
             }
+            // SAFETY(cancel): re-entering the loop re-creates the Notified
+            // future, so spurious wakeups just re-check the flag.
             notified.await;
         }
     }

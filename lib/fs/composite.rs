@@ -431,9 +431,18 @@ where
         })
     }
 
-    /// Removes the composite-level address from `addr_to_slot` and the
-    /// child's bridge map. When the bridge becomes empty, the slot and its
-    /// `name_to_slot` entry are garbage-collected.
+    /// Removes the composite-level address from the child's bridge map and
+    /// then from `addr_to_slot`. When the bridge becomes empty, the slot
+    /// and its `name_to_slot` entry are garbage-collected.
+    ///
+    /// **Ordering invariant:** the bridge mapping is removed *before*
+    /// `addr_to_slot` so that a concurrent [`lookup`](Self::lookup)
+    /// calling `backward_or_insert` will allocate a *fresh* outer address
+    /// (since the old inner→outer entry is already gone from the bridge)
+    /// rather than returning the about-to-be-forgotten address. Because
+    /// the fresh address differs from the forgotten one, the subsequent
+    /// `addr_to_slot.remove_sync` here cannot destroy the concurrent
+    /// lookup's mapping.
     ///
     /// The slot removal uses `remove_if_sync` with a re-check of
     /// `bridge.is_empty()`, preventing a concurrent `backward_or_insert`
@@ -445,25 +454,41 @@ where
         if addr == Self::ROOT_INO {
             return;
         }
-        if let Some((_, slot_idx)) = self.inner.addr_to_slot.remove_sync(&addr) {
-            // Remove the outer->inner mapping from the bridge. The bridge's
-            // internal mutex serializes this with `backward_or_insert`.
-            let bridge_empty = self
+        let Some(slot_idx) = self.inner.addr_to_slot.read_sync(&addr, |_, &v| v) else {
+            return;
+        };
+        // Remove from the bridge FIRST. The bridge's internal mutex
+        // serializes this with `backward_or_insert`, ensuring that any
+        // concurrent lookup that arrives after this point will allocate a
+        // fresh outer address rather than reusing the forgotten `addr`.
+        let bridge_empty = self
+            .inner
+            .slots
+            .read_sync(&slot_idx, |_, slot| slot.bridge.remove_by_outer(addr))
+            .unwrap_or(false);
+        // Now safe to remove from addr_to_slot — concurrent lookups that
+        // raced with us either:
+        // (a) ran backward_or_insert BEFORE our bridge removal and got
+        //     `addr` back (same key we are removing — acceptable, see
+        //     below), or
+        // (b) ran AFTER and got a fresh fallback address (different key,
+        //     unaffected by this removal).
+        //
+        // Case (a) is a FUSE protocol-level race: the kernel sent
+        // `forget` for this address while a lookup resolved to the same
+        // inner entity. In practice, this should not occur because
+        // `forget` fires only when nlookup reaches zero.
+        self.inner.addr_to_slot.remove_sync(&addr);
+        if bridge_empty {
+            // Bridge is empty — atomically remove the slot only if no one
+            // has re-populated the bridge between our check and this removal.
+            // `remove_if_sync` holds the scc bucket lock during evaluation.
+            let removed = self
                 .inner
                 .slots
-                .read_sync(&slot_idx, |_, slot| slot.bridge.remove_by_outer(addr))
-                .unwrap_or(false);
-            if bridge_empty {
-                // Bridge is empty — atomically remove the slot only if no one
-                // has re-populated the bridge between our check and this removal.
-                // `remove_if_sync` holds the scc bucket lock during evaluation.
-                let removed = self
-                    .inner
-                    .slots
-                    .remove_if_sync(&slot_idx, |slot| slot.bridge.is_empty());
-                if let Some((_, slot)) = removed {
-                    self.inner.name_to_slot.remove_sync(&slot.name);
-                }
+                .remove_if_sync(&slot_idx, |slot| slot.bridge.is_empty());
+            if let Some((_, slot)) = removed {
+                self.inner.name_to_slot.remove_sync(&slot.name);
             }
         }
     }
