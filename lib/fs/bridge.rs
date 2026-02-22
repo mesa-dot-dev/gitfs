@@ -118,11 +118,25 @@ impl ConcurrentBridge {
     /// Returns `true` if the bridge contains no mappings.
     ///
     /// Reads are not serialized with mutations. The result is a
-    /// snapshot that may be immediately stale. Use under the
-    /// coordination lock or an external guard when consistency
-    /// with mutations is required.
+    /// snapshot that may be immediately stale. Use [`is_empty_locked`](Self::is_empty_locked)
+    /// when consistency with concurrent mutations is required.
     #[must_use]
     pub fn is_empty(&self) -> bool {
+        self.fwd.is_empty()
+    }
+
+    /// Returns `true` if the bridge contains no mappings, serialized with
+    /// mutations via the coordination lock.
+    ///
+    /// Use this instead of [`is_empty`](Self::is_empty) when the result
+    /// must be consistent with a concurrent [`backward_or_insert`](Self::backward_or_insert)
+    /// that may be mid-insert.
+    #[must_use]
+    pub fn is_empty_locked(&self) -> bool {
+        let _guard = self
+            .mu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.fwd.is_empty()
     }
 }

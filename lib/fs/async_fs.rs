@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
+use tokio::sync::Semaphore;
 
 use crate::cache::async_backed::FutureBackedCache;
 use crate::drop_ward::StatelessDrop;
@@ -262,6 +263,14 @@ async fn prefetch_dir<DP: FsDataProvider>(
     guard.defuse();
 }
 
+/// Maximum number of concurrent prefetch tasks spawned per [`AsyncFs`] instance.
+///
+/// Prevents thundering-herd API calls when a parent directory contains many
+/// subdirectories (e.g. `node_modules`). Each `readdir` that discovers child
+/// directories spawns at most this many concurrent prefetch tasks; additional
+/// children wait for a permit.
+const MAX_PREFETCH_CONCURRENCY: usize = 8;
+
 /// An asynchronous filesystem cache mapping `InodeAddr` to `INode`.
 ///
 /// Uses two [`FutureBackedCache`] layers:
@@ -286,6 +295,9 @@ pub struct AsyncFs<DP: FsDataProvider> {
 
     /// Monotonically increasing file handle counter. Starts at 1 (0 is reserved).
     next_fh: AtomicU64,
+
+    /// Bounds the number of concurrent background prefetch tasks.
+    prefetch_semaphore: Arc<Semaphore>,
 }
 
 impl<DP: FsDataProvider> AsyncFs<DP> {
@@ -305,6 +317,7 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
             directory_cache: Arc::new(DCache::new()),
             data_provider,
             next_fh: AtomicU64::new(1),
+            prefetch_semaphore: Arc::new(Semaphore::new(MAX_PREFETCH_CONCURRENCY)),
         }
     }
 
@@ -323,17 +336,26 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
             directory_cache: Arc::new(DCache::new()),
             data_provider,
             next_fh: AtomicU64::new(1),
+            prefetch_semaphore: Arc::new(Semaphore::new(MAX_PREFETCH_CONCURRENCY)),
         }
     }
 
     /// Spawn background tasks to prefetch each child directory of `parent`.
+    ///
+    /// Concurrency is bounded by [`MAX_PREFETCH_CONCURRENCY`] via a shared
+    /// semaphore, preventing thundering-herd API calls when a parent
+    /// directory contains many subdirectories.
     fn spawn_prefetch_children(&self, parent: LoadedAddr) {
         let child_dirs = self.directory_cache.child_dir_addrs(parent);
         for child_addr in child_dirs {
+            let sem = Arc::clone(&self.prefetch_semaphore);
             let dcache = Arc::clone(&self.directory_cache);
             let table = Arc::clone(&self.inode_table);
             let dp = self.data_provider.clone();
-            tokio::spawn(prefetch_dir(child_addr, dcache, table, dp));
+            tokio::spawn(async move {
+                let _permit = sem.acquire().await;
+                prefetch_dir(child_addr, dcache, table, dp).await;
+            });
         }
     }
 

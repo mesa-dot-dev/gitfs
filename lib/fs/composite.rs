@@ -445,9 +445,9 @@ where
     /// lookup's mapping.
     ///
     /// The slot removal uses `remove_if_sync` with a re-check of
-    /// `bridge.is_empty()`, preventing a concurrent `backward_or_insert`
-    /// from inserting a new mapping between the bridge emptiness check
-    /// and the slot removal.
+    /// `bridge.is_empty_locked()`, which acquires the bridge's
+    /// coordination mutex to serialize with a concurrent
+    /// `backward_or_insert` that may be mid-insert.
     ///
     /// The root inode is never forgotten.
     fn forget(&self, addr: InodeAddr) {
@@ -482,11 +482,13 @@ where
         if bridge_empty {
             // Bridge is empty — atomically remove the slot only if no one
             // has re-populated the bridge between our check and this removal.
-            // `remove_if_sync` holds the scc bucket lock during evaluation.
+            // `remove_if_sync` holds the scc bucket lock during evaluation,
+            // and `is_empty_locked` acquires the bridge's coordination mutex
+            // to serialize with any concurrent `backward_or_insert`.
             let removed = self
                 .inner
                 .slots
-                .remove_if_sync(&slot_idx, |slot| slot.bridge.is_empty());
+                .remove_if_sync(&slot_idx, |slot| slot.bridge.is_empty_locked());
             if let Some((_, slot)) = removed {
                 self.inner.name_to_slot.remove_sync(&slot.name);
             }
