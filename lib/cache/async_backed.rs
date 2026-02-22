@@ -60,6 +60,14 @@ where
     /// computation instead of spawning a duplicate. If the factory panics, the entry is removed
     /// and the next caller retries with a fresh factory invocation.
     ///
+    /// # Panic safety
+    ///
+    /// The factory is wrapped in `AssertUnwindSafe` + `catch_unwind` to prevent a panicking
+    /// factory from permanently poisoning the cache slot. Factories that capture shared mutable
+    /// state must ensure panics do not leave that state inconsistent. In practice this is
+    /// satisfied when factories capture only `Arc`, owned data, or immutable references — which
+    /// is the case for all callers in this codebase.
+    ///
     /// # Panics
     ///
     /// Panics only if *this* caller's own factory panicked (i.e. this caller won the `Vacant`
@@ -151,6 +159,14 @@ where
     /// concurrent callers may each independently invoke their factory rather
     /// than coalescing on the first error. This is intentional — callers
     /// may have different retry or error-handling semantics.
+    ///
+    /// # Panic safety
+    ///
+    /// The factory is wrapped in `AssertUnwindSafe` + `catch_unwind` to prevent a panicking
+    /// factory from permanently poisoning the cache slot. Factories that capture shared mutable
+    /// state must ensure panics do not leave that state inconsistent. In practice this is
+    /// satisfied when factories capture only `Arc`, owned data, or immutable references — which
+    /// is the case for all callers in this codebase.
     ///
     /// # Panics
     ///
@@ -278,6 +294,13 @@ where
         let result = shared.await;
 
         if let Some(v) = result {
+            // Two clones of `v` are structurally necessary:
+            // 1. `guard.value` — the `PromoteGuard` drop impl needs a copy
+            //    to promote the slot if this task is cancelled between here
+            //    and the `update_async` below.
+            // 2. `Slot::Ready(v.clone())` — moves the value into the map.
+            // For `Copy` types (like `INode`, the primary value type) both
+            // clones are zero-cost.
             guard.value = Some(v.clone());
 
             self.map

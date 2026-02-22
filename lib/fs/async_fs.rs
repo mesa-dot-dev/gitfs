@@ -356,7 +356,9 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
             let table = Arc::clone(&self.inode_table);
             let dp = self.data_provider.clone();
             tokio::spawn(async move {
-                let _permit = sem.acquire().await;
+                let Ok(_permit) = sem.acquire().await else {
+                    return;
+                };
                 prefetch_dir(child_addr, dcache, table, dp).await;
             });
         }

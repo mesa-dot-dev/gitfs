@@ -489,17 +489,22 @@ where
         // `forget` fires only when nlookup reaches zero.
         self.inner.addr_to_slot.remove_sync(&addr);
         if bridge_empty {
-            // Bridge is empty — atomically remove the slot only if no one
-            // has re-populated the bridge between our check and this removal.
-            // `remove_if_sync` holds the scc bucket lock during evaluation,
-            // and `is_empty_locked` acquires the bridge's coordination mutex
-            // to serialize with any concurrent `backward_or_insert`.
-            let removed = self
+            // Check emptiness under the bridge's coordination lock OUTSIDE
+            // the scc bucket guard, avoiding nested lock acquisition
+            // (scc bucket -> bridge mutex) which would be a deadlock risk.
+            let still_empty = self
                 .inner
                 .slots
-                .remove_if_sync(&slot_idx, |slot| slot.bridge.is_empty_locked());
-            if let Some((_, slot)) = removed {
-                self.inner.name_to_slot.remove_sync(&slot.name);
+                .read_sync(&slot_idx, |_, slot| Arc::clone(&slot.bridge))
+                .is_some_and(|b| b.is_empty_locked());
+            if still_empty {
+                let removed = self
+                    .inner
+                    .slots
+                    .remove_if_sync(&slot_idx, |slot| slot.bridge.is_empty());
+                if let Some((_, slot)) = removed {
+                    self.inner.name_to_slot.remove_sync(&slot.name);
+                }
             }
         }
     }

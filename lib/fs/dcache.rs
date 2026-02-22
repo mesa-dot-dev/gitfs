@@ -199,6 +199,12 @@ impl DCache {
     /// from that parent's children map, and resets the parent's populate
     /// flag to `UNCLAIMED` so the next `readdir` re-fetches from the
     /// data provider.
+    ///
+    /// The reset uses `compare_exchange(DONE -> UNCLAIMED)` rather than a
+    /// blind store to avoid a race with an in-flight populate: if a
+    /// concurrent `readdir` is mid-populate (`IN_PROGRESS`), a blind store
+    /// of `UNCLAIMED` would be overwritten by the populator's final `DONE`
+    /// store, leaving the cache in a stale-but-marked-done state.
     pub fn evict(&self, child_ino: LoadedAddr) {
         let Some((_, parent_ino)) = self.child_to_parent.remove_sync(&child_ino) else {
             return;
@@ -212,11 +218,19 @@ impl DCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         children.retain(|_, dv| dv.ino != child_ino);
         drop(children);
-        // Reset regardless of current state. If a populate is in flight,
-        // the concurrent caller will overwrite this with DONE when it
-        // finishes; that is acceptable because the next readdir will
-        // re-fetch again.
-        state.populated.store(POPULATE_UNCLAIMED, Ordering::Release);
+        // Only reset from DONE to UNCLAIMED. If a populate is in flight
+        // (IN_PROGRESS), leave the flag alone: the concurrent populator will
+        // finish and store DONE, but the child we just removed is already gone
+        // from the children map, and readdir handles missing inodes gracefully
+        // (skips with a debug log). The next readdir after that populate
+        // completes will see DONE and serve the (stale) cache, but a
+        // subsequent forget-cycle will evict again.
+        let _ = state.populated.compare_exchange(
+            POPULATE_DONE,
+            POPULATE_UNCLAIMED,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
         state.notify.notify_waiters();
     }
 
