@@ -16,7 +16,7 @@ use bytes::Bytes;
 use crate::cache::async_backed::FutureBackedCache;
 use crate::fs::async_fs::{AsyncFs, FileReader, FsDataProvider, OpenFile};
 use crate::fs::bridge::ConcurrentBridge;
-use crate::fs::{INode, INodeType, InodeAddr, InodePerms, LoadedAddr, OpenFlags};
+use crate::fs::{INode, INodeType, InodeAddr, InodePerms, LoadedAddr, OpenFlags, ROOT_INO};
 
 /// Descriptor for a child filesystem returned by [`CompositeRoot`].
 pub struct ChildDescriptor<DP: FsDataProvider> {
@@ -55,16 +55,14 @@ pub trait CompositeRoot: Send + Sync + 'static {
 
 /// Co-locates an inode table and [`AsyncFs`].
 pub struct ChildInner<DP: FsDataProvider> {
-    #[expect(dead_code)]
-    table: Arc<FutureBackedCache<InodeAddr, INode>>,
     fs: AsyncFs<DP>,
 }
 
 impl<DP: FsDataProvider> ChildInner<DP> {
     pub(crate) fn create(table: FutureBackedCache<InodeAddr, INode>, provider: DP) -> Self {
         let table = Arc::new(table);
-        let fs = AsyncFs::new_preseeded(provider, Arc::clone(&table));
-        Self { table, fs }
+        let fs = AsyncFs::new_preseeded(provider, table);
+        Self { fs }
     }
 
     pub(crate) fn get_fs(&self) -> &AsyncFs<DP> {
@@ -152,9 +150,6 @@ impl<R: CompositeRoot> Clone for CompositeFs<R> {
 }
 
 impl<R: CompositeRoot> CompositeFs<R> {
-    /// Root inode address for this composite level.
-    pub const ROOT_INO: InodeAddr = 1;
-
     /// Create a new composite filesystem.
     #[must_use]
     pub fn new(root: R, fs_owner: (u32, u32)) -> Self {
@@ -165,7 +160,7 @@ impl<R: CompositeRoot> CompositeFs<R> {
                 addr_to_slot: scc::HashMap::new(),
                 name_to_slot: scc::HashMap::new(),
                 next_slot: AtomicU64::new(0),
-                next_ino: AtomicU64::new(2), // 1 = root
+                next_ino: AtomicU64::new(ROOT_INO + 1),
                 fs_owner,
             }),
         }
@@ -176,7 +171,7 @@ impl<R: CompositeRoot> CompositeFs<R> {
     pub fn make_root_inode(&self) -> INode {
         let now = std::time::SystemTime::now();
         INode {
-            addr: Self::ROOT_INO,
+            addr: ROOT_INO,
             permissions: InodePerms::from_bits_truncate(0o755),
             uid: self.inner.fs_owner.0,
             gid: self.inner.fs_owner.1,
@@ -201,7 +196,7 @@ impl<R: CompositeRoot> CompositeFs<R> {
             gid: self.inner.fs_owner.1,
             create_time: now,
             last_modified_at: now,
-            parent: Some(Self::ROOT_INO),
+            parent: Some(ROOT_INO),
             size: 0,
             itype: INodeType::Directory,
         }
@@ -291,7 +286,7 @@ where
     type Reader = CompositeReader<<<R as CompositeRoot>::ChildDP as FsDataProvider>::Reader>;
 
     async fn lookup(&self, parent: INode, name: &OsStr) -> Result<INode, std::io::Error> {
-        if parent.addr == Self::ROOT_INO {
+        if parent.addr == ROOT_INO {
             let desc = self
                 .inner
                 .root
@@ -345,7 +340,7 @@ where
     }
 
     async fn readdir(&self, parent: INode) -> Result<Vec<(OsString, INode)>, std::io::Error> {
-        if parent.addr == Self::ROOT_INO {
+        if parent.addr == ROOT_INO {
             let children = self.inner.root.list_children().await?;
             let mut entries = Vec::with_capacity(children.len());
             for desc in &children {
@@ -451,7 +446,7 @@ where
     ///
     /// The root inode is never forgotten.
     fn forget(&self, addr: InodeAddr) {
-        if addr == Self::ROOT_INO {
+        if addr == ROOT_INO {
             return;
         }
         let Some(slot_idx) = self.inner.addr_to_slot.read_sync(&addr, |_, &v| v) else {
@@ -501,7 +496,7 @@ where
                 let removed = self
                     .inner
                     .slots
-                    .remove_if_sync(&slot_idx, |slot| slot.bridge.is_empty());
+                    .remove_if_sync(&slot_idx, |slot| slot.bridge.is_empty_locked());
                 if let Some((_, slot)) = removed {
                     self.inner.name_to_slot.remove_sync(&slot.name);
                 }

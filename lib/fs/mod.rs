@@ -40,6 +40,12 @@ use bitflags::bitflags;
 /// Type representing an inode identifier.
 pub type InodeAddr = u64;
 
+/// The conventional root inode address used by all filesystem layers.
+///
+/// Both [`CompositeFs`](composite::CompositeFs) and data providers use this
+/// value as the root address. Monotonic inode counters start at `ROOT_INO + 1`.
+pub const ROOT_INO: InodeAddr = 1;
+
 /// Represents an inode address that has been loaded into the inode table.
 ///
 /// This newtype wrapper distinguishes inode addresses that are known to exist

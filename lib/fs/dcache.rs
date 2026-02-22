@@ -35,6 +35,12 @@ pub enum PopulateStatus {
 
 /// Per-parent directory state holding child entries and a population flag.
 struct DirState {
+    /// Child entries, guarded by `std::sync::RwLock` (NOT `tokio::sync::RwLock`).
+    ///
+    /// This is intentional: all lock acquisitions are scoped and synchronous,
+    /// never held across `.await` points. `std::sync::RwLock` has lower
+    /// overhead in the uncontended case. Do NOT introduce `.await` calls
+    /// while holding a guard — this would block the tokio worker thread.
     children: RwLock<BTreeMap<OsString, DValue>>,
     populated: AtomicU8,
     /// Monotonically increasing counter bumped by each [`DCache::evict`] call.

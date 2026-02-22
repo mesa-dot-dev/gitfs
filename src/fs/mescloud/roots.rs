@@ -19,13 +19,11 @@ use tracing::warn;
 use git_fs::cache::fcache::FileCache;
 use git_fs::fs::async_fs::{FileReader, FsDataProvider};
 use git_fs::fs::composite::{ChildDescriptor, CompositeFs, CompositeReader, CompositeRoot};
-use git_fs::fs::{INode, INodeType, InodeAddr, InodePerms, OpenFlags};
+use git_fs::fs::{INode, INodeType, InodeAddr, InodePerms, OpenFlags, ROOT_INO};
 
 use super::common::{MesaApiError, mesa_api_error_to_io};
 use super::repo::{MesFileReader, MesRepoProvider};
 use crate::app_config::CacheConfig;
-
-const CHILD_ROOT_ADDR: InodeAddr = 1;
 
 /// Create a [`MesRepoProvider`] and its root [`INode`] for a given repo.
 async fn create_repo_provider(
@@ -61,11 +59,11 @@ async fn create_repo_provider(
         file_cache,
     );
 
-    provider.seed_root_path(CHILD_ROOT_ADDR);
+    provider.seed_root_path(ROOT_INO);
 
     let now = SystemTime::now();
     let root_ino = INode {
-        addr: CHILD_ROOT_ADDR,
+        addr: ROOT_INO,
         permissions: InodePerms::from_bits_truncate(0o755),
         uid: fs_owner.0,
         gid: fs_owner.1,

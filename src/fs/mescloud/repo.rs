@@ -19,7 +19,7 @@ use tracing::warn;
 use git_fs::cache::fcache::FileCache;
 use git_fs::cache::traits::{AsyncReadableCache as _, AsyncWritableCache as _};
 use git_fs::fs::async_fs::{FileReader, FsDataProvider};
-use git_fs::fs::{INode, INodeType, InodeAddr, InodePerms, OpenFlags as AsyncOpenFlags};
+use git_fs::fs::{INode, INodeType, InodeAddr, InodePerms, OpenFlags as AsyncOpenFlags, ROOT_INO};
 
 use super::common::{MesaApiError, mesa_api_error_to_io};
 
@@ -68,7 +68,7 @@ impl MesRepoProvider {
                 repo_name,
                 ref_,
                 fs_owner,
-                next_addr: AtomicU64::new(2), // 1 is reserved for root
+                next_addr: AtomicU64::new(ROOT_INO + 1),
                 path_map: scc::HashMap::new(),
                 file_cache,
             }),
@@ -136,6 +136,7 @@ impl FsDataProvider for MesRepoProvider {
             let now = SystemTime::now();
             let (uid, gid) = inner.fs_owner;
 
+            // Symlinks are mapped to File because FuserAdapter does not implement readlink.
             let (itype, size) = match &content {
                 Content::File(f) => (INodeType::File, f.size.to_u64().unwrap_or(0)),
                 Content::Symlink(s) => (INodeType::File, s.size.to_u64().unwrap_or(0)),

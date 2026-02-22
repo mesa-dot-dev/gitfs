@@ -73,7 +73,7 @@ mod managed_fuse {
 
             let table = FutureBackedCache::default();
             let root_inode = composite.make_root_inode();
-            table.insert_sync(1, root_inode);
+            table.insert_sync(git_fs::fs::ROOT_INO, root_inode);
 
             let fuse_adapter = FuserAdapter::new(table, composite, handle);
             let mount_opts = [
