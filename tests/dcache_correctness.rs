@@ -315,3 +315,30 @@ async fn remove_parent_returns_false_for_unknown() {
         "should return false for unknown parent"
     );
 }
+
+#[tokio::test]
+async fn evict_removes_child_and_resets_populate_status() {
+    let cache = DCache::new();
+    let parent = LoadedAddr::new_unchecked(1);
+    let child = LoadedAddr::new_unchecked(10);
+    cache.insert(parent, OsString::from("foo"), child, false);
+    assert!(matches!(
+        cache.try_claim_populate(parent),
+        PopulateStatus::Claimed
+    ));
+    cache.finish_populate(parent);
+    assert!(matches!(
+        cache.try_claim_populate(parent),
+        PopulateStatus::Done
+    ));
+
+    cache.evict(child);
+
+    // Child should be gone.
+    assert!(cache.lookup(parent, OsStr::new("foo")).is_none());
+    // Populate status should be reset so next readdir re-fetches.
+    assert!(matches!(
+        cache.try_claim_populate(parent),
+        PopulateStatus::Claimed
+    ));
+}

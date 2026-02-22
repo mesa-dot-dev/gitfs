@@ -57,6 +57,9 @@ impl DirState {
 /// with zero sorting overhead.
 pub struct DCache {
     dirs: scc::HashMap<LoadedAddr, Arc<DirState>>,
+    /// Reverse index: child inode -> parent inode, for O(1) parent discovery
+    /// during eviction.
+    child_to_parent: scc::HashMap<LoadedAddr, LoadedAddr>,
 }
 
 impl Default for DCache {
@@ -71,6 +74,7 @@ impl DCache {
     pub fn new() -> Self {
         Self {
             dirs: scc::HashMap::new(),
+            child_to_parent: scc::HashMap::new(),
         }
     }
 
@@ -110,6 +114,7 @@ impl DCache {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         children.insert(name, value);
+        let _ = self.child_to_parent.insert_sync(ino, parent_ino);
     }
 
     /// Iterate all cached children of `parent_ino` in name-sorted order.
@@ -160,7 +165,11 @@ impl DCache {
             .children
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        children.remove(name)
+        let removed = children.remove(name);
+        if let Some(ref dv) = removed {
+            self.child_to_parent.remove_sync(&dv.ino);
+        }
+        removed
     }
 
     /// Removes the entire [`DirState`] for `parent_ino`, resetting its
@@ -169,7 +178,41 @@ impl DCache {
     ///
     /// Returns `true` if an entry was removed.
     pub fn remove_parent(&self, parent_ino: LoadedAddr) -> bool {
-        self.dirs.remove_sync(&parent_ino).is_some()
+        if let Some((_, state)) = self.dirs.remove_sync(&parent_ino) {
+            let children = state
+                .children
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for dv in children.values() {
+                self.child_to_parent.remove_sync(&dv.ino);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Evict a child inode from the cache by its address.
+    ///
+    /// Looks up the parent via the reverse index, removes the child entry
+    /// from that parent's children map, and resets the parent's populate
+    /// flag to `UNCLAIMED` so the next `readdir` re-fetches from the
+    /// data provider.
+    pub fn evict(&self, child_ino: LoadedAddr) {
+        let Some((_, parent_ino)) = self.child_to_parent.remove_sync(&child_ino) else {
+            return;
+        };
+        let Some(state) = self.dirs.read_sync(&parent_ino, |_, v| Arc::clone(v)) else {
+            return;
+        };
+        let mut children = state
+            .children
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        children.retain(|_, dv| dv.ino != child_ino);
+        drop(children);
+        state.populated.store(POPULATE_UNCLAIMED, Ordering::Release);
+        state.notify.notify_waiters();
     }
 
     /// Atomically try to claim a directory for population.
