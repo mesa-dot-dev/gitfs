@@ -225,6 +225,9 @@ where
                         )
                     });
                     let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
+                    // Channel is per-iteration: each owner gets its own error channel.
+                    // Do not hoist above the loop — joiners that re-enter the Vacant
+                    // branch need a fresh channel for their own factory invocation.
                     let (error_tx, mut error_rx) = tokio::sync::oneshot::channel();
                     let shared = Self::make_shared_fallible(f, error_tx);
                     let ret = shared.clone();
@@ -330,6 +333,9 @@ where
         F: FnOnce() -> Fut,
         Fut: Future<Output = V> + Send + 'static,
     {
+        // SAFETY(unwind): factories in this codebase capture only Arc, owned data,
+        // or immutable references — no shared mutable state that could be left
+        // inconsistent by a panic. See `get_or_init` doc comment for details.
         let fut = AssertUnwindSafe(factory()).catch_unwind();
         let boxed: Pin<Box<dyn Future<Output = Option<V>> + Send>> =
             Box::pin(async move { fut.await.ok() });
@@ -349,6 +355,8 @@ where
         Fut: Future<Output = Result<V, E>> + Send + 'static,
         E: Send + 'static,
     {
+        // SAFETY(unwind): same justification as `make_shared` — factories capture
+        // only Arc, owned data, or immutable references.
         let fut = AssertUnwindSafe(factory()).catch_unwind();
         let boxed: Pin<Box<dyn Future<Output = Option<V>> + Send>> = Box::pin(async move {
             match fut.await {
@@ -388,6 +396,20 @@ where
     /// [`StatelessDrop::delete`](crate::drop_ward::StatelessDrop::delete)).
     pub fn remove_sync(&self, key: &K) -> bool {
         self.map.remove_sync(key).is_some()
+    }
+
+    /// Synchronously remove all `Ready` entries for which `predicate` returns `true`.
+    ///
+    /// `InFlight` entries are always retained — only fully resolved entries
+    /// are eligible for removal. This is safe to call concurrently with
+    /// other cache operations: `scc::HashMap::retain_sync` acquires
+    /// bucket-level locks, and `InFlight` entries are skipped so in-progress
+    /// computations are never disturbed.
+    pub fn remove_ready_if_sync(&self, mut predicate: impl FnMut(&K, &V) -> bool) {
+        self.map.retain_sync(|k, slot| match slot {
+            Slot::InFlight(..) => true,
+            Slot::Ready(v) => !predicate(k, v),
+        });
     }
 }
 

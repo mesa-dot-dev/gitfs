@@ -345,6 +345,10 @@ impl OrgChildDP {
     }
 }
 
+// Manual dispatch is safe: Rust's exhaustive matching requires every new
+// variant to be handled in every `match` below, so the compiler enforces
+// completeness. A macro abstraction would add complexity without benefit
+// for a two-variant enum.
 impl FsDataProvider for OrgChildDP {
     type Reader = OrgChildReader;
 

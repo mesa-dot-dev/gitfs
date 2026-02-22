@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::Notify;
@@ -24,7 +24,9 @@ const POPULATE_DONE: u8 = 2;
 /// Result of attempting to claim a directory for population.
 pub enum PopulateStatus {
     /// This caller won the race and should populate the directory.
-    Claimed,
+    /// Carries the generation at claim time so [`DCache::finish_populate`]
+    /// can detect whether an eviction invalidated the populate.
+    Claimed(u64),
     /// Another caller is currently populating; wait and re-check.
     InProgress,
     /// The directory is already fully populated.
@@ -35,6 +37,10 @@ pub enum PopulateStatus {
 struct DirState {
     children: RwLock<BTreeMap<OsString, DValue>>,
     populated: AtomicU8,
+    /// Monotonically increasing counter bumped by each [`DCache::evict`] call.
+    /// Allows [`DCache::finish_populate`] to detect that an eviction occurred
+    /// while a populate was in flight.
+    generation: AtomicU64,
     /// Wakes waiters when `populated` transitions out of `IN_PROGRESS`.
     notify: Notify,
 }
@@ -44,6 +50,7 @@ impl DirState {
         Self {
             children: RwLock::new(BTreeMap::new()),
             populated: AtomicU8::new(POPULATE_UNCLAIMED),
+            generation: AtomicU64::new(0),
             notify: Notify::new(),
         }
     }
@@ -60,6 +67,9 @@ pub struct DCache {
     /// Reverse index: child inode -> parent inode, for O(1) parent discovery
     /// during eviction.
     child_to_parent: scc::HashMap<LoadedAddr, LoadedAddr>,
+    /// Reverse index: child inode -> entry name, for O(log n) removal from
+    /// the parent's `BTreeMap` during eviction (instead of O(n) `retain`).
+    child_to_name: scc::HashMap<LoadedAddr, OsString>,
 }
 
 impl Default for DCache {
@@ -75,6 +85,7 @@ impl DCache {
         Self {
             dirs: scc::HashMap::new(),
             child_to_parent: scc::HashMap::new(),
+            child_to_name: scc::HashMap::new(),
         }
     }
 
@@ -113,8 +124,13 @@ impl DCache {
             .children
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        children.insert(name, value);
-        // Upsert: overwrite if this child was previously cached under a different parent.
+        if let Some(old) = children.insert(name.clone(), value)
+            && old.ino != ino
+        {
+            self.child_to_name.remove_sync(&old.ino);
+            self.child_to_parent.remove_sync(&old.ino);
+        }
+        self.child_to_name.upsert_sync(ino, name);
         self.child_to_parent.upsert_sync(ino, parent_ino);
     }
 
@@ -169,6 +185,7 @@ impl DCache {
         let removed = children.remove(name);
         if let Some(ref dv) = removed {
             self.child_to_parent.remove_sync(&dv.ino);
+            self.child_to_name.remove_sync(&dv.ino);
         }
         removed
     }
@@ -186,6 +203,7 @@ impl DCache {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for dv in children.values() {
                 self.child_to_parent.remove_sync(&dv.ino);
+                self.child_to_name.remove_sync(&dv.ino);
             }
             true
         } else {
@@ -216,15 +234,13 @@ impl DCache {
             .children
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        children.retain(|_, dv| dv.ino != child_ino);
+        if let Some((_, name)) = self.child_to_name.remove_sync(&child_ino) {
+            children.remove(&name);
+        }
         drop(children);
-        // Only reset from DONE to UNCLAIMED. If a populate is in flight
-        // (IN_PROGRESS), leave the flag alone: the concurrent populator will
-        // finish and store DONE, but the child we just removed is already gone
-        // from the children map, and readdir handles missing inodes gracefully
-        // (skips with a debug log). The next readdir after that populate
-        // completes will see DONE and serve the (stale) cache, but a
-        // subsequent forget-cycle will evict again.
+        // Bump generation so any in-flight populate knows its data is stale.
+        state.generation.fetch_add(1, Ordering::Release);
+        // Reset DONE -> UNCLAIMED so the next readdir re-fetches.
         let _ = state.populated.compare_exchange(
             POPULATE_DONE,
             POPULATE_UNCLAIMED,
@@ -248,16 +264,28 @@ impl DCache {
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => PopulateStatus::Claimed,
+            Ok(_) => {
+                let claim_gen = state.generation.load(Ordering::Acquire);
+                PopulateStatus::Claimed(claim_gen)
+            }
             Err(POPULATE_IN_PROGRESS) => PopulateStatus::InProgress,
             Err(_) => PopulateStatus::Done,
         }
     }
 
     /// Mark a directory as fully populated after successful population.
-    pub fn finish_populate(&self, parent_ino: LoadedAddr) {
+    ///
+    /// `claimed_gen` is the generation returned by [`try_claim_populate`]. If
+    /// an [`evict`](Self::evict) bumped the generation since then, the data
+    /// is stale so the flag is reset to `UNCLAIMED` instead of `DONE`.
+    pub fn finish_populate(&self, parent_ino: LoadedAddr, claimed_gen: u64) {
         let state = self.dir_state(parent_ino);
-        state.populated.store(POPULATE_DONE, Ordering::Release);
+        let current_gen = state.generation.load(Ordering::Acquire);
+        if current_gen == claimed_gen {
+            state.populated.store(POPULATE_DONE, Ordering::Release);
+        } else {
+            state.populated.store(POPULATE_UNCLAIMED, Ordering::Release);
+        }
         state.notify.notify_waiters();
     }
 

@@ -77,18 +77,18 @@ async fn try_claim_populate_unclaimed_returns_claimed() {
     let cache = DCache::new();
     assert!(matches!(
         cache.try_claim_populate(LoadedAddr::new_unchecked(1)),
-        PopulateStatus::Claimed
+        PopulateStatus::Claimed(_)
     ));
 }
 
 #[tokio::test]
 async fn finish_populate_then_claim_returns_done() {
     let cache = DCache::new();
-    assert!(matches!(
-        cache.try_claim_populate(LoadedAddr::new_unchecked(1)),
-        PopulateStatus::Claimed
-    ));
-    cache.finish_populate(LoadedAddr::new_unchecked(1));
+    let PopulateStatus::Claimed(claim_gen) = cache.try_claim_populate(LoadedAddr::new_unchecked(1))
+    else {
+        panic!("expected Claimed")
+    };
+    cache.finish_populate(LoadedAddr::new_unchecked(1), claim_gen);
     assert!(matches!(
         cache.try_claim_populate(LoadedAddr::new_unchecked(1)),
         PopulateStatus::Done
@@ -100,7 +100,7 @@ async fn double_claim_returns_in_progress() {
     let cache = DCache::new();
     assert!(matches!(
         cache.try_claim_populate(LoadedAddr::new_unchecked(1)),
-        PopulateStatus::Claimed
+        PopulateStatus::Claimed(_)
     ));
     assert!(matches!(
         cache.try_claim_populate(LoadedAddr::new_unchecked(1)),
@@ -113,12 +113,12 @@ async fn abort_populate_allows_reclaim() {
     let cache = DCache::new();
     assert!(matches!(
         cache.try_claim_populate(LoadedAddr::new_unchecked(1)),
-        PopulateStatus::Claimed
+        PopulateStatus::Claimed(_)
     ));
     cache.abort_populate(LoadedAddr::new_unchecked(1));
     assert!(matches!(
         cache.try_claim_populate(LoadedAddr::new_unchecked(1)),
-        PopulateStatus::Claimed
+        PopulateStatus::Claimed(_)
     ));
 }
 
@@ -134,7 +134,7 @@ async fn insert_does_not_mark_populated() {
     assert!(
         matches!(
             cache.try_claim_populate(LoadedAddr::new_unchecked(1)),
-            PopulateStatus::Claimed
+            PopulateStatus::Claimed(_)
         ),
         "insert alone should not mark a directory as populated"
     );
@@ -283,11 +283,10 @@ async fn remove_parent_resets_populate_status() {
         LoadedAddr::new_unchecked(10),
         false,
     );
-    assert!(matches!(
-        cache.try_claim_populate(parent),
-        PopulateStatus::Claimed
-    ));
-    cache.finish_populate(parent);
+    let PopulateStatus::Claimed(claim_gen) = cache.try_claim_populate(parent) else {
+        panic!("expected Claimed")
+    };
+    cache.finish_populate(parent, claim_gen);
     assert!(matches!(
         cache.try_claim_populate(parent),
         PopulateStatus::Done
@@ -301,7 +300,7 @@ async fn remove_parent_resets_populate_status() {
     // After removal, the parent is gone, so populate returns Claimed again.
     assert!(matches!(
         cache.try_claim_populate(parent),
-        PopulateStatus::Claimed
+        PopulateStatus::Claimed(_)
     ));
     // Children should also be gone.
     assert!(cache.lookup(parent, OsStr::new("x")).is_none());
@@ -322,11 +321,10 @@ async fn evict_removes_child_and_resets_populate_status() {
     let parent = LoadedAddr::new_unchecked(1);
     let child = LoadedAddr::new_unchecked(10);
     cache.insert(parent, OsString::from("foo"), child, false);
-    assert!(matches!(
-        cache.try_claim_populate(parent),
-        PopulateStatus::Claimed
-    ));
-    cache.finish_populate(parent);
+    let PopulateStatus::Claimed(claim_gen) = cache.try_claim_populate(parent) else {
+        panic!("expected Claimed")
+    };
+    cache.finish_populate(parent, claim_gen);
     assert!(matches!(
         cache.try_claim_populate(parent),
         PopulateStatus::Done
@@ -339,7 +337,7 @@ async fn evict_removes_child_and_resets_populate_status() {
     // Populate status should be reset so next readdir re-fetches.
     assert!(matches!(
         cache.try_claim_populate(parent),
-        PopulateStatus::Claimed
+        PopulateStatus::Claimed(_)
     ));
 }
 
@@ -366,11 +364,10 @@ async fn evict_does_not_affect_siblings() {
         LoadedAddr::new_unchecked(11),
         true,
     );
-    assert!(matches!(
-        cache.try_claim_populate(parent),
-        PopulateStatus::Claimed
-    ));
-    cache.finish_populate(parent);
+    let PopulateStatus::Claimed(claim_gen) = cache.try_claim_populate(parent) else {
+        panic!("expected Claimed")
+    };
+    cache.finish_populate(parent, claim_gen);
 
     cache.evict(LoadedAddr::new_unchecked(10));
 
@@ -379,7 +376,7 @@ async fn evict_does_not_affect_siblings() {
     // But populate status should be reset.
     assert!(matches!(
         cache.try_claim_populate(parent),
-        PopulateStatus::Claimed
+        PopulateStatus::Claimed(_)
     ));
 }
 
@@ -398,4 +395,29 @@ async fn evict_child_from_multiple_parents_removes_from_correct_parent() {
 
     // The parent_b entry should be removed (last insert wins in reverse index).
     assert!(cache.lookup(parent_b, OsStr::new("y")).is_none());
+}
+
+#[tokio::test]
+async fn evict_during_populate_invalidates_generation() {
+    let cache = DCache::new();
+    let parent = LoadedAddr::new_unchecked(1);
+    let child = LoadedAddr::new_unchecked(10);
+    cache.insert(parent, OsString::from("foo"), child, false);
+
+    let PopulateStatus::Claimed(claim_gen) = cache.try_claim_populate(parent) else {
+        panic!("expected Claimed")
+    };
+
+    // Evict while populate is in progress.
+    cache.evict(child);
+
+    // Finish populate with the stale generation.
+    cache.finish_populate(parent, claim_gen);
+
+    // The finish_populate should have detected the generation mismatch
+    // and reset to UNCLAIMED instead of DONE.
+    assert!(
+        matches!(cache.try_claim_populate(parent), PopulateStatus::Claimed(_)),
+        "should be re-claimable after evict invalidated the generation"
+    );
 }

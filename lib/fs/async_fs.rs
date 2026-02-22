@@ -235,10 +235,10 @@ async fn prefetch_dir<DP: FsDataProvider>(
 ) {
     use crate::fs::dcache::PopulateStatus;
 
-    match directory_cache.try_claim_populate(dir_addr) {
-        PopulateStatus::Claimed => {}
+    let claim_gen = match directory_cache.try_claim_populate(dir_addr) {
+        PopulateStatus::Claimed(claim_gen) => claim_gen,
         PopulateStatus::InProgress | PopulateStatus::Done => return,
-    }
+    };
 
     let mut guard = PopulateGuard::new(&directory_cache, dir_addr);
 
@@ -262,7 +262,7 @@ async fn prefetch_dir<DP: FsDataProvider>(
             is_dir,
         );
     }
-    directory_cache.finish_populate(dir_addr);
+    directory_cache.finish_populate(dir_addr, claim_gen);
     guard.defuse();
 }
 
@@ -510,6 +510,10 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
     pub fn evict(&self, addr: InodeAddr) {
         self.inode_table.remove_sync(&addr);
         self.directory_cache.evict(LoadedAddr::new_unchecked(addr));
+        self.lookup_cache
+            .remove_ready_if_sync(|&(parent_addr, _), child| {
+                parent_addr == addr || child.addr == addr
+            });
         self.data_provider.forget(addr);
     }
 
@@ -541,7 +545,7 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         // Uses a three-state CAS gate to prevent duplicate dp.readdir() calls.
         loop {
             match self.directory_cache.try_claim_populate(parent) {
-                PopulateStatus::Claimed => {
+                PopulateStatus::Claimed(claim_gen) => {
                     // RAII guard: if this future is cancelled between Claimed
                     // and finish_populate, automatically abort so other waiters
                     // can retry instead of hanging forever.
@@ -559,7 +563,7 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
                             child_inode.itype == INodeType::Directory,
                         );
                     }
-                    self.directory_cache.finish_populate(parent);
+                    self.directory_cache.finish_populate(parent, claim_gen);
                     guard.defuse();
                     self.spawn_prefetch_children(parent);
                     break;
