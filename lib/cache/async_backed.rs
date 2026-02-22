@@ -347,8 +347,7 @@ where
 
     /// Synchronously insert a value, overwriting any existing entry.
     ///
-    /// Suitable for seeding the cache before async operations begin (e.g.
-    /// inside an ouroboros builder where async is unavailable).
+    /// Suitable for seeding the cache before async operations begin.
     pub fn insert_sync(&self, key: K, value: V) {
         drop(self.map.insert_sync(key, Slot::Ready(value)));
     }

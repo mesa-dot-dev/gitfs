@@ -69,61 +69,37 @@ impl<T> FuseResultExt<T> for Result<T, std::io::Error> {
     }
 }
 
-mod inner {
-    #![allow(clippy::future_not_send, clippy::mem_forget)]
+type FuseWard<DP> = crate::drop_ward::DropWard<
+    (Arc<FutureBackedCache<InodeAddr, INode>>, DP),
+    InodeAddr,
+    super::async_fs::InodeForget,
+>;
 
-    use ouroboros::self_referencing;
-
-    use crate::cache::async_backed::FutureBackedCache;
-    use crate::drop_ward::DropWard;
-    use crate::fs::async_fs::{AsyncFs, FsDataProvider, InodeForget};
-    use crate::fs::{INode, InodeAddr};
-
-    /// Self-referential struct holding the inode table, refcount ward, and `AsyncFs`.
-    ///
-    /// Both `ward` and `fs` borrow from `table`. The ward manages inode
-    /// refcounts; the fs serves lookup/readdir/open/read operations.
-    ///
-    /// The ward context is `(&table, DP)` so that [`InodeForget`] can both
-    /// remove the inode from the table and call `dp.forget()` to clean up
-    /// provider-internal maps (bridge mappings, path maps, etc.).
-    #[self_referencing]
-    pub(super) struct FuseBridgeInner<DP: FsDataProvider> {
-        table: FutureBackedCache<InodeAddr, INode>,
-        #[borrows(table)]
-        #[not_covariant]
-        ward: DropWard<(&'this FutureBackedCache<InodeAddr, INode>, DP), InodeAddr, InodeForget>,
-        #[borrows(table)]
-        #[covariant]
-        fs: AsyncFs<'this, DP>,
-    }
-
-    impl<DP: FsDataProvider> FuseBridgeInner<DP> {
-        pub(super) fn create(table: FutureBackedCache<InodeAddr, INode>, provider: DP) -> Self {
-            let ward_provider = provider.clone();
-            FuseBridgeInnerBuilder {
-                table,
-                ward_builder: |tbl| DropWard::new((tbl, ward_provider)),
-                fs_builder: |tbl| AsyncFs::new_preseeded(provider, tbl),
-            }
-            .build()
-        }
-
-        pub(super) fn get_fs(&self) -> &AsyncFs<'_, DP> {
-            self.borrow_fs()
-        }
-
-        pub(super) fn ward_inc(&mut self, addr: InodeAddr) -> usize {
-            self.with_ward_mut(|ward| ward.inc(addr))
-        }
-
-        pub(super) fn ward_dec_count(&mut self, addr: InodeAddr, count: usize) -> Option<usize> {
-            self.with_ward_mut(|ward| ward.dec_count(&addr, count))
-        }
-    }
+struct FuseBridgeInner<DP: FsDataProvider> {
+    ward: FuseWard<DP>,
+    fs: super::async_fs::AsyncFs<DP>,
 }
 
-use inner::FuseBridgeInner;
+impl<DP: FsDataProvider> FuseBridgeInner<DP> {
+    fn create(table: FutureBackedCache<InodeAddr, INode>, provider: DP) -> Self {
+        let table = Arc::new(table);
+        let ward = crate::drop_ward::DropWard::new((Arc::clone(&table), provider.clone()));
+        let fs = super::async_fs::AsyncFs::new_preseeded(provider, table);
+        Self { ward, fs }
+    }
+
+    fn get_fs(&self) -> &super::async_fs::AsyncFs<DP> {
+        &self.fs
+    }
+
+    fn ward_inc(&mut self, addr: InodeAddr) -> usize {
+        self.ward.inc(addr)
+    }
+
+    fn ward_dec_count(&mut self, addr: InodeAddr, count: usize) -> Option<usize> {
+        self.ward.dec_count(&addr, count)
+    }
+}
 
 /// Convert an `INode` to the fuser-specific `FileAttr`.
 fn inode_to_fuser_attr(inode: &INode, block_size: u32) -> fuser::FileAttr {

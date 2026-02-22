@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 
 use crate::cache::async_backed::FutureBackedCache;
-use crate::fs::async_fs::{FileReader, FsDataProvider, OpenFile};
+use crate::fs::async_fs::{AsyncFs, FileReader, FsDataProvider, OpenFile};
 use crate::fs::bridge::ConcurrentBridge;
 use crate::fs::{INode, INodeType, InodeAddr, InodePerms, LoadedAddr, OpenFlags};
 
@@ -53,44 +53,24 @@ pub trait CompositeRoot: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Vec<ChildDescriptor<Self::ChildDP>>, std::io::Error>> + Send;
 }
 
-mod child_inner_impl {
-    #![allow(clippy::future_not_send, clippy::mem_forget)]
-
-    use ouroboros::self_referencing;
-
-    use crate::cache::async_backed::FutureBackedCache;
-    use crate::fs::async_fs::{AsyncFs, FsDataProvider};
-    use crate::fs::{INode, InodeAddr};
-
-    /// Self-referential struct co-locating an inode table and [`AsyncFs`].
-    ///
-    /// The `AsyncFs` borrows from the table directly, avoiding an extra
-    /// indirection. This mirrors the [`FuseBridgeInner`](super::super::fuser)
-    /// pattern.
-    #[self_referencing]
-    pub struct ChildInner<DP: FsDataProvider> {
-        pub(super) table: FutureBackedCache<InodeAddr, INode>,
-        #[borrows(table)]
-        #[covariant]
-        pub(super) fs: AsyncFs<'this, DP>,
-    }
-
-    impl<DP: FsDataProvider> ChildInner<DP> {
-        pub(super) fn create(table: FutureBackedCache<InodeAddr, INode>, provider: DP) -> Self {
-            ChildInnerBuilder {
-                table,
-                fs_builder: |tbl| AsyncFs::new_preseeded(provider, tbl),
-            }
-            .build()
-        }
-
-        pub(super) fn get_fs(&self) -> &AsyncFs<'_, DP> {
-            self.borrow_fs()
-        }
-    }
+/// Co-locates an inode table and [`AsyncFs`].
+pub struct ChildInner<DP: FsDataProvider> {
+    #[expect(dead_code)]
+    table: Arc<FutureBackedCache<InodeAddr, INode>>,
+    fs: AsyncFs<DP>,
 }
 
-pub use child_inner_impl::ChildInner;
+impl<DP: FsDataProvider> ChildInner<DP> {
+    pub(crate) fn create(table: FutureBackedCache<InodeAddr, INode>, provider: DP) -> Self {
+        let table = Arc::new(table);
+        let fs = AsyncFs::new_preseeded(provider, Arc::clone(&table));
+        Self { table, fs }
+    }
+
+    pub(crate) fn get_fs(&self) -> &AsyncFs<DP> {
+        &self.fs
+    }
+}
 
 /// Wraps a child's reader so that the composite layer can expose it as its own
 /// [`FileReader`].

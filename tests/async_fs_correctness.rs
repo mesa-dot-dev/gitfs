@@ -13,11 +13,11 @@ use common::async_fs_mocks::{MockFsDataProvider, MockFsState, make_inode};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lifecycle_inc_returns_count_after_increment() {
-    let table = FutureBackedCache::default();
+    let table = Arc::new(FutureBackedCache::default());
     let inode = make_inode(100, INodeType::File, 0, Some(1));
     table.insert_sync(100, inode);
 
-    let mut lifecycle = InodeLifecycle::from_table(table);
+    let mut lifecycle = InodeLifecycle::from_table(Arc::clone(&table));
 
     assert_eq!(lifecycle.inc(100), 1, "first inc should return 1");
     assert_eq!(lifecycle.inc(100), 2, "second inc should return 2");
@@ -26,11 +26,11 @@ async fn lifecycle_inc_returns_count_after_increment() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lifecycle_dec_returns_remaining_count() {
-    let table = FutureBackedCache::default();
+    let table = Arc::new(FutureBackedCache::default());
     let inode = make_inode(100, INodeType::File, 0, Some(1));
     table.insert_sync(100, inode);
 
-    let mut lifecycle = InodeLifecycle::from_table(table);
+    let mut lifecycle = InodeLifecycle::from_table(Arc::clone(&table));
     lifecycle.inc(100);
     lifecycle.inc(100);
 
@@ -40,8 +40,8 @@ async fn lifecycle_dec_returns_remaining_count() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lifecycle_dec_unknown_addr_returns_none() {
-    let table: FutureBackedCache<u64, INode> = FutureBackedCache::default();
-    let mut lifecycle = InodeLifecycle::from_table(table);
+    let table: Arc<FutureBackedCache<u64, INode>> = Arc::new(FutureBackedCache::default());
+    let mut lifecycle = InodeLifecycle::from_table(Arc::clone(&table));
 
     assert_eq!(
         lifecycle.dec(&999),
@@ -52,11 +52,11 @@ async fn lifecycle_dec_unknown_addr_returns_none() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lifecycle_dec_to_zero_evicts_from_table() {
-    let table = FutureBackedCache::default();
+    let table = Arc::new(FutureBackedCache::default());
     let inode = make_inode(100, INodeType::File, 0, Some(1));
     table.insert_sync(100, inode);
 
-    let mut lifecycle = InodeLifecycle::from_table(table);
+    let mut lifecycle = InodeLifecycle::from_table(Arc::clone(&table));
     lifecycle.inc(100);
 
     assert_eq!(lifecycle.dec(&100), Some(0));
@@ -69,11 +69,11 @@ async fn lifecycle_dec_to_zero_evicts_from_table() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lifecycle_dec_count_decrements_by_n() {
-    let table: FutureBackedCache<u64, INode> = FutureBackedCache::default();
+    let table: Arc<FutureBackedCache<u64, INode>> = Arc::new(FutureBackedCache::default());
     let inode = make_inode(100, INodeType::File, 0, Some(1));
     table.insert_sync(100, inode);
 
-    let mut lifecycle = InodeLifecycle::from_table(table);
+    let mut lifecycle = InodeLifecycle::from_table(Arc::clone(&table));
     lifecycle.inc(100);
     lifecycle.inc(100);
     lifecycle.inc(100); // count = 3
@@ -87,11 +87,11 @@ async fn lifecycle_dec_count_decrements_by_n() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lifecycle_dec_count_to_zero_evicts() {
-    let table = FutureBackedCache::default();
+    let table = Arc::new(FutureBackedCache::default());
     let inode = make_inode(100, INodeType::File, 0, Some(1));
     table.insert_sync(100, inode);
 
-    let mut lifecycle = InodeLifecycle::from_table(table);
+    let mut lifecycle = InodeLifecycle::from_table(Arc::clone(&table));
     lifecycle.inc(100);
     lifecycle.inc(100); // count = 2
 
@@ -104,11 +104,11 @@ async fn lifecycle_dec_count_to_zero_evicts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lifecycle_table_returns_underlying_cache() {
-    let table = FutureBackedCache::default();
+    let table = Arc::new(FutureBackedCache::default());
     let inode = make_inode(42, INodeType::Directory, 0, None);
     table.insert_sync(42, inode);
 
-    let lifecycle = InodeLifecycle::from_table(table);
+    let lifecycle = InodeLifecycle::from_table(Arc::clone(&table));
 
     let fetched = lifecycle.table().get(&42).await;
     assert_eq!(
@@ -120,11 +120,11 @@ async fn lifecycle_table_returns_underlying_cache() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn new_seeds_root_inode_into_table() {
-    let table = FutureBackedCache::default();
+    let table = Arc::new(FutureBackedCache::default());
     let root = make_inode(1, INodeType::Directory, 0, None);
     let dp = MockFsDataProvider::new(MockFsState::default());
 
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
 
     assert_eq!(fs.inode_count(), 1, "root should be the only inode");
     let fetched = table.get(&1).await;
@@ -137,10 +137,10 @@ async fn new_seeds_root_inode_into_table() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn new_preseeded_does_not_insert_root() {
-    let table: FutureBackedCache<u64, INode> = FutureBackedCache::default();
+    let table: Arc<FutureBackedCache<u64, INode>> = Arc::new(FutureBackedCache::default());
     let dp = MockFsDataProvider::new(MockFsState::default());
 
-    let fs = AsyncFs::new_preseeded(dp, &table);
+    let fs = AsyncFs::new_preseeded(dp, Arc::clone(&table));
 
     assert_eq!(
         fs.inode_count(),
@@ -151,11 +151,11 @@ async fn new_preseeded_does_not_insert_root() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn statfs_reports_inode_count() {
-    let table = FutureBackedCache::default();
+    let table = Arc::new(FutureBackedCache::default());
     let root = make_inode(1, INodeType::Directory, 0, None);
     let dp = MockFsDataProvider::new(MockFsState::default());
 
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
     let stats = fs.statfs();
 
     assert_eq!(stats.block_size, 4096);
@@ -166,11 +166,11 @@ async fn statfs_reports_inode_count() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loaded_inode_returns_seeded_inode() {
-    let table = FutureBackedCache::default();
+    let table = Arc::new(FutureBackedCache::default());
     let root = make_inode(1, INodeType::Directory, 0, None);
     let dp = MockFsDataProvider::new(MockFsState::default());
 
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
 
     let inode = fs.loaded_inode(LoadedAddr::new_unchecked(1)).await.unwrap();
     assert_eq!(inode.addr, 1);
@@ -179,11 +179,11 @@ async fn loaded_inode_returns_seeded_inode() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loaded_inode_returns_enoent_for_missing_addr() {
-    let table = FutureBackedCache::default();
+    let table = Arc::new(FutureBackedCache::default());
     let root = make_inode(1, INodeType::Directory, 0, None);
     let dp = MockFsDataProvider::new(MockFsState::default());
 
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
 
     let err = fs
         .loaded_inode(LoadedAddr::new_unchecked(999))
@@ -194,11 +194,11 @@ async fn loaded_inode_returns_enoent_for_missing_addr() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn getattr_delegates_to_loaded_inode() {
-    let table = FutureBackedCache::default();
+    let table = Arc::new(FutureBackedCache::default());
     let root = make_inode(1, INodeType::Directory, 4096, None);
     let dp = MockFsDataProvider::new(MockFsState::default());
 
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
 
     let inode = fs.getattr(LoadedAddr::new_unchecked(1)).await.unwrap();
     assert_eq!(inode.addr, 1);
@@ -214,8 +214,8 @@ async fn lookup_resolves_child_via_data_provider() {
     state.lookups.insert((1, "readme.md".into()), child);
     let dp = MockFsDataProvider::new(state);
 
-    let table = FutureBackedCache::default();
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
 
     let tracked = fs
         .lookup(LoadedAddr::new_unchecked(1), OsStr::new("readme.md"))
@@ -236,8 +236,8 @@ async fn lookup_populates_inode_table() {
     state.lookups.insert((1, "file.txt".into()), child);
     let dp = MockFsDataProvider::new(state);
 
-    let table = FutureBackedCache::default();
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
 
     fs.lookup(LoadedAddr::new_unchecked(1), OsStr::new("file.txt"))
         .await
@@ -261,8 +261,8 @@ async fn lookup_second_call_uses_cache() {
     state.lookups.insert((1, "cached.txt".into()), child);
     let dp = MockFsDataProvider::new(state);
 
-    let table = FutureBackedCache::default();
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
 
     let first = fs
         .lookup(LoadedAddr::new_unchecked(1), OsStr::new("cached.txt"))
@@ -282,8 +282,8 @@ async fn lookup_propagates_provider_error() {
     // No lookups configured — provider will return ENOENT.
     let dp = MockFsDataProvider::new(MockFsState::default());
 
-    let table = FutureBackedCache::default();
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
 
     let err = fs
         .lookup(LoadedAddr::new_unchecked(1), OsStr::new("nonexistent"))
@@ -305,9 +305,9 @@ async fn open_returns_file_handle_and_reader() {
         .insert(10, bytes::Bytes::from_static(b"hello"));
     let dp = MockFsDataProvider::new(state);
 
-    let table = FutureBackedCache::default();
+    let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(10, file);
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
 
     let open_file = fs
         .open(LoadedAddr::new_unchecked(10), OpenFlags::RDONLY)
@@ -324,8 +324,8 @@ async fn open_returns_eisdir_for_directory() {
     let root = make_inode(1, INodeType::Directory, 0, None);
     let dp = MockFsDataProvider::new(MockFsState::default());
 
-    let table = FutureBackedCache::default();
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
 
     let err = fs
         .open(LoadedAddr::new_unchecked(1), OpenFlags::RDONLY)
@@ -339,8 +339,8 @@ async fn open_returns_enoent_for_missing_inode() {
     let root = make_inode(1, INodeType::Directory, 0, None);
     let dp = MockFsDataProvider::new(MockFsState::default());
 
-    let table = FutureBackedCache::default();
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
 
     let err = fs
         .open(LoadedAddr::new_unchecked(999), OpenFlags::RDONLY)
@@ -356,9 +356,9 @@ async fn open_assigns_unique_file_handles() {
 
     let dp = MockFsDataProvider::new(MockFsState::default());
 
-    let table = FutureBackedCache::default();
+    let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(10, file);
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
 
     let fh1 = fs
         .open(LoadedAddr::new_unchecked(10), OpenFlags::RDONLY)
@@ -385,9 +385,9 @@ async fn open_file_read_with_offset() {
         .insert(10, bytes::Bytes::from_static(b"hello world"));
     let dp = MockFsDataProvider::new(state);
 
-    let table = FutureBackedCache::default();
+    let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(10, file);
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
 
     let open_file = fs
         .open(LoadedAddr::new_unchecked(10), OpenFlags::RDONLY)
@@ -416,8 +416,8 @@ async fn readdir_lists_children_sorted_by_name() {
     );
     let dp = MockFsDataProvider::new(state);
 
-    let table = FutureBackedCache::default();
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
 
     let mut entries: Vec<(OsString, u64)> = Vec::new();
     fs.readdir(LoadedAddr::new_unchecked(1), 0, |entry, _offset| {
@@ -452,8 +452,8 @@ async fn readdir_respects_offset() {
     );
     let dp = MockFsDataProvider::new(state);
 
-    let table = FutureBackedCache::default();
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
 
     // First readdir to populate cache
     fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, _| false)
@@ -490,8 +490,8 @@ async fn readdir_stops_when_filler_returns_true() {
     );
     let dp = MockFsDataProvider::new(state);
 
-    let table = FutureBackedCache::default();
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
 
     let mut count = 0;
     fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, _| {
@@ -511,9 +511,9 @@ async fn readdir_returns_enotdir_for_file() {
 
     let dp = MockFsDataProvider::new(MockFsState::default());
 
-    let table = FutureBackedCache::default();
+    let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(10, file);
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
 
     let err = fs
         .readdir(LoadedAddr::new_unchecked(10), 0, |_, _| false)
@@ -533,8 +533,8 @@ async fn readdir_populates_inode_table_with_children() {
         .insert(1, vec![(OsString::from("child.txt"), child)]);
     let dp = MockFsDataProvider::new(state);
 
-    let table = FutureBackedCache::default();
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
 
     fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, _| false)
         .await
@@ -556,8 +556,8 @@ async fn readdir_empty_directory() {
     state.directories.insert(1, vec![]);
     let dp = MockFsDataProvider::new(state);
 
-    let table = FutureBackedCache::default();
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
 
     let mut count = 0;
     fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, _| {
@@ -586,8 +586,8 @@ async fn readdir_provides_correct_next_offsets() {
     );
     let dp = MockFsDataProvider::new(state);
 
-    let table = FutureBackedCache::default();
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
 
     let mut offsets: Vec<u64> = Vec::new();
     fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, next_offset| {
@@ -615,8 +615,8 @@ async fn lookup_after_eviction_returns_fresh_inode() {
     let dp = MockFsDataProvider::new(state);
     let state_ref = Arc::clone(&dp.state);
 
-    let table = FutureBackedCache::default();
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
 
     // First lookup → addr=10
     let first = fs
@@ -660,8 +660,8 @@ async fn lookup_after_readdir_uses_directory_cache() {
         .insert(1, vec![(OsString::from("file.txt"), child)]);
     let dp = MockFsDataProvider::new(state);
 
-    let table = FutureBackedCache::default();
-    let fs = AsyncFs::new(dp, root, &table).await;
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
 
     // readdir populates the directory cache.
     fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, _| false)

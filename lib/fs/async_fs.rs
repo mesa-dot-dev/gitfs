@@ -86,18 +86,18 @@ pub trait FsDataProvider: Clone + Send + Sync + 'static {
 pub struct InodeForget;
 
 /// Evicts the inode from the table only. Used when no data provider is available.
-impl<'a> StatelessDrop<&'a FutureBackedCache<InodeAddr, INode>, InodeAddr> for InodeForget {
-    fn delete(inode_table: &&'a FutureBackedCache<InodeAddr, INode>, addr: &InodeAddr) {
+impl StatelessDrop<Arc<FutureBackedCache<InodeAddr, INode>>, InodeAddr> for InodeForget {
+    fn delete(inode_table: &Arc<FutureBackedCache<InodeAddr, INode>>, addr: &InodeAddr) {
         inode_table.remove_sync(addr);
     }
 }
 
 /// Evicts the inode from the table and delegates to [`FsDataProvider::forget`]
 /// so the provider can clean up its own auxiliary state.
-impl<'a, DP: FsDataProvider> StatelessDrop<(&'a FutureBackedCache<InodeAddr, INode>, DP), InodeAddr>
+impl<DP: FsDataProvider> StatelessDrop<(Arc<FutureBackedCache<InodeAddr, INode>>, DP), InodeAddr>
     for InodeForget
 {
-    fn delete(ctx: &(&'a FutureBackedCache<InodeAddr, INode>, DP), key: &InodeAddr) {
+    fn delete(ctx: &(Arc<FutureBackedCache<InodeAddr, INode>>, DP), key: &InodeAddr) {
         ctx.0.remove_sync(key);
         ctx.1.forget(*key);
     }
@@ -134,44 +134,29 @@ impl<R: FileReader> OpenFile<R> {
     }
 }
 
-mod inode_lifecycle_impl {
-    #![allow(clippy::future_not_send, clippy::mem_forget)]
-    use ouroboros::self_referencing;
-
-    use crate::cache::async_backed::FutureBackedCache;
-    use crate::drop_ward::DropWard;
-    use crate::fs::InodeAddr;
-
-    use super::{INode, InodeForget};
-
-    /// Co-located inode table and reference-count ward.
-    ///
-    /// The ward borrows the table directly (no `Arc`) via `ouroboros`.
-    /// When `dec` reaches zero for a key, [`InodeForget::delete`] synchronously
-    /// removes that inode from the table.
-    #[self_referencing]
-    pub struct InodeLifecycle {
-        pub(super) table: FutureBackedCache<InodeAddr, INode>,
-        #[borrows(table)]
-        #[not_covariant]
-        pub(super) ward:
-            DropWard<&'this FutureBackedCache<InodeAddr, INode>, InodeAddr, InodeForget>,
-    }
-
-    impl InodeLifecycle {
-        /// Create a new lifecycle managing the given inode table.
-        pub fn from_table(table: FutureBackedCache<InodeAddr, INode>) -> Self {
-            Self::new(table, |tbl| DropWard::new(tbl))
-        }
-    }
+/// Co-located inode table and reference-count ward.
+///
+/// When `dec` reaches zero for a key, [`InodeForget::delete`] synchronously
+/// removes that inode from the table.
+pub struct InodeLifecycle {
+    table: Arc<FutureBackedCache<InodeAddr, INode>>,
+    ward: crate::drop_ward::DropWard<
+        Arc<FutureBackedCache<InodeAddr, INode>>,
+        InodeAddr,
+        InodeForget,
+    >,
 }
 
-pub use inode_lifecycle_impl::InodeLifecycle;
-
 impl InodeLifecycle {
+    /// Create a new lifecycle managing the given inode table.
+    pub fn from_table(table: Arc<FutureBackedCache<InodeAddr, INode>>) -> Self {
+        let ward = crate::drop_ward::DropWard::new(Arc::clone(&table));
+        Self { table, ward }
+    }
+
     /// Increment the reference count for an inode address.
     pub fn inc(&mut self, addr: InodeAddr) -> usize {
-        self.with_ward_mut(|ward| ward.inc(addr))
+        self.ward.inc(addr)
     }
 
     /// Decrement the reference count for an inode address.
@@ -179,20 +164,20 @@ impl InodeLifecycle {
     /// When the count reaches zero, the inode is automatically evicted
     /// from the table via [`InodeForget::delete`].
     pub fn dec(&mut self, addr: &InodeAddr) -> Option<usize> {
-        self.with_ward_mut(|ward| ward.dec(addr))
+        self.ward.dec(addr)
     }
 
     /// Decrement the reference count by `count`.
     ///
     /// When the count reaches zero, the inode is automatically evicted.
     pub fn dec_count(&mut self, addr: &InodeAddr, count: usize) -> Option<usize> {
-        self.with_ward_mut(|ward| ward.dec_count(addr, count))
+        self.ward.dec_count(addr, count)
     }
 
     /// Read-only access to the underlying inode table.
     #[must_use]
     pub fn table(&self) -> &FutureBackedCache<InodeAddr, INode> {
-        self.borrow_table()
+        &self.table
     }
 }
 
@@ -242,16 +227,16 @@ impl Drop for PopulateGuard<'_> {
 ///   called on a true cache miss (not already cached or in-flight).
 ///
 /// The [`DCache`] sits in front as a synchronous fast path mapping `(parent, name)` to child addr.
-pub struct AsyncFs<'tbl, DP: FsDataProvider> {
+pub struct AsyncFs<DP: FsDataProvider> {
     /// Canonical addr -> `INode` map. Used by `loaded_inode()` to retrieve inodes by address.
-    inode_table: &'tbl FutureBackedCache<InodeAddr, INode>,
+    inode_table: Arc<FutureBackedCache<InodeAddr, INode>>,
 
     /// Deduplicating lookup cache keyed by `(parent_addr, child_name)`. The factory is
     /// `dp.lookup()`, so the data provider is only called on a true cache miss.
     lookup_cache: FutureBackedCache<(InodeAddr, Arc<OsStr>), INode>,
 
     /// Directory entry cache, mapping `(parent, name)` to child inode address.
-    directory_cache: DCache,
+    directory_cache: Arc<DCache>,
 
     /// The data provider used to fetch inode data on cache misses.
     data_provider: DP,
@@ -260,12 +245,12 @@ pub struct AsyncFs<'tbl, DP: FsDataProvider> {
     next_fh: AtomicU64,
 }
 
-impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
+impl<DP: FsDataProvider> AsyncFs<DP> {
     /// Create a new `AsyncFs`, seeding the root inode into the table.
     pub async fn new(
         data_provider: DP,
         root: INode,
-        inode_table: &'tbl FutureBackedCache<InodeAddr, INode>,
+        inode_table: Arc<FutureBackedCache<InodeAddr, INode>>,
     ) -> Self {
         inode_table
             .get_or_init(root.addr, || async move { root })
@@ -274,7 +259,7 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
         Self {
             inode_table,
             lookup_cache: FutureBackedCache::default(),
-            directory_cache: DCache::new(),
+            directory_cache: Arc::new(DCache::new()),
             data_provider,
             next_fh: AtomicU64::new(1),
         }
@@ -282,18 +267,17 @@ impl<'tbl, DP: FsDataProvider> AsyncFs<'tbl, DP> {
 
     /// Create a new `AsyncFs`, assuming the root inode is already in the table.
     ///
-    /// This synchronous constructor is needed for ouroboros builders where
-    /// async is unavailable. The caller must ensure the root inode has already
-    /// been inserted into `inode_table` (e.g. via [`FutureBackedCache::insert_sync`]).
+    /// The caller must ensure the root inode has already been inserted into
+    /// `inode_table` (e.g. via [`FutureBackedCache::insert_sync`]).
     #[must_use]
     pub fn new_preseeded(
         data_provider: DP,
-        inode_table: &'tbl FutureBackedCache<InodeAddr, INode>,
+        inode_table: Arc<FutureBackedCache<InodeAddr, INode>>,
     ) -> Self {
         Self {
             inode_table,
             lookup_cache: FutureBackedCache::default(),
-            directory_cache: DCache::new(),
+            directory_cache: Arc::new(DCache::new()),
             data_provider,
             next_fh: AtomicU64::new(1),
         }
