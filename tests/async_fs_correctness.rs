@@ -823,3 +823,53 @@ async fn readdir_after_evict_re_fetches_from_provider() {
         "should have called dp.readdir again after eviction"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readdir_evict_all_readdir_returns_same_entries() {
+    let root = make_inode(1, INodeType::Directory, 0, None);
+    let child_dir = make_inode(10, INodeType::Directory, 0, Some(1));
+    let child_file = make_inode(11, INodeType::File, 100, Some(1));
+
+    let mut state = MockFsState::default();
+    state.directories.insert(
+        1,
+        vec![
+            (OsString::from("subdir"), child_dir),
+            (OsString::from("file.txt"), child_file),
+        ],
+    );
+    let dp = MockFsDataProvider::new(state);
+
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+
+    // First readdir.
+    let mut first = Vec::new();
+    fs.readdir(LoadedAddr::new_unchecked(1), 0, |entry, _| {
+        first.push((entry.name.to_os_string(), entry.inode.addr));
+        false
+    })
+    .await
+    .unwrap();
+    assert_eq!(first.len(), 2);
+
+    // Evict all children (simulating FUSE forget).
+    fs.evict(10);
+    fs.evict(11);
+
+    // Wait for any prefetch tasks to settle.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Second readdir should return the same entries.
+    let mut second = Vec::new();
+    fs.readdir(LoadedAddr::new_unchecked(1), 0, |entry, _| {
+        second.push((entry.name.to_os_string(), entry.inode.addr));
+        false
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        second, first,
+        "readdir after evict should return same entries"
+    );
+}
