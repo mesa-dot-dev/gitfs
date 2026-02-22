@@ -130,6 +130,26 @@ impl DCache {
         }
     }
 
+    /// Returns the [`LoadedAddr`] of every child that is itself a directory.
+    ///
+    /// Used by the prefetch logic to discover which subdirectories to
+    /// background-populate after a `readdir` completes.
+    #[must_use]
+    pub fn child_dir_addrs(&self, parent_ino: LoadedAddr) -> Vec<LoadedAddr> {
+        let Some(state) = self.dirs.read_sync(&parent_ino, |_, v| Arc::clone(v)) else {
+            return Vec::new();
+        };
+        let children = state
+            .children
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        children
+            .values()
+            .filter(|dv| dv.is_dir)
+            .map(|dv| dv.ino)
+            .collect()
+    }
+
     /// Atomically try to claim a directory for population.
     ///
     /// Uses `compare_exchange` on the three-state flag:

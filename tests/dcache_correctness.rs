@@ -179,3 +179,45 @@ async fn readdir_returns_entries_in_sorted_order() {
     });
     assert_eq!(names, ["apple", "mango", "zebra"]);
 }
+
+#[tokio::test]
+async fn child_dir_addrs_returns_only_directories() {
+    let cache = DCache::new();
+    let parent = LoadedAddr::new_unchecked(1);
+    cache.insert(
+        parent,
+        OsString::from("file.txt"),
+        LoadedAddr::new_unchecked(10),
+        false,
+    );
+    cache.insert(
+        parent,
+        OsString::from("subdir"),
+        LoadedAddr::new_unchecked(11),
+        true,
+    );
+    cache.insert(
+        parent,
+        OsString::from("another_file"),
+        LoadedAddr::new_unchecked(12),
+        false,
+    );
+    cache.insert(
+        parent,
+        OsString::from("another_dir"),
+        LoadedAddr::new_unchecked(13),
+        true,
+    );
+
+    let dirs = cache.child_dir_addrs(parent);
+    assert_eq!(dirs.len(), 2);
+    assert!(dirs.contains(&LoadedAddr::new_unchecked(11)));
+    assert!(dirs.contains(&LoadedAddr::new_unchecked(13)));
+}
+
+#[tokio::test]
+async fn child_dir_addrs_returns_empty_for_unknown_parent() {
+    let cache = DCache::new();
+    let dirs = cache.child_dir_addrs(LoadedAddr::new_unchecked(999));
+    assert!(dirs.is_empty());
+}
