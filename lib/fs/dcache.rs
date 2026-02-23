@@ -124,12 +124,16 @@ impl DCache {
 
     /// Atomically inserts or overwrites a child entry in the cache.
     ///
-    /// When re-parenting a child (the child was previously cached under a
-    /// different parent), the stale entry in the old parent's children map is
-    /// removed and the old parent's populate status is reset to `UNCLAIMED`
-    /// so that the next `readdir` re-fetches from the data provider.
+    /// Handles two kinds of stale-entry cleanup before the insert:
+    ///
+    /// - **Cross-parent move:** the child was previously cached under a
+    ///   different parent. The old entry is removed and the old parent's
+    ///   populate status is reset to `UNCLAIMED`.
+    /// - **Same-parent rename:** the child was previously cached under this
+    ///   parent with a different name. The old name entry is removed so that
+    ///   `readdir` does not return two entries for the same inode.
     pub fn insert(&self, parent_ino: LoadedAddr, name: OsString, ino: LoadedAddr, is_dir: bool) {
-        self.cleanup_old_parent(parent_ino, ino);
+        self.cleanup_stale_entry(parent_ino, &name, ino);
 
         let state = self.dir_state(parent_ino);
         let value = DValue { ino, is_dir };
@@ -147,23 +151,39 @@ impl DCache {
         self.child_to_parent.upsert_sync(ino, parent_ino);
     }
 
-    /// If `ino` is currently cached under a parent different from
-    /// `new_parent`, remove its stale entry from the old parent and reset
-    /// that parent's populate status.
+    /// Remove a stale cache entry for `ino` if it moved to a new parent or
+    /// was renamed within the same parent.
     ///
-    /// The old parent's write lock is acquired and released before `insert`
-    /// takes the new parent's write lock, avoiding any deadlock from
-    /// simultaneous two-lock holds.
-    fn cleanup_old_parent(&self, new_parent: LoadedAddr, ino: LoadedAddr) {
+    /// For cross-parent moves the old parent's write lock is acquired and
+    /// released before `insert` takes the new parent's write lock, avoiding
+    /// deadlock from simultaneous two-lock holds.
+    ///
+    /// For same-parent renames the same lock is acquired sequentially (not
+    /// nested). The brief window between the two acquisitions is acceptable:
+    /// during initial population `readdir` is blocked by `IN_PROGRESS`, and
+    /// after population a concurrent `readdir` would at worst momentarily
+    /// miss the entry — it will reappear on the next call.
+    ///
+    /// # Concurrent same-inode inserts
+    ///
+    /// Two concurrent `insert` calls for the same `ino` with different names
+    /// under the same parent can orphan an entry: both read the same stale
+    /// `old_name`, the first removes it, the second's guard no-ops, and both
+    /// inserts proceed — leaving two name→ino mappings with only the last
+    /// writer's name in the reverse index. This is not reachable in practice
+    /// because [`AsyncFs`](super::async_fs::AsyncFs) deduplicates per-inode
+    /// operations through [`FutureBackedCache`](crate::cache::async_backed::FutureBackedCache),
+    /// but callers that bypass that layer must serialize inserts per inode.
+    fn cleanup_stale_entry(&self, new_parent: LoadedAddr, new_name: &OsStr, ino: LoadedAddr) {
         let Some(old_parent) = self.child_to_parent.read_sync(&ino, |_, &v| v) else {
             return;
         };
-        if old_parent == new_parent {
-            return;
-        }
         let Some(old_name) = self.child_to_name.read_sync(&ino, |_, v| v.clone()) else {
             return;
         };
+        if old_parent == new_parent && old_name.as_os_str() == new_name {
+            return;
+        }
         let Some(old_state) = self.dirs.read_sync(&old_parent, |_, v| Arc::clone(v)) else {
             return;
         };
@@ -177,15 +197,20 @@ impl DCache {
             old_children.remove(&old_name);
         }
         drop(old_children);
-        // Reset populate status so the next readdir re-fetches.
-        old_state.generation.fetch_add(1, Ordering::Release);
-        let _ = old_state.populated.compare_exchange(
-            POPULATE_DONE,
-            POPULATE_UNCLAIMED,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        );
-        old_state.notify.notify_waiters();
+        // Only reset populate status for cross-parent moves. A same-parent
+        // rename does not invalidate the directory listing — the data
+        // provider returned the new name, so the cache is being corrected,
+        // not going stale.
+        if old_parent != new_parent {
+            old_state.generation.fetch_add(1, Ordering::Release);
+            let _ = old_state.populated.compare_exchange(
+                POPULATE_DONE,
+                POPULATE_UNCLAIMED,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+            old_state.notify.notify_waiters();
+        }
     }
 
     /// Iterate all cached children of `parent_ino` in name-sorted order.

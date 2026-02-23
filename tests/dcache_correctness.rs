@@ -165,11 +165,11 @@ async fn upsert_overwrites_existing_entry() {
 #[tokio::test]
 async fn readdir_returns_entries_in_sorted_order() {
     let cache = DCache::new();
-    for name in ["zebra", "apple", "mango"] {
+    for (i, name) in ["zebra", "apple", "mango"].iter().enumerate() {
         cache.insert(
             LoadedAddr::new_unchecked(1),
-            OsString::from(name),
-            LoadedAddr::new_unchecked(10),
+            OsString::from(*name),
+            LoadedAddr::new_unchecked(10 + i as u64),
             false,
         );
     }
@@ -566,7 +566,7 @@ async fn insert_reparent_does_not_remove_reused_name_in_old_parent() {
 }
 
 #[tokio::test]
-async fn insert_reparent_same_parent_is_noop() {
+async fn insert_reparent_same_parent_removes_old_name() {
     let cache = DCache::new();
     let parent = LoadedAddr::new_unchecked(1);
     let child = LoadedAddr::new_unchecked(10);
@@ -574,14 +574,11 @@ async fn insert_reparent_same_parent_is_noop() {
     cache.insert(parent, OsString::from("foo"), child, false);
 
     // Re-insert under the same parent with a different name.
-    // This is not a re-parent, so no cross-parent cleanup should happen.
     cache.insert(parent, OsString::from("bar"), child, false);
 
     // "bar" should exist (the new entry).
     assert!(cache.lookup(parent, OsStr::new("bar")).is_some());
-    // "foo" still exists because insert only cleans up cross-parent
-    // stale entries, not same-parent renames. The old entry under
-    // the same parent is a separate concern (name -> ino mapping).
-    // The reverse index now says child_to_name[child] = "bar",
-    // so evict will target "bar", not "foo".
+    // "foo" must be gone — otherwise readdir would return two entries
+    // pointing to the same child inode.
+    assert!(cache.lookup(parent, OsStr::new("foo")).is_none());
 }
