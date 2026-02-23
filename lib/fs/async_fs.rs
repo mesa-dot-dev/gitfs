@@ -100,6 +100,22 @@ impl StatelessDrop<Arc<FutureBackedCache<InodeAddr, INode>>, InodeAddr> for Inod
     }
 }
 
+/// Context for inode eviction when a data provider is available.
+///
+/// Groups the shared caches and provider into a named struct so that
+/// [`InodeForget::delete`] reads clearly instead of using positional
+/// tuple fields (`ctx.0`, `ctx.1`, etc.).
+pub struct ForgetContext<DP: FsDataProvider> {
+    /// Canonical addr → `INode` map.
+    pub inode_table: Arc<FutureBackedCache<InodeAddr, INode>>,
+    /// Directory entry cache.
+    pub dcache: Arc<DCache>,
+    /// Reverse-indexed lookup cache.
+    pub lookup_cache: Arc<IndexedLookupCache>,
+    /// The data provider for provider-specific cleanup.
+    pub provider: DP,
+}
+
 /// Evicts the inode from the table, directory cache, and lookup cache, then
 /// delegates to [`FsDataProvider::forget`] so the provider can clean up its
 /// own auxiliary state.
@@ -107,31 +123,13 @@ impl StatelessDrop<Arc<FutureBackedCache<InodeAddr, INode>>, InodeAddr> for Inod
 /// The lookup cache cleanup removes all entries referencing the forgotten
 /// inode (as parent or child) via the [`IndexedLookupCache`]'s reverse
 /// index, ensuring O(k) eviction instead of O(N) full-cache scan.
-impl<DP: FsDataProvider>
-    StatelessDrop<
-        (
-            Arc<FutureBackedCache<InodeAddr, INode>>,
-            Arc<DCache>,
-            Arc<IndexedLookupCache>,
-            DP,
-        ),
-        InodeAddr,
-    > for InodeForget
-{
-    fn delete(
-        ctx: &(
-            Arc<FutureBackedCache<InodeAddr, INode>>,
-            Arc<DCache>,
-            Arc<IndexedLookupCache>,
-            DP,
-        ),
-        key: &InodeAddr,
-    ) {
+impl<DP: FsDataProvider> StatelessDrop<ForgetContext<DP>, InodeAddr> for InodeForget {
+    fn delete(ctx: &ForgetContext<DP>, key: &InodeAddr) {
         let addr = *key;
-        ctx.0.remove_sync(key);
-        ctx.1.evict(LoadedAddr::new_unchecked(addr));
-        ctx.2.evict_addr(addr);
-        ctx.3.forget(addr);
+        ctx.inode_table.remove_sync(key);
+        ctx.dcache.evict(LoadedAddr::new_unchecked(addr));
+        ctx.lookup_cache.evict_addr(addr);
+        ctx.provider.forget(addr);
     }
 }
 

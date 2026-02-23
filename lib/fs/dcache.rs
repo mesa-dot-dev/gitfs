@@ -418,6 +418,16 @@ impl DCache {
     /// to `UNCLAIMED`, this does not overwrite that correction.
     pub fn finish_populate(&self, parent_ino: LoadedAddr, claimed_gen: u64) {
         let state = self.dir_state(parent_ino);
+        // Acquire the read lock to serialize the generation check with
+        // evict's generation bump (which happens under the write lock).
+        // Without this, a concurrent evict could bump the generation and
+        // reset the flag to UNCLAIMED, then a new populator could claim
+        // IN_PROGRESS, and this stale finish_populate would overwrite the
+        // new populator's IN_PROGRESS with DONE — serving incomplete data.
+        let children_guard = state
+            .children
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let current_gen = state.generation.load(Ordering::Acquire);
         let target = if current_gen == claimed_gen {
             POPULATE_DONE
@@ -433,6 +443,7 @@ impl DCache {
             Ordering::AcqRel,
             Ordering::Relaxed,
         );
+        drop(children_guard);
         state.notify.notify_waiters();
     }
 

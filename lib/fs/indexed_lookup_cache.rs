@@ -1,6 +1,7 @@
 //! [`IndexedLookupCache`]: a reverse-indexed wrapper around [`LookupCache`]
 //! for O(k) eviction of lookup-cache entries by inode address.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::future::Future;
 use std::sync::Arc;
@@ -27,12 +28,11 @@ type ReverseEntry = (LookupKey, InodeAddr);
 /// reverse index (where each child has exactly one parent), the lookup
 /// cache maps one inode address to *multiple* cache keys (because an
 /// inode can appear as both a parent and a child in different entries).
-/// Hence we use `Vec<ReverseEntry>` rather than a flat map.
 pub struct IndexedLookupCache {
     cache: LookupCache,
     /// addr → set of `(key, child_addr)` pairs where `addr` appears as
     /// parent or child.
-    reverse: scc::HashMap<InodeAddr, Vec<ReverseEntry>>,
+    reverse: scc::HashMap<InodeAddr, HashSet<ReverseEntry>>,
 }
 
 impl Default for IndexedLookupCache {
@@ -93,20 +93,17 @@ impl IndexedLookupCache {
                     .remove_if_ready_sync(key, |inode| inode.addr == addr);
             }
             // Clean the *other* side(s) of the reverse index.
-            // We removed `addr`'s Vec already; now prune the key from
+            // We removed `addr`'s set already; now prune the entry from
             // whichever other addrs it was indexed under.
-            //
-            // The retain predicate matches on both key and child_addr to
-            // avoid spuriously removing a freshly-indexed entry for a
-            // *different* child that reuses the same LookupKey.
+            let entry = (key.clone(), *child_addr);
             if *parent_addr != addr {
                 self.reverse.update_sync(parent_addr, |_, v| {
-                    v.retain(|(k, ca)| !(k == key && *ca == *child_addr));
+                    v.remove(&entry);
                 });
             }
             if *child_addr != addr && *child_addr != *parent_addr {
                 self.reverse.update_sync(child_addr, |_, v| {
-                    v.retain(|(k, ca)| !(k == key && *ca == *child_addr));
+                    v.remove(&entry);
                 });
             }
         }
@@ -114,27 +111,27 @@ impl IndexedLookupCache {
 
     /// Record a lookup entry in the reverse index for both parent and child addrs.
     ///
-    /// Deduplicates: if the key is already present in the `Vec` for a given
-    /// addr, the push is skipped. This prevents unbounded growth when the
-    /// same key is looked up repeatedly (cache hits still call this method
-    /// because the `FutureBackedCache` joiner path returns without
-    /// distinguishing hits from misses).
+    /// Deduplicates via `HashSet`: repeated lookups for the same key are
+    /// O(1) instead of the O(k) linear scan of the previous `Vec`-based
+    /// approach. Cache hits still call this method because the
+    /// `FutureBackedCache` joiner path returns without distinguishing
+    /// hits from misses.
     fn index_entry(&self, key: &LookupKey, child_addr: InodeAddr) {
         let entry = (key.clone(), child_addr);
         let (parent_addr, _) = key;
-        // Index under parent addr (deduplicated).
+        // Index under parent addr.
         self.reverse
             .entry_sync(*parent_addr)
             .or_default()
             .get_mut()
-            .dedup_push(&entry);
-        // Index under child addr (if different from parent, deduplicated).
+            .insert(entry.clone());
+        // Index under child addr (if different from parent).
         if child_addr != *parent_addr {
             self.reverse
                 .entry_sync(child_addr)
                 .or_default()
                 .get_mut()
-                .dedup_push(&entry);
+                .insert(entry);
         }
     }
 
@@ -162,18 +159,5 @@ impl IndexedLookupCache {
         self.reverse.update_sync(parent_addr, |_, entries| {
             entries.retain(|(k, _)| k != key);
         });
-    }
-}
-
-/// Extension trait for `Vec` to push only if the element is not already present.
-trait DedupPush<T: PartialEq + Clone> {
-    fn dedup_push(&mut self, item: &T);
-}
-
-impl<T: PartialEq + Clone> DedupPush<T> for Vec<T> {
-    fn dedup_push(&mut self, item: &T) {
-        if !self.contains(item) {
-            self.push(item.clone());
-        }
     }
 }
