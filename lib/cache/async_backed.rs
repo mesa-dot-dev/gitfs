@@ -405,6 +405,20 @@ where
     pub fn remove_sync(&self, key: &K) -> bool {
         self.map.remove_sync(key).is_some()
     }
+
+    /// Synchronously remove the entry for `key` only if it is `Ready` and
+    /// `predicate` returns `true` for the resolved value.
+    ///
+    /// `InFlight` entries are never removed. Returns `true` if the entry
+    /// was present and removed.
+    pub fn remove_if_ready_sync(&self, key: &K, mut predicate: impl FnMut(&V) -> bool) -> bool {
+        self.map
+            .remove_if_sync(key, |slot| match slot {
+                Slot::InFlight(..) => false,
+                Slot::Ready(v) => predicate(v),
+            })
+            .is_some()
+    }
 }
 
 /// Drop guard that synchronously promotes an `InFlight` entry to `Ready` if the caller

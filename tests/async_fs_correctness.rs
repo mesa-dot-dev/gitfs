@@ -1138,3 +1138,87 @@ async fn remove_sync_cleans_cache_and_parent_reverse_index() {
         "entry should be re-fetchable after orphan cleanup via evict_addr"
     );
 }
+
+/// Verify that `evict_addr(old_child)` does not spuriously remove a
+/// freshly-indexed reverse entry for a *new* child that reuses the same
+/// `LookupKey` `(parent, name)`.
+///
+/// Scenario:
+/// 1. Insert `(P, "foo") -> C1`. Reverse: `P=[(key,C1)]`, `C1=[(key,C1)]`.
+/// 2. Remove C1 from cache, re-insert `(P, "foo") -> C2` (simulating a
+///    concurrent re-lookup that resolved to a new child after C1 was evicted
+///    from the inode table).
+/// 3. `evict_addr(C1)` should only prune entries whose child_addr is C1.
+///    The freshly-indexed entry `(key, C2)` under parent P must survive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evict_old_child_must_not_remove_new_childs_reverse_entry() {
+    use git_fs::fs::IndexedLookupCache;
+
+    let cache = IndexedLookupCache::default();
+    let parent: u64 = 100;
+    let old_child: u64 = 200;
+    let new_child: u64 = 300;
+
+    let key: (u64, Arc<OsStr>) = (parent, Arc::from(OsStr::new("foo")));
+
+    // Step 1: Insert (P, "foo") -> old_child.
+    let oc = old_child;
+    cache
+        .get_or_try_init(key.clone(), move || async move {
+            Ok(make_inode(oc, INodeType::File, 10, Some(parent)))
+        })
+        .await
+        .unwrap();
+    assert_eq!(cache.reverse_entry_count(parent), 1);
+    assert_eq!(cache.reverse_entry_count(old_child), 1);
+
+    // Step 2: Simulate old_child being evicted from the inode table, then a
+    // new lookup resolving (P, "foo") -> new_child. We remove the old cache
+    // entry first (as InodeForget::delete would), then re-insert.
+    cache.remove_sync(&key);
+    let nc = new_child;
+    cache
+        .get_or_try_init(key.clone(), move || async move {
+            Ok(make_inode(nc, INodeType::File, 20, Some(parent)))
+        })
+        .await
+        .unwrap();
+
+    // Parent's reverse index should have the new entry (key, new_child).
+    assert_eq!(
+        cache.reverse_entry_count(parent),
+        1,
+        "parent should have exactly 1 reverse entry (the new child)"
+    );
+    assert_eq!(cache.reverse_entry_count(new_child), 1);
+
+    // Step 3: evict_addr(old_child). The old_child's reverse Vec was already
+    // partially cleaned by remove_sync, but may still contain an orphaned
+    // entry. The retain predicate must NOT remove the new child's entry from
+    // parent's Vec.
+    cache.evict_addr(old_child);
+
+    // The new child's entry under parent must survive.
+    assert_eq!(
+        cache.reverse_entry_count(parent),
+        1,
+        "evict_addr(old_child) must not remove new_child's reverse entry under parent"
+    );
+    assert_eq!(
+        cache.reverse_entry_count(new_child),
+        1,
+        "new_child's own reverse entry must survive"
+    );
+
+    // The cache entry itself must also survive.
+    let result = cache
+        .get_or_try_init(key.clone(), move || async move {
+            Ok(make_inode(new_child, INodeType::File, 999, Some(parent)))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        result.size, 20,
+        "cache entry for new_child should still be present (factory should not run)"
+    );
+}

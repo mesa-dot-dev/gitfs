@@ -21,6 +21,26 @@ const POPULATE_UNCLAIMED: u8 = 0;
 const POPULATE_IN_PROGRESS: u8 = 1;
 const POPULATE_DONE: u8 = 2;
 
+/// CAS loop: atomically transition `DONE|IN_PROGRESS → UNCLAIMED`.
+///
+/// Uses `compare_exchange_weak` in a loop to close the window that would
+/// exist between two sequential CAS operations, where a new populator
+/// could claim `IN_PROGRESS` and then be clobbered by a stale second CAS.
+fn reset_populate(flag: &AtomicU8) {
+    let mut current = flag.load(Ordering::Acquire);
+    while matches!(current, POPULATE_DONE | POPULATE_IN_PROGRESS) {
+        match flag.compare_exchange_weak(
+            current,
+            POPULATE_UNCLAIMED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 /// Result of attempting to claim a directory for population.
 pub enum PopulateStatus {
     /// This caller won the race and should populate the directory.
@@ -203,23 +223,7 @@ impl DCache {
         // not going stale.
         if old_parent != new_parent {
             old_state.generation.fetch_add(1, Ordering::Release);
-            if old_state
-                .populated
-                .compare_exchange(
-                    POPULATE_DONE,
-                    POPULATE_UNCLAIMED,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                )
-                .is_err()
-            {
-                let _ = old_state.populated.compare_exchange(
-                    POPULATE_IN_PROGRESS,
-                    POPULATE_UNCLAIMED,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                );
-            }
+            reset_populate(&old_state.populated);
             old_state.notify.notify_waiters();
         }
     }
@@ -372,26 +376,10 @@ impl DCache {
         // reading the stale generation and setting DONE between the child
         // removal and the generation bump.
         state.generation.fetch_add(1, Ordering::Release);
-        // Reset to UNCLAIMED so the next readdir re-fetches. Try both
-        // DONE and IN_PROGRESS: eviction during an in-flight populate
-        // must also reset the flag so waiters are not stuck.
-        if state
-            .populated
-            .compare_exchange(
-                POPULATE_DONE,
-                POPULATE_UNCLAIMED,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            )
-            .is_err()
-        {
-            let _ = state.populated.compare_exchange(
-                POPULATE_IN_PROGRESS,
-                POPULATE_UNCLAIMED,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            );
-        }
+        // Reset to UNCLAIMED so the next readdir re-fetches. Eviction
+        // during an in-flight populate must also reset the flag so
+        // waiters are not stuck.
+        reset_populate(&state.populated);
         drop(children);
         state.notify.notify_waiters();
     }

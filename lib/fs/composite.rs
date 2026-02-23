@@ -466,10 +466,10 @@ where
         // inner inodes don't leak until the entire slot is GC'd.
         //
         // Clone the `Arc<ChildInner>` out of the scc bucket guard before
-        // calling `evict`. `evict` does O(n) work (`retain_sync` on the
-        // lookup_cache), and holding the `slots` bucket lock for the
-        // entire duration would block concurrent lookups and forgets that
-        // hash to the same bucket.
+        // calling `evict`. `evict` does O(k) work (targeted removal via
+        // `IndexedLookupCache::evict_addr`), and holding the `slots`
+        // bucket lock for the entire duration would block concurrent
+        // lookups and forgets that hash to the same bucket.
         if let Some(inner_addr) = removed_inner {
             let child = self
                 .inner

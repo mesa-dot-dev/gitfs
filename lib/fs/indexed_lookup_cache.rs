@@ -80,19 +80,33 @@ impl IndexedLookupCache {
             .unwrap_or_default();
 
         for (key, child_addr) in &entries {
-            self.cache.remove_sync(key);
             let (parent_addr, _) = key;
+            // When evicting by parent (parent_addr == addr), all lookups
+            // under that parent are invalid — remove unconditionally.
+            // When evicting by child, only remove if the cache still maps
+            // to the old child; a concurrent re-lookup may have replaced
+            // the value with a new child under the same key.
+            if *parent_addr == addr {
+                self.cache.remove_sync(key);
+            } else {
+                self.cache
+                    .remove_if_ready_sync(key, |inode| inode.addr == addr);
+            }
             // Clean the *other* side(s) of the reverse index.
             // We removed `addr`'s Vec already; now prune the key from
             // whichever other addrs it was indexed under.
+            //
+            // The retain predicate matches on both key and child_addr to
+            // avoid spuriously removing a freshly-indexed entry for a
+            // *different* child that reuses the same LookupKey.
             if *parent_addr != addr {
                 self.reverse.update_sync(parent_addr, |_, v| {
-                    v.retain(|(k, _)| k != key);
+                    v.retain(|(k, ca)| !(k == key && *ca == *child_addr));
                 });
             }
             if *child_addr != addr && *child_addr != *parent_addr {
                 self.reverse.update_sync(child_addr, |_, v| {
-                    v.retain(|(k, _)| k != key);
+                    v.retain(|(k, ca)| !(k == key && *ca == *child_addr));
                 });
             }
         }
