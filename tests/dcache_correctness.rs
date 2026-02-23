@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, missing_docs)]
+#![allow(clippy::unwrap_used, clippy::doc_markdown, missing_docs)]
 
 use std::ffi::{OsStr, OsString};
 
@@ -565,6 +565,87 @@ async fn insert_reparent_does_not_remove_reused_name_in_old_parent() {
     assert_eq!(dv.unwrap().ino, child_2);
 }
 
+/// Regression test for H1: evict during IN_PROGRESS must reset populate
+/// status so finish_populate stores UNCLAIMED (not DONE).
+///
+/// Scenario:
+/// 1. Populate is claimed (state = IN_PROGRESS, claim_gen = 0)
+/// 2. Evict fires while IN_PROGRESS — bumps generation to 1 AND resets
+///    state back to UNCLAIMED
+/// 3. finish_populate(claim_gen=0) sees generation mismatch → stores UNCLAIMED
+///
+/// Before the fix, evict only attempted CAS(DONE -> UNCLAIMED) which
+/// failed because state was IN_PROGRESS. The state stayed IN_PROGRESS,
+/// and finish_populate with stale gen correctly stored UNCLAIMED via
+/// the generation check. But the populate status was stuck for any
+/// waiter that checked between evict and finish_populate.
+///
+/// After the fix, evict also resets IN_PROGRESS -> UNCLAIMED, closing
+/// the window.
+#[tokio::test]
+async fn evict_during_in_progress_resets_populate_status() {
+    let cache = DCache::new();
+    let parent = LoadedAddr::new_unchecked(1);
+    let child = LoadedAddr::new_unchecked(10);
+    cache.insert(parent, OsString::from("foo"), child, false);
+
+    // Claim populate (state → IN_PROGRESS).
+    let PopulateStatus::Claimed(_claim_gen) = cache.try_claim_populate(parent) else {
+        panic!("expected Claimed");
+    };
+
+    // Evict while IN_PROGRESS.
+    cache.evict(child);
+
+    // After the fix, evict should have reset IN_PROGRESS → UNCLAIMED.
+    // A new claim attempt should succeed (not return InProgress).
+    match cache.try_claim_populate(parent) {
+        PopulateStatus::Claimed(_) => { /* correct: evict reset to UNCLAIMED */ }
+        PopulateStatus::InProgress => {
+            panic!(
+                "BUG: evict during IN_PROGRESS failed to reset populate status; \
+                 state is stuck at IN_PROGRESS"
+            );
+        }
+        PopulateStatus::Done => {
+            panic!("BUG: state should not be DONE — nobody called finish_populate");
+        }
+    }
+}
+
+/// Regression test: evict during IN_PROGRESS followed by finish_populate
+/// with stale generation must leave the directory re-claimable.
+#[tokio::test]
+async fn evict_during_in_progress_then_finish_populate_stays_unclaimed() {
+    let cache = DCache::new();
+    let parent = LoadedAddr::new_unchecked(1);
+    let child_a = LoadedAddr::new_unchecked(10);
+    let child_b = LoadedAddr::new_unchecked(11);
+    cache.insert(parent, OsString::from("a"), child_a, false);
+    cache.insert(parent, OsString::from("b"), child_b, false);
+
+    // Step 1: claim populate.
+    let PopulateStatus::Claimed(claim_gen) = cache.try_claim_populate(parent) else {
+        panic!("expected Claimed");
+    };
+
+    // Step 2: evict during IN_PROGRESS. After the fix, this resets to
+    // UNCLAIMED and bumps the generation.
+    cache.evict(child_a);
+
+    // Step 3: finish_populate with the stale generation. Since evict
+    // already reset to UNCLAIMED, finish_populate's CAS on IN_PROGRESS
+    // may fail (already UNCLAIMED) — which is correct. Or if the
+    // generation mismatch is detected, it stores UNCLAIMED.
+    cache.finish_populate(parent, claim_gen);
+
+    // The directory must be re-claimable (not stuck in DONE with stale data).
+    assert!(
+        matches!(cache.try_claim_populate(parent), PopulateStatus::Claimed(_)),
+        "directory should be re-claimable after evict invalidated the in-flight populate"
+    );
+}
+
 #[tokio::test]
 async fn insert_reparent_same_parent_removes_old_name() {
     let cache = DCache::new();
@@ -581,4 +662,81 @@ async fn insert_reparent_same_parent_removes_old_name() {
     // "foo" must be gone — otherwise readdir would return two entries
     // pointing to the same child inode.
     assert!(cache.lookup(parent, OsStr::new("foo")).is_none());
+}
+
+/// M1: `remove_parent` should only remove reverse-index entries for children
+/// that still belong to the removed parent. If a child was concurrently
+/// re-inserted under a *new* parent's DirState (created after the old one was
+/// removed), remove_parent must not clobber the new reverse-index entries.
+#[tokio::test]
+async fn remove_parent_does_not_clobber_concurrent_reinsert_reverse_index() {
+    let cache = DCache::new();
+    let parent_a = LoadedAddr::new_unchecked(1);
+    let parent_b = LoadedAddr::new_unchecked(2);
+    let child = LoadedAddr::new_unchecked(10);
+
+    // Populate parent_a with child.
+    cache.insert(parent_a, OsString::from("child"), child, false);
+
+    // Now simulate the race: first, re-insert child under parent_b.
+    cache.insert(parent_b, OsString::from("child"), child, false);
+
+    // Then remove parent_a (which no longer owns the child, since insert
+    // already moved the reverse index to parent_b).
+    cache.remove_parent(parent_a);
+
+    // The child should still be discoverable via evict (which uses the
+    // reverse index to find the parent). If remove_parent clobbered the
+    // reverse index, evict won't find anything.
+    cache.evict(child);
+
+    // After evict, lookup under parent_b should return None (evicted).
+    assert!(
+        cache.lookup(parent_b, OsStr::new("child")).is_none(),
+        "evict should have removed child from parent_b via reverse index"
+    );
+}
+
+/// M2: The generation bump in `evict` must be visible before the write lock
+/// is released, so that a concurrent `finish_populate` sees the new
+/// generation and resets to UNCLAIMED instead of setting DONE.
+///
+/// This test exercises the interleaving:
+/// 1. Claim populate (gen=0), begin populating.
+/// 2. Evict bumps gen to 1, resets IN_PROGRESS to UNCLAIMED.
+/// 3. finish_populate with claimed_gen=0 — must NOT set DONE because
+///    the CAS from IN_PROGRESS fails (already UNCLAIMED from evict).
+/// 4. A subsequent try_claim_populate must succeed (UNCLAIMED, not DONE).
+#[tokio::test]
+async fn evict_generation_bump_prevents_stale_finish_populate() {
+    let cache = DCache::new();
+    let parent = LoadedAddr::new_unchecked(1);
+    let child = LoadedAddr::new_unchecked(10);
+
+    // Insert child so evict has something to work with.
+    cache.insert(parent, OsString::from("foo"), child, false);
+
+    // Claim populate (gen=0). State: IN_PROGRESS.
+    let PopulateStatus::Claimed(claimed_gen) = cache.try_claim_populate(parent) else {
+        panic!("expected Claimed");
+    };
+    assert_eq!(claimed_gen, 0);
+
+    // Evict while populate is in-flight. This bumps gen to 1 and
+    // CASes IN_PROGRESS -> UNCLAIMED.
+    cache.evict(child);
+
+    // finish_populate with the now-stale claimed_gen=0. Since evict
+    // already reset to UNCLAIMED, the CAS (IN_PROGRESS -> target) should
+    // fail harmlessly. The directory must remain UNCLAIMED.
+    cache.finish_populate(parent, claimed_gen);
+
+    // The directory should be re-claimable (UNCLAIMED), not stuck at DONE.
+    match cache.try_claim_populate(parent) {
+        PopulateStatus::Claimed(_) => { /* correct: UNCLAIMED -> Claimed */ }
+        PopulateStatus::Done => {
+            panic!("directory should be UNCLAIMED after evict invalidated the generation")
+        }
+        PopulateStatus::InProgress => panic!("unexpected InProgress"),
+    }
 }

@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::doc_markdown,
+    missing_docs
+)]
 
 mod common;
 
@@ -394,4 +399,124 @@ async fn composite_forget_cleans_up_slot_and_name_mapping() {
 
     assert_eq!(re_resolved.inode.itype, INodeType::Directory);
     // The new address may differ from the original (fresh slot allocated).
+}
+
+/// Regression test for C1: forget must not remove a name_to_slot entry
+/// that was replaced by a concurrent register_child.
+///
+/// Scenario: slot S1 for "repo" is GC'd by forget (bridge empty), then
+/// a new lookup creates slot S2 for the same name. A stale forget that
+/// still references S1's slot index must NOT remove the name_to_slot
+/// entry pointing to S2.
+///
+/// We simulate this by:
+/// 1. Looking up "repo" to create slot S1
+/// 2. Forgetting all addresses to trigger slot GC (name_to_slot entry removed)
+/// 3. Re-looking up "repo" to create slot S2 (name_to_slot entry re-created)
+/// 4. Verifying a further re-lookup still works (name_to_slot entry intact)
+///
+/// Before the fix, step 2's forget could race with step 3's register_child
+/// and destroy the replacement entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn composite_forget_does_not_destroy_replacement_name_to_slot_entry() {
+    let (provider, root_ino) = make_child_provider(100, &[("file.txt", 101, INodeType::File, 42)]);
+
+    let mut children = HashMap::new();
+    children.insert(OsString::from("repo"), (provider, root_ino));
+
+    let mock_root = MockRoot::new(children);
+    let composite = CompositeFs::new(mock_root, (1000, 1000));
+    let root_inode = composite.make_root_inode();
+
+    let table = Arc::new(FutureBackedCache::default());
+    table.insert_sync(1, root_inode);
+    let afs = AsyncFs::new_preseeded(composite.clone(), Arc::clone(&table));
+
+    // Step 1: establish slot S1
+    let child_dir = afs
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("repo"))
+        .await
+        .unwrap();
+    let s1_child_addr = child_dir.inode.addr;
+
+    let file = afs
+        .lookup(
+            LoadedAddr::new_unchecked(s1_child_addr),
+            OsStr::new("file.txt"),
+        )
+        .await
+        .unwrap();
+    let s1_file_addr = file.inode.addr;
+
+    // Step 2: forget all S1 addresses → slot GC
+    composite.forget(s1_file_addr);
+    composite.forget(s1_child_addr);
+
+    // Step 3: re-lookup "repo" → creates slot S2
+    let re_resolved = afs
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("repo"))
+        .await
+        .unwrap();
+    let s2_child_addr = re_resolved.inode.addr;
+    assert_eq!(re_resolved.inode.itype, INodeType::Directory);
+
+    // Step 4: another lookup must succeed — name_to_slot must still point to S2.
+    // Before the fix, if forget's stale remove_sync destroyed S2's entry,
+    // this lookup would create a *third* slot instead of reusing S2, or
+    // worse, the name_to_slot entry would be missing.
+    let third_lookup = afs
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("repo"))
+        .await
+        .unwrap();
+    assert_eq!(
+        third_lookup.inode.addr, s2_child_addr,
+        "repeated lookup after forget+re-register should return the same slot S2 address"
+    );
+}
+
+/// Test that concurrent forget + lookup on the same child name does not
+/// orphan the replacement slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn composite_concurrent_forget_and_lookup_preserves_name_mapping() {
+    let (provider, root_ino) = make_child_provider(100, &[("a.txt", 101, INodeType::File, 1)]);
+
+    let mut children = HashMap::new();
+    children.insert(OsString::from("repo"), (provider, root_ino));
+
+    let mock_root = MockRoot::new(children);
+    let composite = CompositeFs::new(mock_root, (1000, 1000));
+    let root_inode = composite.make_root_inode();
+
+    // Run multiple rounds of forget-then-re-lookup to stress the race window.
+    for _ in 0..50 {
+        let table = Arc::new(FutureBackedCache::default());
+        table.insert_sync(1, root_inode);
+        let afs = AsyncFs::new_preseeded(composite.clone(), Arc::clone(&table));
+
+        // Establish the child.
+        let child = afs
+            .lookup(LoadedAddr::new_unchecked(1), OsStr::new("repo"))
+            .await
+            .unwrap();
+        let child_addr = child.inode.addr;
+
+        let file = afs
+            .lookup(LoadedAddr::new_unchecked(child_addr), OsStr::new("a.txt"))
+            .await
+            .unwrap();
+
+        // Forget everything so the slot is GC'd.
+        composite.forget(file.inode.addr);
+        composite.forget(child_addr);
+
+        // Re-lookup: must always succeed.
+        let re = afs
+            .lookup(LoadedAddr::new_unchecked(1), OsStr::new("repo"))
+            .await;
+        assert!(
+            re.is_ok(),
+            "re-lookup after forget should always succeed, got: {:?}",
+            re.err()
+        );
+    }
 }

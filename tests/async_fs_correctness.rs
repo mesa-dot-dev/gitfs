@@ -1,4 +1,10 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::doc_markdown,
+    clippy::similar_names,
+    missing_docs
+)]
 
 mod common;
 
@@ -871,5 +877,205 @@ async fn readdir_evict_all_readdir_returns_same_entries() {
     assert_eq!(
         second, first,
         "readdir after evict should return same entries"
+    );
+}
+
+/// Verify that `IndexedLookupCache::evict_addr` removes only entries
+/// referencing the evicted inode (parent or child), leaving unrelated
+/// entries intact. This is the O(k) replacement for the old O(N) scan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn indexed_lookup_cache_evict_removes_only_related_entries() {
+    use git_fs::fs::async_fs::IndexedLookupCache;
+
+    let cache = IndexedLookupCache::default();
+
+    let parent_a: u64 = 1;
+    let parent_b: u64 = 2;
+    let child_x: u64 = 10;
+    let child_y: u64 = 11;
+    let child_z: u64 = 12;
+
+    let inode_x = make_inode(child_x, INodeType::File, 100, Some(parent_a));
+    let inode_y = make_inode(child_y, INodeType::File, 200, Some(parent_a));
+    let inode_z = make_inode(child_z, INodeType::File, 300, Some(parent_b));
+
+    // Populate: parent_a has children x and y, parent_b has child z.
+    let key_ax: (u64, Arc<OsStr>) = (parent_a, Arc::from(OsStr::new("x")));
+    let key_ay: (u64, Arc<OsStr>) = (parent_a, Arc::from(OsStr::new("y")));
+    let key_bz: (u64, Arc<OsStr>) = (parent_b, Arc::from(OsStr::new("z")));
+
+    let ix = inode_x;
+    cache
+        .get_or_try_init(key_ax.clone(), move || async move { Ok(ix) })
+        .await
+        .unwrap();
+    let iy = inode_y;
+    cache
+        .get_or_try_init(key_ay.clone(), move || async move { Ok(iy) })
+        .await
+        .unwrap();
+    let iz = inode_z;
+    cache
+        .get_or_try_init(key_bz.clone(), move || async move { Ok(iz) })
+        .await
+        .unwrap();
+
+    // Evict child_x. This should remove key_ax but leave key_ay and key_bz.
+    cache.evict_addr(child_x);
+
+    // key_ax should be gone (child_x was evicted).
+    let result = cache
+        .get_or_try_init(key_ax.clone(), move || async move {
+            Ok(make_inode(child_x, INodeType::File, 999, Some(parent_a)))
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.size, 999, "key_ax should have been re-fetched");
+
+    // key_ay should still be cached (different child).
+    let result = cache
+        .get_or_try_init(key_ay.clone(), || async {
+            panic!("factory should not be called for cached key_ay")
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.size, 200, "key_ay should still be cached");
+
+    // key_bz should still be cached (different parent and child).
+    let result = cache
+        .get_or_try_init(key_bz.clone(), || async {
+            panic!("factory should not be called for cached key_bz")
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.size, 300, "key_bz should still be cached");
+
+    // Evict parent_a. This should remove all entries with parent_a (key_ax, key_ay).
+    cache.evict_addr(parent_a);
+
+    let result = cache
+        .get_or_try_init(key_ay.clone(), move || async move {
+            Ok(make_inode(child_y, INodeType::File, 888, Some(parent_a)))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        result.size, 888,
+        "key_ay should have been re-fetched after parent eviction"
+    );
+
+    // key_bz should still be cached.
+    let result = cache
+        .get_or_try_init(key_bz.clone(), || async {
+            panic!("factory should not be called for cached key_bz after parent_a eviction")
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.size, 300, "key_bz should still be cached");
+}
+
+/// H1: Evicting a parent addr orphans the child-side reverse-index entries.
+/// A subsequent evict of the old child then spuriously deletes a live cache
+/// entry that was re-inserted under the same key with a different child.
+///
+/// Sequence:
+/// 1. Insert (P, "foo") -> C1. Reverse: P=[key], C1=[key].
+/// 2. evict_addr(P): removes P's entries, cleans cache. But since key's
+///    parent_addr == P == addr, the child side (C1) is NOT cleaned.
+///    Reverse: C1=[orphaned key].
+/// 3. Insert (P, "foo") -> C2 (new child). Reverse: P=[key], C2=[key],
+///    C1=[orphaned key still referencing (P, "foo")].
+/// 4. evict_addr(C1): finds orphaned (P, "foo") in C1's reverse list,
+///    calls cache.remove_sync((P, "foo")) — deletes the LIVE C2 entry.
+/// 5. Lookup (P, "foo") should return C2 (cached), but instead triggers
+///    the factory (cache miss).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evict_parent_then_old_child_must_not_delete_repopulated_entry() {
+    use git_fs::fs::async_fs::IndexedLookupCache;
+
+    let cache = IndexedLookupCache::default();
+    let parent: u64 = 1;
+    let child_c1: u64 = 10;
+    let child_c2: u64 = 20;
+
+    let key: (u64, Arc<OsStr>) = (parent, Arc::from(OsStr::new("foo")));
+
+    // Step 1: Insert (P, "foo") -> C1.
+    let c1 = make_inode(child_c1, INodeType::File, 100, Some(parent));
+    cache
+        .get_or_try_init(key.clone(), move || async move { Ok(c1) })
+        .await
+        .unwrap();
+
+    // Step 2: Evict the parent.
+    cache.evict_addr(parent);
+
+    // Step 3: Re-insert (P, "foo") -> C2 (different child).
+    let c2 = make_inode(child_c2, INodeType::File, 200, Some(parent));
+    cache
+        .get_or_try_init(key.clone(), move || async move { Ok(c2) })
+        .await
+        .unwrap();
+
+    // Step 4: Evict old child C1. If orphaned reverse entries exist,
+    // this spuriously removes the live (P, "foo") -> C2 entry.
+    cache.evict_addr(child_c1);
+
+    // Step 5: The live entry (P, "foo") -> C2 must still be cached.
+    let result = cache
+        .get_or_try_init(key.clone(), || async {
+            panic!("factory must NOT be called — (P, \"foo\") -> C2 should still be cached")
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        result.size, 200,
+        "live entry C2 should not have been spuriously evicted"
+    );
+}
+
+/// H2: The reverse-index Vec grows unbounded because `index_entry` is
+/// called on every `get_or_try_init` hit, not just on cache misses.
+/// After N lookups of the same key, the reverse-index should still
+/// contain only 1 entry per addr side (not N duplicates).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_lookups_must_not_grow_reverse_index() {
+    use git_fs::fs::async_fs::IndexedLookupCache;
+
+    let cache = IndexedLookupCache::default();
+    let parent: u64 = 1;
+    let child: u64 = 10;
+
+    let key: (u64, Arc<OsStr>) = (parent, Arc::from(OsStr::new("foo")));
+    let inode = make_inode(child, INodeType::File, 42, Some(parent));
+
+    // First call: cache miss, factory runs.
+    let i = inode;
+    cache
+        .get_or_try_init(key.clone(), move || async move { Ok(i) })
+        .await
+        .unwrap();
+
+    // 50 more calls: all cache hits, factory never called.
+    for _ in 0..50 {
+        cache
+            .get_or_try_init(key.clone(), || async {
+                panic!("factory should not be called on cache hit")
+            })
+            .await
+            .unwrap();
+    }
+
+    // The reverse index for parent and child should each have exactly 1
+    // entry, not 51.
+    assert_eq!(
+        cache.reverse_entry_count(parent),
+        1,
+        "parent reverse-index should have exactly 1 entry, not one per lookup"
+    );
+    assert_eq!(
+        cache.reverse_entry_count(child),
+        1,
+        "child reverse-index should have exactly 1 entry, not one per lookup"
     );
 }

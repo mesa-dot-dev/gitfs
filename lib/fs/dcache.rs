@@ -281,8 +281,17 @@ impl DCache {
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for dv in children.values() {
-                self.child_to_parent.remove_sync(&dv.ino);
-                self.child_to_name.remove_sync(&dv.ino);
+                // Only remove reverse-index entries that still point to this
+                // parent. A concurrent `insert` may have re-parented the child
+                // to a new parent between `dirs.remove_sync` and this cleanup;
+                // removing unconditionally would clobber the new mapping.
+                let removed = self
+                    .child_to_parent
+                    .remove_if_sync(&dv.ino, |v| *v == parent_ino)
+                    .is_some();
+                if removed {
+                    self.child_to_name.remove_sync(&dv.ino);
+                }
             }
             true
         } else {
@@ -297,11 +306,13 @@ impl DCache {
     /// flag to `UNCLAIMED` so the next `readdir` re-fetches from the
     /// data provider.
     ///
-    /// The reset uses `compare_exchange(DONE -> UNCLAIMED)` rather than a
-    /// blind store to avoid a race with an in-flight populate: if a
-    /// concurrent `readdir` is mid-populate (`IN_PROGRESS`), a blind store
-    /// of `UNCLAIMED` would be overwritten by the populator's final `DONE`
-    /// store, leaving the cache in a stale-but-marked-done state.
+    /// The reset attempts CAS on both `DONE -> UNCLAIMED` and
+    /// `IN_PROGRESS -> UNCLAIMED`. The `IN_PROGRESS` case handles eviction
+    /// that occurs while a concurrent `readdir` is mid-populate: the
+    /// populator's subsequent `finish_populate` will observe a generation
+    /// mismatch and store `UNCLAIMED`, but resetting here closes the window
+    /// where waiters would see a stuck `IN_PROGRESS` flag between the
+    /// eviction and the populate completion.
     ///
     /// # Ordering with concurrent `insert`
     ///
@@ -345,16 +356,32 @@ impl DCache {
         if let Some((_, name)) = self.child_to_name.remove_sync(&child_ino) {
             children.remove(&name);
         }
-        drop(children);
-        // Bump generation so any in-flight populate knows its data is stale.
+        // Bump generation and reset populate status while still holding the
+        // write lock. This prevents a concurrent `finish_populate` from
+        // reading the stale generation and setting DONE between the child
+        // removal and the generation bump.
         state.generation.fetch_add(1, Ordering::Release);
-        // Reset DONE -> UNCLAIMED so the next readdir re-fetches.
-        let _ = state.populated.compare_exchange(
-            POPULATE_DONE,
-            POPULATE_UNCLAIMED,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        );
+        // Reset to UNCLAIMED so the next readdir re-fetches. Try both
+        // DONE and IN_PROGRESS: eviction during an in-flight populate
+        // must also reset the flag so waiters are not stuck.
+        if state
+            .populated
+            .compare_exchange(
+                POPULATE_DONE,
+                POPULATE_UNCLAIMED,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            let _ = state.populated.compare_exchange(
+                POPULATE_IN_PROGRESS,
+                POPULATE_UNCLAIMED,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+        }
+        drop(children);
         state.notify.notify_waiters();
     }
 
@@ -386,14 +413,27 @@ impl DCache {
     /// `claimed_gen` is the generation returned by [`try_claim_populate`]. If
     /// an [`evict`](Self::evict) bumped the generation since then, the data
     /// is stale so the flag is reset to `UNCLAIMED` instead of `DONE`.
+    ///
+    /// Uses CAS (`IN_PROGRESS -> target`) rather than a plain store so
+    /// that if a concurrent [`evict`](Self::evict) already reset the flag
+    /// to `UNCLAIMED`, this does not overwrite that correction.
     pub fn finish_populate(&self, parent_ino: LoadedAddr, claimed_gen: u64) {
         let state = self.dir_state(parent_ino);
         let current_gen = state.generation.load(Ordering::Acquire);
-        if current_gen == claimed_gen {
-            state.populated.store(POPULATE_DONE, Ordering::Release);
+        let target = if current_gen == claimed_gen {
+            POPULATE_DONE
         } else {
-            state.populated.store(POPULATE_UNCLAIMED, Ordering::Release);
-        }
+            POPULATE_UNCLAIMED
+        };
+        // CAS: only transition from IN_PROGRESS. If evict already reset
+        // to UNCLAIMED, this fails harmlessly — the correct state is
+        // already in place.
+        let _ = state.populated.compare_exchange(
+            POPULATE_IN_PROGRESS,
+            target,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
         state.notify.notify_waiters();
     }
 

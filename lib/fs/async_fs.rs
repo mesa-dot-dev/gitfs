@@ -22,6 +22,167 @@ use crate::fs::{
 /// `StatelessDrop` context without repeating the full generic signature.
 pub type LookupCache = FutureBackedCache<(InodeAddr, Arc<OsStr>), INode>;
 
+type LookupKey = (InodeAddr, Arc<OsStr>);
+
+/// A reverse-index entry: the lookup-cache key plus the child inode addr
+/// that the key resolved to. Storing the child addr allows [`evict_addr`]
+/// to clean both the parent and child sides of the reverse index without
+/// needing to read the (already-removed) cache value.
+type ReverseEntry = (LookupKey, InodeAddr);
+
+/// Wraps a [`LookupCache`] with a reverse index for O(k) eviction.
+///
+/// The reverse index maps each `InodeAddr` to the set of lookup-cache
+/// keys that reference it (either as parent or as child). This avoids
+/// the O(N) `retain_sync` scan that would otherwise be required when
+/// evicting a single inode.
+///
+/// Unlike [`DCache`](super::dcache::DCache)'s 1:1 `child_to_parent`
+/// reverse index (where each child has exactly one parent), the lookup
+/// cache maps one inode address to *multiple* cache keys (because an
+/// inode can appear as both a parent and a child in different entries).
+/// Hence we use `Vec<ReverseEntry>` rather than a flat map.
+pub struct IndexedLookupCache {
+    cache: LookupCache,
+    /// addr → set of `(key, child_addr)` pairs where `addr` appears as
+    /// parent or child.
+    reverse: scc::HashMap<InodeAddr, Vec<ReverseEntry>>,
+}
+
+impl Default for IndexedLookupCache {
+    fn default() -> Self {
+        Self {
+            cache: LookupCache::default(),
+            reverse: scc::HashMap::new(),
+        }
+    }
+}
+
+impl IndexedLookupCache {
+    /// Delegate to the inner cache's `get_or_try_init`, then record the
+    /// result in the reverse index.
+    pub async fn get_or_try_init<F, Fut>(
+        &self,
+        key: LookupKey,
+        factory: F,
+    ) -> Result<INode, std::io::Error>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<INode, std::io::Error>> + Send + 'static,
+    {
+        let child = self.cache.get_or_try_init(key.clone(), factory).await?;
+        self.index_entry(&key, child.addr);
+        Ok(child)
+    }
+
+    /// Remove a single key from the cache and its reverse-index entries.
+    pub fn remove_sync(&self, key: &LookupKey) {
+        if self.cache.remove_sync(key) {
+            self.deindex_key(key);
+        }
+    }
+
+    /// Remove all lookup-cache entries referencing `addr` (as parent or child).
+    ///
+    /// O(k) where k is the number of entries referencing `addr`, vs the
+    /// previous O(N) scan over the entire cache.
+    pub fn evict_addr(&self, addr: InodeAddr) {
+        let entries = self
+            .reverse
+            .remove_sync(&addr)
+            .map(|(_, entries)| entries)
+            .unwrap_or_default();
+
+        for (key, child_addr) in &entries {
+            self.cache.remove_sync(key);
+            let (parent_addr, _) = key;
+            // Clean the *other* side(s) of the reverse index.
+            // We removed `addr`'s Vec already; now prune the key from
+            // whichever other addrs it was indexed under.
+            if *parent_addr != addr {
+                self.reverse.update_sync(parent_addr, |_, v| {
+                    v.retain(|(k, _)| k != key);
+                });
+            }
+            if *child_addr != addr && *child_addr != *parent_addr {
+                self.reverse.update_sync(child_addr, |_, v| {
+                    v.retain(|(k, _)| k != key);
+                });
+            }
+        }
+    }
+
+    /// Record a lookup entry in the reverse index for both parent and child addrs.
+    ///
+    /// Deduplicates: if the key is already present in the `Vec` for a given
+    /// addr, the push is skipped. This prevents unbounded growth when the
+    /// same key is looked up repeatedly (cache hits still call this method
+    /// because the `FutureBackedCache` joiner path returns without
+    /// distinguishing hits from misses).
+    fn index_entry(&self, key: &LookupKey, child_addr: InodeAddr) {
+        let entry = (key.clone(), child_addr);
+        let (parent_addr, _) = key;
+        // Index under parent addr (deduplicated).
+        self.reverse
+            .entry_sync(*parent_addr)
+            .or_default()
+            .get_mut()
+            .dedup_push(&entry);
+        // Index under child addr (if different from parent, deduplicated).
+        if child_addr != *parent_addr {
+            self.reverse
+                .entry_sync(child_addr)
+                .or_default()
+                .get_mut()
+                .dedup_push(&entry);
+        }
+    }
+
+    /// Returns the number of entries in the reverse-index `Vec` for `addr`.
+    ///
+    /// Intended for testing only — verifies that the reverse index stays
+    /// bounded and does not accumulate duplicates.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn reverse_entry_count(&self, addr: InodeAddr) -> usize {
+        self.reverse
+            .read_sync(&addr, |_, entries| entries.len())
+            .unwrap_or(0)
+    }
+
+    /// Remove a single key's entries from the reverse index.
+    ///
+    /// Cleans the parent side. The child side cannot be cleaned here because
+    /// the cache value (which held the child addr) has already been removed.
+    /// This is acceptable: orphaned child-side entries are harmless (they
+    /// reference a key that no longer exists in the cache) and are cleaned
+    /// up when the child addr is eventually evicted via [`evict_addr`].
+    fn deindex_key(&self, key: &LookupKey) {
+        let (parent_addr, _) = key;
+        self.reverse.update_sync(parent_addr, |_, entries| {
+            entries.retain(|(k, _)| k != key);
+        });
+    }
+}
+
+/// Extension trait for `Vec` to push only if the element is not already present.
+trait DedupPush<T: PartialEq> {
+    fn dedup_push(&mut self, item: &T)
+    where
+        T: Clone;
+}
+
+impl<T: PartialEq + Clone> DedupPush<T> for Vec<T> {
+    fn dedup_push(&mut self, item: &T)
+    where
+        T: Clone,
+    {
+        if !self.contains(item) {
+            self.push(item.clone());
+        }
+    }
+}
+
 /// A reader for an open file, returned by [`FsDataProvider::open`].
 ///
 /// Implementors provide the actual data for read operations. The FUSE
@@ -104,17 +265,15 @@ impl StatelessDrop<Arc<FutureBackedCache<InodeAddr, INode>>, InodeAddr> for Inod
 /// delegates to [`FsDataProvider::forget`] so the provider can clean up its
 /// own auxiliary state.
 ///
-/// The lookup cache cleanup (`remove_ready_if_sync`) ensures that stale
-/// `(parent, name) → INode` entries do not survive after FUSE forgets an
-/// inode. Without this, a subsequent `lookup` would hit the stale cache
-/// entry, observe a missing inode table entry, and have to fall through to
-/// the slow path — correct but wasteful.
+/// The lookup cache cleanup removes all entries referencing the forgotten
+/// inode (as parent or child) via the [`IndexedLookupCache`]'s reverse
+/// index, ensuring O(k) eviction instead of O(N) full-cache scan.
 impl<DP: FsDataProvider>
     StatelessDrop<
         (
             Arc<FutureBackedCache<InodeAddr, INode>>,
             Arc<DCache>,
-            Arc<LookupCache>,
+            Arc<IndexedLookupCache>,
             DP,
         ),
         InodeAddr,
@@ -124,7 +283,7 @@ impl<DP: FsDataProvider>
         ctx: &(
             Arc<FutureBackedCache<InodeAddr, INode>>,
             Arc<DCache>,
-            Arc<LookupCache>,
+            Arc<IndexedLookupCache>,
             DP,
         ),
         key: &InodeAddr,
@@ -132,9 +291,7 @@ impl<DP: FsDataProvider>
         let addr = *key;
         ctx.0.remove_sync(key);
         ctx.1.evict(LoadedAddr::new_unchecked(addr));
-        ctx.2.remove_ready_if_sync(|&(parent_addr, _), child| {
-            parent_addr == addr || child.addr == addr
-        });
+        ctx.2.evict_addr(addr);
         ctx.3.forget(addr);
     }
 }
@@ -327,10 +484,10 @@ pub struct AsyncFs<DP: FsDataProvider> {
     /// Deduplicating lookup cache keyed by `(parent_addr, child_name)`. The factory is
     /// `dp.lookup()`, so the data provider is only called on a true cache miss.
     ///
-    /// Wrapped in `Arc` so that [`InodeForget`] can include it in its
-    /// `StatelessDrop` context and clean up stale entries when FUSE forgets
-    /// an inode.
-    lookup_cache: Arc<LookupCache>,
+    /// Uses [`IndexedLookupCache`] with a reverse index for O(k) eviction
+    /// instead of O(N) full-cache scans. Wrapped in `Arc` so that
+    /// [`InodeForget`] can include it in its `StatelessDrop` context.
+    lookup_cache: Arc<IndexedLookupCache>,
 
     /// Directory entry cache, mapping `(parent, name)` to child inode address.
     directory_cache: Arc<DCache>,
@@ -358,7 +515,7 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
 
         Self {
             inode_table,
-            lookup_cache: Arc::new(LookupCache::default()),
+            lookup_cache: Arc::new(IndexedLookupCache::default()),
             directory_cache: Arc::new(DCache::new()),
             data_provider,
             next_fh: AtomicU64::new(1),
@@ -377,7 +534,7 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
     ) -> Self {
         Self {
             inode_table,
-            lookup_cache: Arc::new(LookupCache::default()),
+            lookup_cache: Arc::new(IndexedLookupCache::default()),
             directory_cache: Arc::new(DCache::new()),
             data_provider,
             next_fh: AtomicU64::new(1),
@@ -422,7 +579,7 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
     /// context so that [`InodeForget`] can clean up stale
     /// `(parent, name) → INode` entries when the kernel forgets an inode.
     #[must_use]
-    pub fn lookup_cache(&self) -> Arc<LookupCache> {
+    pub fn lookup_cache(&self) -> Arc<IndexedLookupCache> {
         Arc::clone(&self.lookup_cache)
     }
 
@@ -562,10 +719,7 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
     pub fn evict(&self, addr: InodeAddr) {
         self.inode_table.remove_sync(&addr);
         self.directory_cache.evict(LoadedAddr::new_unchecked(addr));
-        self.lookup_cache
-            .remove_ready_if_sync(|&(parent_addr, _), child| {
-                parent_addr == addr || child.addr == addr
-            });
+        self.lookup_cache.evict_addr(addr);
         self.data_provider.forget(addr);
     }
 

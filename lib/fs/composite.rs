@@ -508,7 +508,14 @@ where
                     .slots
                     .remove_if_sync(&slot_idx, |slot| slot.bridge.is_empty_locked());
                 if let Some((_, slot)) = removed {
-                    self.inner.name_to_slot.remove_sync(&slot.name);
+                    // Guard: only remove from name_to_slot if it still
+                    // points to this slot. A concurrent `register_child`
+                    // may have replaced it with a new slot index for the
+                    // same child name; removing unconditionally would
+                    // orphan the replacement slot.
+                    self.inner
+                        .name_to_slot
+                        .remove_if_sync(&slot.name, |idx| *idx == slot_idx);
                 }
             }
         }

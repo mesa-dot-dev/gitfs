@@ -73,7 +73,7 @@ type FuseWard<DP> = crate::drop_ward::DropWard<
     (
         Arc<FutureBackedCache<InodeAddr, INode>>,
         Arc<super::dcache::DCache>,
-        Arc<super::async_fs::LookupCache>,
+        Arc<super::async_fs::IndexedLookupCache>,
         DP,
     ),
     InodeAddr,
