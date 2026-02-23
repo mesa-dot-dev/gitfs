@@ -405,20 +405,6 @@ where
     pub fn remove_sync(&self, key: &K) -> bool {
         self.map.remove_sync(key).is_some()
     }
-
-    /// Synchronously remove all `Ready` entries for which `predicate` returns `true`.
-    ///
-    /// `InFlight` entries are always retained — only fully resolved entries
-    /// are eligible for removal. This is safe to call concurrently with
-    /// other cache operations: `scc::HashMap::retain_sync` acquires
-    /// bucket-level locks, and `InFlight` entries are skipped so in-progress
-    /// computations are never disturbed.
-    pub fn remove_ready_if_sync(&self, mut predicate: impl FnMut(&K, &V) -> bool) {
-        self.map.retain_sync(|k, slot| match slot {
-            Slot::InFlight(..) => true,
-            Slot::Ready(v) => !predicate(k, v),
-        });
-    }
 }
 
 /// Drop guard that synchronously promotes an `InFlight` entry to `Ready` if the caller

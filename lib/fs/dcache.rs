@@ -203,12 +203,23 @@ impl DCache {
         // not going stale.
         if old_parent != new_parent {
             old_state.generation.fetch_add(1, Ordering::Release);
-            let _ = old_state.populated.compare_exchange(
-                POPULATE_DONE,
-                POPULATE_UNCLAIMED,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            );
+            if old_state
+                .populated
+                .compare_exchange(
+                    POPULATE_DONE,
+                    POPULATE_UNCLAIMED,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                let _ = old_state.populated.compare_exchange(
+                    POPULATE_IN_PROGRESS,
+                    POPULATE_UNCLAIMED,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
+            }
             old_state.notify.notify_waiters();
         }
     }
@@ -439,9 +450,19 @@ impl DCache {
 
     /// Abort a population attempt, resetting back to unclaimed so another
     /// caller can retry.
+    ///
+    /// Uses CAS (`IN_PROGRESS → UNCLAIMED`) rather than a plain store so
+    /// that if a concurrent [`evict`](Self::evict) already reset the flag
+    /// to `UNCLAIMED` and a new populator claimed it, this stale abort
+    /// does not clobber the new populator's `IN_PROGRESS` state.
     pub fn abort_populate(&self, parent_ino: LoadedAddr) {
         let state = self.dir_state(parent_ino);
-        state.populated.store(POPULATE_UNCLAIMED, Ordering::Release);
+        let _ = state.populated.compare_exchange(
+            POPULATE_IN_PROGRESS,
+            POPULATE_UNCLAIMED,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
         state.notify.notify_waiters();
     }
 

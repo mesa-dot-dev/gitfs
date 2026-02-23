@@ -29,10 +29,11 @@ pub mod composite;
 pub mod dcache;
 /// FUSE adapter: maps [`fuser::Filesystem`] callbacks to [`async_fs::AsyncFs`].
 pub mod fuser;
+/// Reverse-indexed lookup cache for O(k) inode eviction.
+pub mod indexed_lookup_cache;
 
-pub use async_fs::{
-    IndexedLookupCache, InodeForget, InodeLifecycle, LookupCache, OpenFile, ResolvedINode,
-};
+pub use async_fs::{InodeForget, InodeLifecycle, LookupCache, OpenFile, ResolvedINode};
+pub use indexed_lookup_cache::IndexedLookupCache;
 
 use std::ffi::OsStr;
 use std::time::SystemTime;
