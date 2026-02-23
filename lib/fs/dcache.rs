@@ -123,7 +123,14 @@ impl DCache {
     }
 
     /// Atomically inserts or overwrites a child entry in the cache.
+    ///
+    /// When re-parenting a child (the child was previously cached under a
+    /// different parent), the stale entry in the old parent's children map is
+    /// removed and the old parent's populate status is reset to `UNCLAIMED`
+    /// so that the next `readdir` re-fetches from the data provider.
     pub fn insert(&self, parent_ino: LoadedAddr, name: OsString, ino: LoadedAddr, is_dir: bool) {
+        self.cleanup_old_parent(parent_ino, ino);
+
         let state = self.dir_state(parent_ino);
         let value = DValue { ino, is_dir };
         let mut children = state
@@ -138,6 +145,47 @@ impl DCache {
         }
         self.child_to_name.upsert_sync(ino, name);
         self.child_to_parent.upsert_sync(ino, parent_ino);
+    }
+
+    /// If `ino` is currently cached under a parent different from
+    /// `new_parent`, remove its stale entry from the old parent and reset
+    /// that parent's populate status.
+    ///
+    /// The old parent's write lock is acquired and released before `insert`
+    /// takes the new parent's write lock, avoiding any deadlock from
+    /// simultaneous two-lock holds.
+    fn cleanup_old_parent(&self, new_parent: LoadedAddr, ino: LoadedAddr) {
+        let Some(old_parent) = self.child_to_parent.read_sync(&ino, |_, &v| v) else {
+            return;
+        };
+        if old_parent == new_parent {
+            return;
+        }
+        let Some(old_name) = self.child_to_name.read_sync(&ino, |_, v| v.clone()) else {
+            return;
+        };
+        let Some(old_state) = self.dirs.read_sync(&old_parent, |_, v| Arc::clone(v)) else {
+            return;
+        };
+        let mut old_children = old_state
+            .children
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Guard: only remove if the entry still maps to this inode.
+        // A concurrent insert may have reused the name for a different child.
+        if old_children.get(&old_name).is_some_and(|dv| dv.ino == ino) {
+            old_children.remove(&old_name);
+        }
+        drop(old_children);
+        // Reset populate status so the next readdir re-fetches.
+        old_state.generation.fetch_add(1, Ordering::Release);
+        let _ = old_state.populated.compare_exchange(
+            POPULATE_DONE,
+            POPULATE_UNCLAIMED,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+        old_state.notify.notify_waiters();
     }
 
     /// Iterate all cached children of `parent_ino` in name-sorted order.

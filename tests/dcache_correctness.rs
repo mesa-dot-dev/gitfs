@@ -478,9 +478,110 @@ async fn evict_with_concurrent_reparent_does_not_corrupt() {
         cache.lookup(parent_b, OsStr::new("bar")).is_none(),
         "evict should target the current parent, not a stale one"
     );
-    // parent_a's "foo" entry should already have been cleaned up by the
-    // insert that re-parented the child (insert replaces the old entry
-    // only if the ino changes — here same ino, different parent, so
-    // parent_a retains a stale "foo" entry pointing to the moved child).
-    // This is a known limitation: insert does not cross-parent cleanup.
+    // parent_a's "foo" entry should have been cleaned up by the insert
+    // that re-parented the child to parent_b.
+    assert!(
+        cache.lookup(parent_a, OsStr::new("foo")).is_none(),
+        "insert should clean up stale entry in old parent when re-parenting"
+    );
+}
+
+#[tokio::test]
+async fn insert_reparent_removes_stale_entry_from_old_parent() {
+    let cache = DCache::new();
+    let parent_a = LoadedAddr::new_unchecked(1);
+    let parent_b = LoadedAddr::new_unchecked(2);
+    let child = LoadedAddr::new_unchecked(10);
+
+    cache.insert(parent_a, OsString::from("foo"), child, false);
+    assert!(cache.lookup(parent_a, OsStr::new("foo")).is_some());
+
+    // Re-parent: insert same child under parent_b.
+    cache.insert(parent_b, OsString::from("bar"), child, false);
+
+    // Old parent should no longer have the stale entry.
+    assert!(
+        cache.lookup(parent_a, OsStr::new("foo")).is_none(),
+        "stale entry in old parent should be cleaned up on re-parent"
+    );
+    // New parent should have the entry.
+    assert!(cache.lookup(parent_b, OsStr::new("bar")).is_some());
+}
+
+#[tokio::test]
+async fn insert_reparent_resets_old_parent_populate_status() {
+    let cache = DCache::new();
+    let parent_a = LoadedAddr::new_unchecked(1);
+    let parent_b = LoadedAddr::new_unchecked(2);
+    let child = LoadedAddr::new_unchecked(10);
+
+    cache.insert(parent_a, OsString::from("foo"), child, false);
+    let PopulateStatus::Claimed(claim_gen) = cache.try_claim_populate(parent_a) else {
+        panic!("expected Claimed");
+    };
+    cache.finish_populate(parent_a, claim_gen);
+    assert!(matches!(
+        cache.try_claim_populate(parent_a),
+        PopulateStatus::Done
+    ));
+
+    // Re-parent: insert same child under parent_b.
+    cache.insert(parent_b, OsString::from("bar"), child, false);
+
+    // Old parent's populate status should be reset to allow re-fetch.
+    assert!(
+        matches!(
+            cache.try_claim_populate(parent_a),
+            PopulateStatus::Claimed(_)
+        ),
+        "old parent should be re-claimable after child was re-parented away"
+    );
+}
+
+#[tokio::test]
+async fn insert_reparent_does_not_remove_reused_name_in_old_parent() {
+    let cache = DCache::new();
+    let parent_a = LoadedAddr::new_unchecked(1);
+    let parent_b = LoadedAddr::new_unchecked(2);
+    let child_1 = LoadedAddr::new_unchecked(10);
+    let child_2 = LoadedAddr::new_unchecked(20);
+
+    // Insert child_1 under parent_a as "foo".
+    cache.insert(parent_a, OsString::from("foo"), child_1, false);
+
+    // Replace "foo" in parent_a with a different child (child_2).
+    cache.insert(parent_a, OsString::from("foo"), child_2, false);
+
+    // Now re-parent child_1 to parent_b. The old name "foo" is still in
+    // child_to_name for child_1, but parent_a's "foo" now points to child_2.
+    cache.insert(parent_b, OsString::from("bar"), child_1, false);
+
+    // parent_a's "foo" should still point to child_2, not be removed.
+    let dv = cache.lookup(parent_a, OsStr::new("foo"));
+    assert!(
+        dv.is_some(),
+        "should not remove entry belonging to different child"
+    );
+    assert_eq!(dv.unwrap().ino, child_2);
+}
+
+#[tokio::test]
+async fn insert_reparent_same_parent_is_noop() {
+    let cache = DCache::new();
+    let parent = LoadedAddr::new_unchecked(1);
+    let child = LoadedAddr::new_unchecked(10);
+
+    cache.insert(parent, OsString::from("foo"), child, false);
+
+    // Re-insert under the same parent with a different name.
+    // This is not a re-parent, so no cross-parent cleanup should happen.
+    cache.insert(parent, OsString::from("bar"), child, false);
+
+    // "bar" should exist (the new entry).
+    assert!(cache.lookup(parent, OsStr::new("bar")).is_some());
+    // "foo" still exists because insert only cleans up cross-parent
+    // stale entries, not same-parent renames. The old entry under
+    // the same parent is a separate concern (name -> ino mapping).
+    // The reverse index now says child_to_name[child] = "bar",
+    // so evict will target "bar", not "foo".
 }
