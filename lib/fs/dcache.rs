@@ -152,6 +152,17 @@ impl DCache {
     /// - **Same-parent rename:** the child was previously cached under this
     ///   parent with a different name. The old name entry is removed so that
     ///   `readdir` does not return two entries for the same inode.
+    ///
+    /// # Concurrency requirement
+    ///
+    /// Callers **must** serialize inserts for the same inode, typically via
+    /// [`FutureBackedCache`](crate::cache::async_backed::FutureBackedCache)
+    /// deduplication. Two concurrent `insert` calls for the same `ino` with
+    /// different names under the same parent can orphan entries (two
+    /// name→ino mappings with only one reflected in the reverse index).
+    /// This invariant is upheld by [`AsyncFs`](super::async_fs::AsyncFs),
+    /// which is the intended entry point.  Direct use of `insert` outside
+    /// that path requires equivalent per-inode serialization.
     pub fn insert(&self, parent_ino: LoadedAddr, name: OsString, ino: LoadedAddr, is_dir: bool) {
         self.cleanup_stale_entry(parent_ino, &name, ino);
 

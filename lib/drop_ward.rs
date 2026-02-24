@@ -107,15 +107,20 @@ where
     }
 
     fn dec_by(&mut self, key: &K, by: usize) -> Option<usize> {
-        let curr = *self.map.get(key)?;
-        let new_count = curr.saturating_sub(by);
+        let slot = self.map.get_mut(key)?;
+        let new_count = slot.saturating_sub(by);
         if new_count == 0 {
-            // Delete before removing from the map: if `delete` panics the
-            // entry remains and a subsequent `dec` can retry cleanup. The
-            // reverse order would silently lose the entry.
+            // Set the count to zero *before* calling `delete`. If `delete`
+            // panics, the entry stays in the map at count 0, so a subsequent
+            // `dec` will see `curr == 0`, compute `new_count == 0`, and
+            // retry cleanup. Without this, a panic during `dec_count(key, N)`
+            // with `N > 1` would leave the entry at its original count `N`,
+            // and a follow-up `dec(key, 1)` would compute `N − 1 > 0` —
+            // never retrying cleanup.
+            *slot = 0;
             T::delete(&self.ctx, key);
             self.map.remove(key);
-        } else if let Some(slot) = self.map.get_mut(key) {
+        } else {
             *slot = new_count;
         }
         Some(new_count)

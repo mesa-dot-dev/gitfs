@@ -144,8 +144,10 @@ const BLOCK_SIZE: u32 = 4096;
 
 /// Snapshot of a directory listing created by `opendir`.
 enum DirSnapshot {
-    /// Directory handle allocated but not yet populated.
-    Pending,
+    /// Directory handle allocated but not yet populated. Carries the inode
+    /// address of the directory so `readdir` can assert consistency with
+    /// the `ino` parameter that fuser provides.
+    Pending(InodeAddr),
     /// Fully materialized directory listing.
     Ready(Vec<(InodeAddr, OsString, INodeType)>),
 }
@@ -242,17 +244,17 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
             });
     }
 
-    #[instrument(name = "FuserAdapter::opendir", skip(self, _req, _ino, _flags, reply))]
+    #[instrument(name = "FuserAdapter::opendir", skip(self, _req, _flags, reply))]
     fn opendir(
         &mut self,
         _req: &fuser::Request<'_>,
-        _ino: u64,
+        ino: u64,
         _flags: i32,
         reply: fuser::ReplyOpen,
     ) {
         let fh = self.next_dir_fh;
         self.next_dir_fh += 1;
-        self.dir_handles.insert(fh, DirSnapshot::Pending);
+        self.dir_handles.insert(fh, DirSnapshot::Pending(ino));
         debug!(handle = fh, "replying...");
         reply.opened(fh, 0);
     }
@@ -269,36 +271,49 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
         let offset_u64 = offset.cast_unsigned();
 
         // Lazily populate the snapshot on the first readdir call for this handle.
-        let snapshot = match self.dir_handles.get(&fh) {
-            Some(DirSnapshot::Pending) | None => {
-                // Populate from AsyncFs and transition to Ready.
-                let result = self.runtime.block_on(async {
-                    let mut entries = Vec::new();
-                    self.inner
-                        .get_fs()
-                        .readdir(LoadedAddr::new_unchecked(ino), 0, |de, _next_offset| {
-                            entries.push((de.inode.addr, de.name.to_os_string(), de.inode.itype));
-                            false
-                        })
-                        .await?;
-                    Ok::<_, std::io::Error>(entries)
-                });
-                match result {
-                    Ok(entries) => {
-                        self.dir_handles.insert(fh, DirSnapshot::Ready(entries));
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "replying error");
-                        reply.error(io_to_errno(&e));
-                        return;
-                    }
+        let needs_populate = match self.dir_handles.get(&fh) {
+            Some(DirSnapshot::Pending(stored_ino)) => {
+                debug_assert_eq!(
+                    *stored_ino, ino,
+                    "readdir ino mismatch: opendir recorded {stored_ino} but readdir received {ino}"
+                );
+                true
+            }
+            None => true,
+            Some(DirSnapshot::Ready(_)) => false,
+        };
+
+        let snapshot = if needs_populate {
+            let result = self.runtime.block_on(async {
+                let mut entries = Vec::new();
+                self.inner
+                    .get_fs()
+                    .readdir(LoadedAddr::new_unchecked(ino), 0, |de, _next_offset| {
+                        entries.push((de.inode.addr, de.name.to_os_string(), de.inode.itype));
+                        false
+                    })
+                    .await?;
+                Ok::<_, std::io::Error>(entries)
+            });
+            match result {
+                Ok(entries) => {
+                    self.dir_handles.insert(fh, DirSnapshot::Ready(entries));
                 }
-                match self.dir_handles.get(&fh) {
-                    Some(DirSnapshot::Ready(entries)) => entries,
-                    _ => unreachable!("just inserted Ready"),
+                Err(e) => {
+                    debug!(error = %e, "replying error");
+                    reply.error(io_to_errno(&e));
+                    return;
                 }
             }
-            Some(DirSnapshot::Ready(entries)) => entries,
+            match self.dir_handles.get(&fh) {
+                Some(DirSnapshot::Ready(entries)) => entries,
+                _ => unreachable!("just inserted Ready"),
+            }
+        } else {
+            match self.dir_handles.get(&fh) {
+                Some(DirSnapshot::Ready(entries)) => entries,
+                _ => unreachable!("checked above"),
+            }
         };
 
         #[expect(

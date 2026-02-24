@@ -494,19 +494,28 @@ where
         // `forget` fires only when nlookup reaches zero.
         self.inner.addr_to_slot.remove_sync(&addr);
         if bridge_empty {
-            // Check emptiness under the bridge's coordination lock OUTSIDE
-            // the scc bucket guard, avoiding nested lock acquisition
-            // (scc bucket -> bridge mutex) which would be a deadlock risk.
+            // Verify emptiness under the bridge's coordination mutex,
+            // **outside** any scc bucket guard. This establishes the
+            // ordering `bridge.mu → (released) → scc_bucket(slots)`,
+            // avoiding the nested `scc_bucket(slots) → bridge.mu`
+            // ordering that would be one refactor away from a deadlock
+            // cycle.
             let still_empty = self
                 .inner
                 .slots
                 .read_sync(&slot_idx, |_, slot| Arc::clone(&slot.bridge))
                 .is_some_and(|b| b.is_empty_locked());
             if still_empty {
+                // Use the non-locking `is_empty()` inside the predicate.
+                // A concurrent `backward_or_insert` that races between
+                // our `is_empty_locked()` above and this `remove_if_sync`
+                // will cause `is_empty()` to return false, preventing the
+                // removal. The worst case is a missed GC opportunity,
+                // retried on the next forget.
                 let removed = self
                     .inner
                     .slots
-                    .remove_if_sync(&slot_idx, |slot| slot.bridge.is_empty_locked());
+                    .remove_if_sync(&slot_idx, |slot| slot.bridge.is_empty());
                 if let Some((_, slot)) = removed {
                     // Guard: only remove from name_to_slot if it still
                     // points to this slot. A concurrent `register_child`
