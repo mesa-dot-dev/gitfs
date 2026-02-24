@@ -1183,6 +1183,41 @@ async fn remove_sync_cleans_cache_and_parent_reverse_index() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lookup_falls_through_to_remote_after_eviction_resets_populated() {
+    let root = make_inode(1, INodeType::Directory, 0, None);
+    let child_a = make_inode(10, INodeType::File, 42, Some(1));
+    let child_b = make_inode(11, INodeType::File, 99, Some(1));
+
+    let mut state = MockFsState::default();
+    state
+        .directories
+        .insert(1, vec![(OsString::from("a.txt"), child_a)]);
+    // "b.txt" is only reachable via lookup, NOT readdir.
+    state.lookups.insert((1, "b.txt".into()), child_b);
+    let dp = MockFsDataProvider::new(state);
+
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+
+    // Populate via readdir — directory is now DONE.
+    fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, _| false)
+        .await
+        .unwrap();
+
+    // Evict child_a — this resets populate flag to UNCLAIMED.
+    fs.directory_cache().evict(LoadedAddr::new_unchecked(10));
+
+    // Now lookup "b.txt" — directory is no longer DONE, so the
+    // short-circuit must NOT fire. The slow path should call
+    // dp.lookup() and find "b.txt".
+    let result = fs
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("b.txt"))
+        .await
+        .unwrap();
+    assert_eq!(result.inode.addr, 11);
+}
+
 /// Verify that `evict_addr(old_child)` does not spuriously remove a
 /// freshly-indexed reverse entry for a *new* child that reuses the same
 /// `LookupKey` `(parent, name)`.
