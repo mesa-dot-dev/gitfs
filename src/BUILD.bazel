@@ -8,7 +8,6 @@ cargo_build_script(
     srcs = ["//:build.rs"],
     edition = "2024",
     deps = ["@crates//:vergen-gitcl"],
-    stamp = 1,
 )
 
 rust_binary(
@@ -16,10 +15,12 @@ rust_binary(
     srcs = glob(["**/*.rs"]),
     edition = "2024",
     visibility = ["//visibility:public"],
+    proc_macro_deps = [
+        "@crates//:async-trait",
+    ],
     deps = [
         ":build_script",
         "//lib:git_fs_lib",
-        "@crates//:async-trait",
         "@crates//:base64",
         "@crates//:bytes",
         "@crates//:bytesize",
