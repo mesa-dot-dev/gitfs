@@ -1,0 +1,101 @@
+"""Bazel test targets for git-fs integration tests."""
+
+load("@rules_rust//rust:defs.bzl", "rust_test")
+
+_COMMON_SRCS = glob(["common/**/*.rs"])
+
+_COMMON_DEPS = [
+    "//lib:git_fs_lib",
+    "@crates//:bytes",
+    "@crates//:libc",
+    "@crates//:scc",
+    "@crates//:tokio",
+]
+
+rust_test(
+    name = "async_fs_correctness",
+    srcs = ["async_fs_correctness.rs"] + _COMMON_SRCS,
+    edition = "2024",
+    deps = _COMMON_DEPS,
+)
+
+rust_test(
+    name = "async_backed_correctness",
+    srcs = ["async_backed_correctness.rs"],
+    edition = "2024",
+    deps = [
+        "//lib:git_fs_lib",
+        "@crates//:tokio",
+    ],
+)
+
+rust_test(
+    name = "bridge_tests",
+    srcs = ["bridge_tests.rs"],
+    edition = "2024",
+    deps = [
+        "//lib:git_fs_lib",
+    ],
+)
+
+rust_test(
+    name = "composite_fs_tests",
+    srcs = ["composite_fs_tests.rs"] + _COMMON_SRCS,
+    edition = "2024",
+    deps = _COMMON_DEPS,
+)
+
+rust_test(
+    name = "dcache_correctness",
+    srcs = ["dcache_correctness.rs"],
+    edition = "2024",
+    deps = [
+        "//lib:git_fs_lib",
+        "@crates//:tokio",
+    ],
+)
+
+rust_test(
+    name = "drop_ward_tests",
+    srcs = ["drop_ward_tests.rs"],
+    edition = "2024",
+    deps = [
+        "//lib:git_fs_lib",
+    ],
+)
+
+rust_test(
+    name = "fcache_concurrent",
+    srcs = ["fcache_concurrent.rs"],
+    edition = "2024",
+    deps = [
+        "//lib:git_fs_lib",
+        "@crates//:tempfile",
+        "@crates//:tokio",
+    ],
+)
+
+rust_test(
+    name = "fcache_correctness",
+    srcs = ["fcache_correctness.rs"],
+    edition = "2024",
+    deps = [
+        "//lib:git_fs_lib",
+        "@crates//:tempfile",
+        "@crates//:tokio",
+    ],
+)
+
+rust_test(
+    name = "lru_concurrent",
+    srcs = ["lru_concurrent.rs"] + _COMMON_SRCS,
+    edition = "2024",
+    deps = _COMMON_DEPS,
+)
+
+rust_test(
+    name = "lru_correctness",
+    srcs = ["lru_correctness.rs"] + _COMMON_SRCS,
+    edition = "2024",
+    deps = _COMMON_DEPS,
+)
