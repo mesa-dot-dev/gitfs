@@ -1,4 +1,4 @@
-"""Compare directory layout of git-fs mounted repos vs git clone --depth 1."""
+"""Compare directory layout and file contents of git-fs vs git clone."""
 
 from __future__ import annotations
 
@@ -81,7 +81,8 @@ def dfs_compare(
     """Recursively compare two directory trees, raising AssertionError on mismatch.
 
     Walks both trees simultaneously via sorted iterdir(), comparing child
-    names and entry types at each level, then recursing into subdirectories.
+    names, entry types, file contents, and symlink targets at each level,
+    then recursing into subdirectories.
     """
 
     def _is_excluded(name: str) -> bool:
@@ -149,6 +150,34 @@ def test_dfs_compare_detects_content_mismatch(tmp_path: Path) -> None:
         dfs_compare(lhs, rhs)
 
 
+def test_dfs_compare_detects_symlink_target_mismatch(tmp_path: Path) -> None:
+    """dfs_compare should fail when symlink targets differ."""
+    lhs = tmp_path / "lhs"
+    rhs = tmp_path / "rhs"
+    lhs.mkdir()
+    rhs.mkdir()
+
+    (lhs / "link").symlink_to("target_a")
+    (rhs / "link").symlink_to("target_b")
+
+    with pytest.raises(AssertionError, match="Symlink target mismatch"):
+        dfs_compare(lhs, rhs)
+
+
+def test_dfs_compare_passes_when_contents_match(tmp_path: Path) -> None:
+    """dfs_compare should pass when structure and contents are identical."""
+    lhs = tmp_path / "lhs"
+    rhs = tmp_path / "rhs"
+    for root in (lhs, rhs):
+        root.mkdir()
+        (root / "a.txt").write_text("same content")
+        (root / "sub").mkdir()
+        (root / "sub" / "b.txt").write_bytes(b"\x00\x01\x02")
+        (root / "link").symlink_to("a.txt")
+
+    dfs_compare(lhs, rhs)  # Should not raise
+
+
 @pytest.mark.integration
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize("repo_slug", REPOS, ids=REPOS)
@@ -156,7 +185,8 @@ def test_dfs_compare_detects_content_mismatch(tmp_path: Path) -> None:
 def test_directory_layout_matches_clone(repo_slug: str) -> None:
     """Compare the directory tree visible through git-fs with a shallow clone.
 
-    Only entry names and types (file/directory/symlink) are compared, NOT contents.
+    Entry names, types (file/directory/symlink), file contents, and symlink
+    targets are all compared.
     """
     owner, repo = repo_slug.split("/", 1)
     clone_dest = shallow_clone(repo_slug)
