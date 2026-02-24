@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
 
-use super::async_fs::{FileReader as _, FsDataProvider};
+use bytes::Bytes;
+
+use super::async_fs::{FileReader as _, FsDataProvider, OverlayReader};
 use super::{FileHandle, INode, INodeType, InodeAddr, LoadedAddr, OpenFlags};
 use crate::cache::async_backed::FutureBackedCache;
 use tracing::{debug, error, instrument};
@@ -47,6 +49,7 @@ impl_fuse_reply!(
     fuser::ReplyDirectory,
     fuser::ReplyOpen,
     fuser::ReplyData,
+    fuser::ReplyWrite,
 );
 
 /// Extension trait on `Result<T, std::io::Error>` for FUSE reply handling.
@@ -89,6 +92,7 @@ impl<DP: FsDataProvider> FuseBridgeInner<DP> {
             dcache: fs.directory_cache(),
             lookup_cache: fs.lookup_cache(),
             provider,
+            write_overlay: fs.write_overlay(),
         };
         let ward = crate::drop_ward::DropWard::new(ctx);
         Self { ward, fs }
@@ -159,7 +163,7 @@ enum DirSnapshot {
 /// for blocking on async ops.
 pub struct FuserAdapter<DP: FsDataProvider> {
     inner: FuseBridgeInner<DP>,
-    open_files: HashMap<FileHandle, Arc<DP::Reader>>,
+    open_files: HashMap<FileHandle, Arc<OverlayReader<DP::Reader>>>,
     dir_handles: HashMap<FileHandle, DirSnapshot>,
     next_dir_fh: u64,
     runtime: tokio::runtime::Handle,
@@ -406,6 +410,57 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
             .fuse_reply(reply, |data, reply| {
                 debug!(read_bytes = data.len(), "replying...");
                 reply.data(&data);
+            });
+    }
+
+    #[instrument(
+        name = "FuserAdapter::write",
+        skip(
+            self,
+            _req,
+            _ino,
+            fh,
+            offset,
+            data,
+            _write_flags,
+            _flags,
+            _lock_owner,
+            reply
+        )
+    )]
+    fn write(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: fuser::ReplyWrite,
+    ) {
+        let Some(reader) = self.open_files.get(&fh) else {
+            reply.error(libc::EBADF);
+            return;
+        };
+        let addr = reader.addr;
+        let data = Bytes::from(data.to_vec());
+
+        self.runtime
+            .block_on(async {
+                self.inner
+                    .get_fs()
+                    .write(
+                        LoadedAddr::new_unchecked(addr),
+                        offset.cast_unsigned(),
+                        data,
+                    )
+                    .await
+            })
+            .fuse_reply(reply, |written, reply| {
+                debug!(bytes_written = written, "replying...");
+                reply.written(written);
             });
     }
 

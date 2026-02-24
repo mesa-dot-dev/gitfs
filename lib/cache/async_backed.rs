@@ -395,7 +395,14 @@ where
     ///
     /// Suitable for seeding the cache before async operations begin.
     pub fn insert_sync(&self, key: K, value: V) {
-        drop(self.map.insert_sync(key, Slot::Ready(value)));
+        match self.map.entry_sync(key) {
+            scc::hash_map::Entry::Occupied(mut occ) => {
+                *occ.get_mut() = Slot::Ready(value);
+            }
+            scc::hash_map::Entry::Vacant(vac) => {
+                vac.insert_entry(Slot::Ready(value));
+            }
+        }
     }
 
     /// Synchronously remove the entry for `key`, returning `true` if it was present.
@@ -418,6 +425,14 @@ where
                 Slot::Ready(v) => predicate(v),
             })
             .is_some()
+    }
+
+    /// Synchronously check whether an entry exists for `key`.
+    ///
+    /// Returns `true` for both `Ready` and `InFlight` entries.
+    #[must_use]
+    pub fn contains_sync(&self, key: &K) -> bool {
+        self.map.read_sync(key, |_, _| ()).is_some()
     }
 }
 

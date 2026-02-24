@@ -120,4 +120,13 @@ impl FsDataProvider for MockFsDataProvider {
     fn forget(&self, addr: git_fs::fs::InodeAddr) {
         let _ = self.state.forgotten_addrs.insert_sync(addr);
     }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test mock — data stays small"
+    )]
+    async fn write(&self, _inode: INode, _offset: u64, data: Bytes) -> Result<u32, std::io::Error> {
+        println!("[MockFsDataProvider] write called, {} bytes", data.len());
+        Ok(data.len() as u32)
+    }
 }

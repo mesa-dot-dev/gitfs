@@ -83,6 +83,19 @@ pub trait FsDataProvider: Clone + Send + Sync + 'static {
     /// Never called directly -- [`InodeForget::delete`] invokes it
     /// automatically when the refcount drops to zero.
     fn forget(&self, _addr: InodeAddr) {}
+
+    /// Write data to a file at the given offset.
+    ///
+    /// The default implementation returns `EROFS` (read-only filesystem).
+    /// Providers that support writes should override this.
+    fn write(
+        &self,
+        _inode: INode,
+        _offset: u64,
+        _data: Bytes,
+    ) -> impl Future<Output = Result<u32, std::io::Error>> + Send {
+        async { Err(std::io::Error::from_raw_os_error(libc::EROFS)) }
+    }
 }
 
 /// Zero-sized cleanup tag for inode eviction.
@@ -114,17 +127,25 @@ pub struct ForgetContext<DP: FsDataProvider> {
     pub lookup_cache: Arc<IndexedLookupCache>,
     /// The data provider for provider-specific cleanup.
     pub provider: DP,
+    /// Write overlay — inodes present here must not be evicted.
+    pub write_overlay: Arc<FutureBackedCache<InodeAddr, Bytes>>,
 }
 
 /// Evicts the inode from the table, directory cache, and lookup cache, then
 /// delegates to [`FsDataProvider::forget`] so the provider can clean up its
 /// own auxiliary state.
 ///
+/// Inodes that have locally-written data (present in `write_overlay`) are
+/// skipped — they must persist for the lifetime of the mount.
+///
 /// The lookup cache cleanup removes all entries referencing the forgotten
 /// inode (as parent or child) via the [`IndexedLookupCache`]'s reverse
 /// index, ensuring O(k) eviction instead of O(N) full-cache scan.
 impl<DP: FsDataProvider> StatelessDrop<ForgetContext<DP>, InodeAddr> for InodeForget {
     fn delete(ctx: &ForgetContext<DP>, key: &InodeAddr) {
+        if ctx.write_overlay.contains_sync(key) {
+            return;
+        }
         let addr = *key;
         ctx.inode_table.remove_sync(key);
         ctx.dcache.evict(LoadedAddr::new_unchecked(addr));
@@ -142,6 +163,42 @@ impl<DP: FsDataProvider> StatelessDrop<ForgetContext<DP>, InodeAddr> for InodeFo
 pub struct ResolvedINode {
     /// The resolved inode data.
     pub inode: INode,
+}
+
+/// A file reader that checks the write overlay first, falling back to the
+/// underlying provider reader.
+pub struct OverlayReader<R: FileReader> {
+    /// The inode address this reader is for.
+    pub addr: InodeAddr,
+    write_overlay: Arc<FutureBackedCache<InodeAddr, Bytes>>,
+    inner: R,
+}
+
+impl<R: FileReader> std::fmt::Debug for OverlayReader<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OverlayReader")
+            .field("addr", &self.addr)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R: FileReader> FileReader for OverlayReader<R> {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "offset and size fit in usize on supported 64-bit platforms"
+    )]
+    async fn read(&self, offset: u64, size: u32) -> Result<Bytes, std::io::Error> {
+        if let Some(data) = self.write_overlay.get(&self.addr).await {
+            let start = (offset as usize).min(data.len());
+            let end = (start + size as usize).min(data.len());
+            return Ok(data.slice(start..end));
+        }
+        self.inner.read(offset, size).await
+    }
+
+    async fn close(&self) -> Result<(), std::io::Error> {
+        self.inner.close().await
+    }
 }
 
 /// An open file that provides read access.
@@ -337,6 +394,13 @@ pub struct AsyncFs<DP: FsDataProvider> {
 
     /// Bounds the number of concurrent background prefetch tasks.
     prefetch_semaphore: Arc<Semaphore>,
+
+    /// Overlay cache for locally-written file data.
+    ///
+    /// Keyed by inode address, valued by the full file content. Written
+    /// entries are never evicted by `InodeForget` — they persist for the
+    /// lifetime of the mount.
+    write_overlay: Arc<FutureBackedCache<InodeAddr, Bytes>>,
 }
 
 impl<DP: FsDataProvider> AsyncFs<DP> {
@@ -357,6 +421,7 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
             data_provider,
             next_fh: AtomicU64::new(1),
             prefetch_semaphore: Arc::new(Semaphore::new(MAX_PREFETCH_CONCURRENCY)),
+            write_overlay: Arc::new(FutureBackedCache::default()),
         }
     }
 
@@ -376,6 +441,7 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
             data_provider,
             next_fh: AtomicU64::new(1),
             prefetch_semaphore: Arc::new(Semaphore::new(MAX_PREFETCH_CONCURRENCY)),
+            write_overlay: Arc::new(FutureBackedCache::default()),
         }
     }
 
@@ -528,23 +594,94 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
     /// Open a file for reading.
     ///
     /// Validates the inode is not a directory, delegates to the data provider
-    /// to create a [`FileReader`], and returns an [`OpenFile`] that the caller
-    /// owns. Reads go through [`OpenFile::read`].
+    /// to create a [`FileReader`], and returns an [`OpenFile`] wrapping an
+    /// [`OverlayReader`] that checks the write overlay first, falling back
+    /// to the provider reader.
     pub async fn open(
         &self,
         addr: LoadedAddr,
         flags: OpenFlags,
-    ) -> Result<OpenFile<DP::Reader>, std::io::Error> {
+    ) -> Result<OpenFile<OverlayReader<DP::Reader>>, std::io::Error> {
         let inode = self.loaded_inode(addr).await?;
         if inode.itype == INodeType::Directory {
             return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
         }
         let reader = self.data_provider.open(inode, flags).await?;
+        let overlay_reader = OverlayReader {
+            addr: addr.addr(),
+            write_overlay: Arc::clone(&self.write_overlay),
+            inner: reader,
+        };
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         Ok(OpenFile {
             fh,
-            reader: Arc::new(reader),
+            reader: Arc::new(overlay_reader),
         })
+    }
+
+    /// Write data to a file at the given offset.
+    ///
+    /// Stores the result in the write overlay cache. The overlay takes
+    /// precedence over the data provider on subsequent reads. Also calls
+    /// [`FsDataProvider::write`] so the provider can log or forward as needed.
+    pub async fn write(
+        &self,
+        addr: LoadedAddr,
+        offset: u64,
+        data: Bytes,
+    ) -> Result<u32, std::io::Error> {
+        let inode = self.loaded_inode(addr).await?;
+        if inode.itype == INodeType::Directory {
+            return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
+        }
+
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "data.len() fits in u32 (FUSE writes are at most 128 KiB)"
+        )]
+        let bytes_written = data.len() as u32;
+
+        // Merge with existing overlay content, if any.
+        let existing = self.write_overlay.get(&addr.addr()).await;
+        let mut buf = existing.map_or_else(Vec::new, |b| b.to_vec());
+
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "offset fits in usize on supported 64-bit platforms"
+        )]
+        let offset_usize = offset as usize;
+        if offset_usize > buf.len() {
+            buf.resize(offset_usize, 0);
+        }
+        let end = offset_usize + data.len();
+        if end > buf.len() {
+            buf.resize(end, 0);
+        }
+        buf[offset_usize..end].copy_from_slice(&data);
+
+        let new_content = Bytes::from(buf);
+        let new_size = new_content.len() as u64;
+        self.write_overlay.insert_sync(addr.addr(), new_content);
+
+        // Update inode size in the table.
+        let mut updated = inode;
+        updated.size = new_size;
+        updated.last_modified_at = std::time::SystemTime::now();
+        self.inode_table.insert_sync(addr.addr(), updated);
+
+        // Notify the data provider (for logging / future forwarding).
+        drop(self.data_provider.write(inode, offset, data).await);
+
+        Ok(bytes_written)
+    }
+
+    /// Returns a clone of the write overlay handle.
+    ///
+    /// Used by the FUSE adapter to pass into `ForgetContext` so that
+    /// `InodeForget` can check whether an inode has locally-written data.
+    #[must_use]
+    pub fn write_overlay(&self) -> Arc<FutureBackedCache<InodeAddr, Bytes>> {
+        Arc::clone(&self.write_overlay)
     }
 
     /// Evict an inode from the inode table and notify the data provider.

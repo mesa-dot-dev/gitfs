@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 
 use crate::cache::async_backed::FutureBackedCache;
-use crate::fs::async_fs::{AsyncFs, FileReader, FsDataProvider, OpenFile};
+use crate::fs::async_fs::{AsyncFs, FileReader, FsDataProvider, OpenFile, OverlayReader};
 use crate::fs::bridge::ConcurrentBridge;
 use crate::fs::{INode, INodeType, InodeAddr, InodePerms, LoadedAddr, OpenFlags, ROOT_INO};
 
@@ -283,7 +283,8 @@ where
     R::ChildDP: Clone,
     <<R as CompositeRoot>::ChildDP as FsDataProvider>::Reader: 'static,
 {
-    type Reader = CompositeReader<<<R as CompositeRoot>::ChildDP as FsDataProvider>::Reader>;
+    type Reader =
+        CompositeReader<OverlayReader<<<R as CompositeRoot>::ChildDP as FsDataProvider>::Reader>>;
 
     async fn lookup(&self, parent: INode, name: &OsStr) -> Result<INode, std::io::Error> {
         if parent.addr == ROOT_INO {
@@ -416,7 +417,9 @@ where
 
         let inner_ino = inner_ino.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
-        let open_file: OpenFile<<<R as CompositeRoot>::ChildDP as FsDataProvider>::Reader> = child
+        let open_file: OpenFile<
+            OverlayReader<<<R as CompositeRoot>::ChildDP as FsDataProvider>::Reader>,
+        > = child
             .get_fs()
             .open(LoadedAddr::new_unchecked(inner_ino), flags)
             .await?;
@@ -424,6 +427,34 @@ where
         Ok(CompositeReader {
             inner: open_file.reader,
         })
+    }
+
+    async fn write(&self, inode: INode, offset: u64, data: Bytes) -> Result<u32, std::io::Error> {
+        if inode.addr == ROOT_INO {
+            return Err(std::io::Error::from_raw_os_error(libc::EROFS));
+        }
+
+        let slot_idx = self
+            .inner
+            .addr_to_slot
+            .read_sync(&inode.addr, |_, &v| v)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        let (child, inner_addr) = self
+            .inner
+            .slots
+            .read_sync(&slot_idx, |_, slot| {
+                (Arc::clone(&slot.inner), slot.bridge.forward(inode.addr))
+            })
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        let inner_addr =
+            inner_addr.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        child
+            .get_fs()
+            .write(LoadedAddr::new_unchecked(inner_addr), offset, data)
+            .await
     }
 
     /// Removes the composite-level address from the child's bridge map and

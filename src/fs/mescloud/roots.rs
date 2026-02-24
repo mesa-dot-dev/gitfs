@@ -12,12 +12,13 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use base64::Engine as _;
+use bytes::Bytes;
 use futures::TryStreamExt as _;
 use mesa_dev::MesaClient;
 use tracing::warn;
 
 use git_fs::cache::fcache::FileCache;
-use git_fs::fs::async_fs::{FileReader, FsDataProvider};
+use git_fs::fs::async_fs::{FileReader, FsDataProvider, OverlayReader};
 use git_fs::fs::composite::{ChildDescriptor, CompositeFs, CompositeReader, CompositeRoot};
 use git_fs::fs::{INode, INodeType, InodeAddr, InodePerms, OpenFlags, ROOT_INO};
 
@@ -392,6 +393,21 @@ impl FsDataProvider for OrgChildDP {
         }
     }
 
+    fn write(
+        &self,
+        inode: INode,
+        offset: u64,
+        data: Bytes,
+    ) -> impl Future<Output = Result<u32, std::io::Error>> + Send {
+        let this = self.clone();
+        async move {
+            match this {
+                Self::Standard(c) => c.write(inode, offset, data).await,
+                Self::Github(c) => c.write(inode, offset, data).await,
+            }
+        }
+    }
+
     fn forget(&self, addr: InodeAddr) {
         match self {
             Self::Standard(c) => c.forget(addr),
@@ -401,8 +417,8 @@ impl FsDataProvider for OrgChildDP {
 }
 
 pub enum OrgChildReader {
-    Standard(CompositeReader<MesFileReader>),
-    Github(CompositeReader<CompositeReader<MesFileReader>>),
+    Standard(CompositeReader<OverlayReader<MesFileReader>>),
+    Github(CompositeReader<OverlayReader<CompositeReader<OverlayReader<MesFileReader>>>>),
 }
 
 impl std::fmt::Debug for OrgChildReader {
@@ -419,7 +435,7 @@ impl FileReader for OrgChildReader {
         &self,
         offset: u64,
         size: u32,
-    ) -> impl Future<Output = Result<bytes::Bytes, std::io::Error>> + Send {
+    ) -> impl Future<Output = Result<Bytes, std::io::Error>> + Send {
         match self {
             Self::Standard(r) => futures::future::Either::Left(r.read(offset, size)),
             Self::Github(r) => futures::future::Either::Right(r.read(offset, size)),
