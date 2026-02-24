@@ -1,0 +1,12 @@
+"""System libfuse3 wrapper for Bazel.
+
+Wraps the system-installed libfuse3 so that the `fuser` crate can link
+against it. Requires `libfuse3-dev` (Debian/Ubuntu) or `fuse3-devel`
+(Fedora/RHEL) to be installed on the host.
+"""
+
+cc_library(
+    name = "fuse3",
+    linkopts = ["-lfuse3"],
+    visibility = ["//visibility:public"],
+)
