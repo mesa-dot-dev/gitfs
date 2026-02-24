@@ -1,0 +1,9 @@
+"""Root BUILD file for git-fs.
+
+Exports Cargo manifest files for crate_universe consumption.
+"""
+
+exports_files([
+    "Cargo.toml",
+    "Cargo.lock",
+])
