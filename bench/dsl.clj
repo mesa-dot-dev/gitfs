@@ -1,7 +1,5 @@
 (ns bench.dsl
-  (:require [babashka.fs :as fs]
-            [babashka.process :as proc]
-            [cheshire.core :as json]))
+  (:require [babashka.fs :as fs]))
 
 (defn- fn->script-file
   "Serialize a quoted Clojure form to a temp .clj file in `dir`.
@@ -41,26 +39,20 @@
    `dir` is the temp directory for script files.
    `json-path` is where --export-json will write."
   [dir json-path opts commands]
-  (let [args (transient ["hyperfine" "--export-json" (str json-path)])]
-    ;; simple k/v flags
-    (doseq [[k flag] flag-map]
-      (when-let [v (get opts k)]
-        (conj! args flag)
-        (conj! args (str v))))
-    ;; hook flags (fn-or-string)
-    (doseq [[k flag] hook-flags]
-      (when-let [v (get opts k)]
-        (conj! args flag)
-        (conj! args (hook-arg dir v))))
-    ;; -L parameter-list: expects [var-name values-string]
-    (when-let [[var-name values] (:parameter-list opts)]
-      (conj! args "-L")
-      (conj! args (str var-name))
-      (conj! args (str values)))
-    ;; -N no-shell (bare flag)
-    (when (:no-shell opts)
-      (conj! args "-N"))
-    ;; append the commands to benchmark
-    (doseq [cmd commands]
-      (conj! args (str cmd)))
-    (persistent! args)))
+  (-> ["hyperfine" "--export-json" (str json-path)]
+      (into (mapcat (fn [[k flag]]
+                      (when-let [v (get opts k)]
+                        [flag (str v)]))
+                    flag-map))
+      (into (mapcat (fn [[k flag]]
+                      (when-let [v (get opts k)]
+                        [flag (hook-arg dir v)]))
+                    hook-flags))
+      (cond->
+        (:parameter-list opts)
+        (into (let [[var-name values] (:parameter-list opts)]
+                ["-L" (str var-name) (str values)]))
+
+        (:no-shell opts)
+        (conj "-N"))
+      (into (map str commands))))
