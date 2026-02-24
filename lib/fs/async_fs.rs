@@ -447,9 +447,11 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
     /// Asynchronously look up an inode by name within a parent directory.
     ///
     /// Resolution order:
-    /// 1. Directory cache (synchronous fast path)
-    /// 2. Lookup cache (`get_or_try_init` — calls `dp.lookup()` only on a true miss)
-    /// 3. On success, populates inode table and directory cache
+    /// 1. Directory cache hit — returns immediately.
+    /// 2. Directory cache miss in a fully-populated directory — returns `ENOENT`
+    ///    immediately without hitting the remote data provider.
+    /// 3. Lookup cache (`get_or_try_init` — calls `dp.lookup()` only on a true miss)
+    /// 4. On success, populates inode table and directory cache
     pub async fn lookup(
         &self,
         parent: LoadedAddr,
@@ -469,6 +471,11 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
             // entry so the slow path calls dp.lookup() fresh.
             self.lookup_cache
                 .remove_sync(&(parent.addr(), Arc::from(name)));
+        } else if self.directory_cache.is_populated(parent) {
+            // The directory has been fully populated (e.g. by readdir) and this
+            // name was not found — the file does not exist. Short-circuit
+            // without hitting the remote data provider.
+            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
         }
 
         // Note: get_or_try_init deduplicates successful lookups but NOT
