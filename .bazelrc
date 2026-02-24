@@ -1,0 +1,15 @@
+# Rust edition matching Cargo.toml
+build --@rules_rust//:edition=2024
+
+# Use the Rust stable toolchain
+build --@rules_rust//rust/toolchain/channel=stable
+
+# Show test output on failure
+test --test_output=errors
+
+# Enable colored diagnostics
+build --color=yes
+
+# Short-form convenience configs
+build:release --compilation_mode=opt
+build:debug --compilation_mode=dbg
