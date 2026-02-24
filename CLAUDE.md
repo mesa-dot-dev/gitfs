@@ -43,6 +43,11 @@ cargo fmt --all && cargo clippy --all-targets --all-features -- -D warnings && c
 - Channels: `tokio::sync::mpsc` for multi-producer, `tokio::sync::oneshot` for request-response
 - Never block the async runtime — offload blocking work with `tokio::task::spawn_blocking`
 
+## Testing
+
+- Avoid writing tests in-line in the same file as production code; use separate `tests/` directory
+  for tests.
+
 ## Dependencies
 
 - Check for existing deps with `cargo tree` before adding new crates

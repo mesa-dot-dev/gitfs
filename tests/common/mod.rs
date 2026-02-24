@@ -1,4 +1,7 @@
-#![allow(missing_docs, clippy::unwrap_used)]
+#![allow(dead_code, missing_docs, clippy::unwrap_used)]
+
+pub mod async_fs_mocks;
+pub mod composite_mocks;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

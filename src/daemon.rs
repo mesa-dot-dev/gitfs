@@ -1,7 +1,6 @@
 use tokio::select;
 
 use crate::app_config;
-use crate::fs::mescloud::{MesaFS, OrgConfig};
 use tracing::{debug, error, info};
 
 mod managed_fuse {
@@ -14,9 +13,12 @@ mod managed_fuse {
 
     use nix::errno::Errno;
 
-    use super::{MesaFS, OrgConfig, app_config, debug, error};
-    use crate::fs::fuser::FuserAdapter;
+    use git_fs::cache::async_backed::FutureBackedCache;
+
+    use super::{app_config, debug, error};
     use fuser::BackgroundSession;
+    use git_fs::fs::fuser::FuserAdapter;
+    use secrecy::ExposeSecret as _;
 
     pub struct FuseCoreScope {
         _session: BackgroundSession,
@@ -36,15 +38,44 @@ mod managed_fuse {
             config: app_config::Config,
             handle: tokio::runtime::Handle,
         ) -> Result<BackgroundSession, std::io::Error> {
-            let orgs = config
-                .organizations
-                .iter()
-                .map(|(org_name, org)| OrgConfig {
-                    name: org_name.clone(),
-                    api_key: org.api_key.clone(),
-                });
-            let mesa_fs = MesaFS::new(orgs, (config.uid, config.gid), &config.cache);
-            let fuse_adapter = FuserAdapter::new(mesa_fs, handle);
+            let fs_owner = (config.uid, config.gid);
+
+            let mut org_children = Vec::new();
+            for (org_name, org_conf) in &config.organizations {
+                let client =
+                    crate::fs::mescloud::build_mesa_client(org_conf.api_key.expose_secret());
+                let dp = if org_name == "github" {
+                    let github_org_root = crate::fs::mescloud::roots::GithubOrgRoot::new(
+                        client,
+                        org_name.clone(),
+                        config.cache.clone(),
+                        fs_owner,
+                    );
+                    crate::fs::mescloud::roots::OrgChildDP::Github(
+                        git_fs::fs::composite::CompositeFs::new(github_org_root, fs_owner),
+                    )
+                } else {
+                    let standard_org_root = crate::fs::mescloud::roots::StandardOrgRoot::new(
+                        client,
+                        org_name.clone(),
+                        config.cache.clone(),
+                        fs_owner,
+                    );
+                    crate::fs::mescloud::roots::OrgChildDP::Standard(
+                        git_fs::fs::composite::CompositeFs::new(standard_org_root, fs_owner),
+                    )
+                };
+                org_children.push((std::ffi::OsString::from(org_name), dp));
+            }
+
+            let mesa_root = crate::fs::mescloud::roots::MesaRoot::new(org_children);
+            let composite = git_fs::fs::composite::CompositeFs::new(mesa_root, fs_owner);
+
+            let table = FutureBackedCache::default();
+            let root_inode = composite.make_root_inode();
+            table.insert_sync(git_fs::fs::ROOT_INO, root_inode);
+
+            let fuse_adapter = FuserAdapter::new(table, composite, handle);
             let mount_opts = [
                 fuser::MountOption::FSName("git-fs".to_owned()),
                 fuser::MountOption::RO,
