@@ -87,6 +87,23 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-features
 
+  bazel-build-and-test:
+    name: Bazel Build & Test
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: libfuse3-dev
+          version: 1.0
+
+      - name: Build
+        run: bazel build //...
+
+      - name: Test
+        run: bazel test //...
+
   python-lint:
     name: Ruff & Pyright
     runs-on: blacksmith-2vcpu-ubuntu-2404
