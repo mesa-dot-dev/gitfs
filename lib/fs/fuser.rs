@@ -161,7 +161,9 @@ pub struct FuserAdapter<DP: FsDataProvider> {
     inner: FuseBridgeInner<DP>,
     open_files: HashMap<FileHandle, Arc<DP::Reader>>,
     dir_handles: HashMap<FileHandle, DirSnapshot>,
-    next_dir_fh: u64,
+    /// Unified file handle counter for both file and directory handles.
+    /// Prevents collisions between `open` and `opendir` handles.
+    next_fh: u64,
     runtime: tokio::runtime::Handle,
 }
 
@@ -190,7 +192,7 @@ impl<DP: FsDataProvider> FuserAdapter<DP> {
             inner: FuseBridgeInner::create(table, provider),
             open_files: HashMap::new(),
             dir_handles: HashMap::new(),
-            next_dir_fh: 1,
+            next_fh: 1,
             runtime,
         }
     }
@@ -252,8 +254,8 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
         _flags: i32,
         reply: fuser::ReplyOpen,
     ) {
-        let fh = self.next_dir_fh;
-        self.next_dir_fh += 1;
+        let fh = self.next_fh;
+        self.next_fh += 1;
         self.dir_handles.insert(fh, DirSnapshot::Pending(ino));
         debug!(handle = fh, "replying...");
         reply.opened(fh, 0);
@@ -268,6 +270,11 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
         offset: i64,
         reply: fuser::ReplyDirectory,
     ) {
+        if offset < 0 {
+            debug!(offset, "negative readdir offset");
+            reply.error(libc::EINVAL);
+            return;
+        }
         let offset_u64 = offset.cast_unsigned();
 
         // Lazily populate the snapshot on the first readdir call for this handle.
@@ -370,7 +377,8 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
                     .get_fs()
                     .open(LoadedAddr::new_unchecked(ino), flags)
                     .await?;
-                let fh = open_file.fh;
+                let fh = self.next_fh;
+                self.next_fh += 1;
                 self.open_files.insert(fh, Arc::clone(&open_file.reader));
                 Ok::<_, std::io::Error>(fh)
             })
@@ -395,6 +403,11 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
         _lock_owner: Option<u64>,
         reply: fuser::ReplyData,
     ) {
+        if offset < 0 {
+            debug!(offset, "negative read offset");
+            reply.error(libc::EINVAL);
+            return;
+        }
         self.runtime
             .block_on(async {
                 let reader = self

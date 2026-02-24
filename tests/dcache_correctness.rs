@@ -84,11 +84,11 @@ async fn try_claim_populate_unclaimed_returns_claimed() {
 #[tokio::test]
 async fn finish_populate_then_claim_returns_done() {
     let cache = DCache::new();
-    let PopulateStatus::Claimed(claim_gen) = cache.try_claim_populate(LoadedAddr::new_unchecked(1))
+    let PopulateStatus::Claimed(receipt) = cache.try_claim_populate(LoadedAddr::new_unchecked(1))
     else {
         panic!("expected Claimed")
     };
-    cache.finish_populate(LoadedAddr::new_unchecked(1), claim_gen);
+    cache.finish_populate(LoadedAddr::new_unchecked(1), receipt);
     assert!(matches!(
         cache.try_claim_populate(LoadedAddr::new_unchecked(1)),
         PopulateStatus::Done
@@ -111,11 +111,11 @@ async fn double_claim_returns_in_progress() {
 #[tokio::test]
 async fn abort_populate_allows_reclaim() {
     let cache = DCache::new();
-    assert!(matches!(
-        cache.try_claim_populate(LoadedAddr::new_unchecked(1)),
-        PopulateStatus::Claimed(_)
-    ));
-    cache.abort_populate(LoadedAddr::new_unchecked(1));
+    let PopulateStatus::Claimed(receipt) = cache.try_claim_populate(LoadedAddr::new_unchecked(1))
+    else {
+        panic!("expected Claimed")
+    };
+    cache.abort_populate(LoadedAddr::new_unchecked(1), receipt.token);
     assert!(matches!(
         cache.try_claim_populate(LoadedAddr::new_unchecked(1)),
         PopulateStatus::Claimed(_)
@@ -283,10 +283,10 @@ async fn remove_parent_resets_populate_status() {
         LoadedAddr::new_unchecked(10),
         false,
     );
-    let PopulateStatus::Claimed(claim_gen) = cache.try_claim_populate(parent) else {
+    let PopulateStatus::Claimed(receipt) = cache.try_claim_populate(parent) else {
         panic!("expected Claimed")
     };
-    cache.finish_populate(parent, claim_gen);
+    cache.finish_populate(parent, receipt);
     assert!(matches!(
         cache.try_claim_populate(parent),
         PopulateStatus::Done
@@ -321,10 +321,10 @@ async fn evict_removes_child_and_resets_populate_status() {
     let parent = LoadedAddr::new_unchecked(1);
     let child = LoadedAddr::new_unchecked(10);
     cache.insert(parent, OsString::from("foo"), child, false);
-    let PopulateStatus::Claimed(claim_gen) = cache.try_claim_populate(parent) else {
+    let PopulateStatus::Claimed(receipt) = cache.try_claim_populate(parent) else {
         panic!("expected Claimed")
     };
-    cache.finish_populate(parent, claim_gen);
+    cache.finish_populate(parent, receipt);
     assert!(matches!(
         cache.try_claim_populate(parent),
         PopulateStatus::Done
@@ -364,10 +364,10 @@ async fn evict_does_not_affect_siblings() {
         LoadedAddr::new_unchecked(11),
         true,
     );
-    let PopulateStatus::Claimed(claim_gen) = cache.try_claim_populate(parent) else {
+    let PopulateStatus::Claimed(receipt) = cache.try_claim_populate(parent) else {
         panic!("expected Claimed")
     };
-    cache.finish_populate(parent, claim_gen);
+    cache.finish_populate(parent, receipt);
 
     cache.evict(LoadedAddr::new_unchecked(10));
 
@@ -404,15 +404,18 @@ async fn evict_during_populate_invalidates_generation() {
     let child = LoadedAddr::new_unchecked(10);
     cache.insert(parent, OsString::from("foo"), child, false);
 
-    let PopulateStatus::Claimed(claim_gen) = cache.try_claim_populate(parent) else {
+    let PopulateStatus::Claimed(receipt) = cache.try_claim_populate(parent) else {
         panic!("expected Claimed")
     };
 
     // Evict while populate is in progress.
     cache.evict(child);
 
-    // Finish populate with the stale generation.
-    cache.finish_populate(parent, claim_gen);
+    // Finish populate with the stale receipt. The CAS uses the original
+    // token, but evict already reset the flag to UNCLAIMED, so the CAS
+    // fails harmlessly. Even if it succeeded, the generation mismatch
+    // would cause UNCLAIMED to be stored.
+    cache.finish_populate(parent, receipt);
 
     // The finish_populate should have detected the generation mismatch
     // and reset to UNCLAIMED instead of DONE.
@@ -516,10 +519,10 @@ async fn insert_reparent_resets_old_parent_populate_status() {
     let child = LoadedAddr::new_unchecked(10);
 
     cache.insert(parent_a, OsString::from("foo"), child, false);
-    let PopulateStatus::Claimed(claim_gen) = cache.try_claim_populate(parent_a) else {
+    let PopulateStatus::Claimed(receipt) = cache.try_claim_populate(parent_a) else {
         panic!("expected Claimed");
     };
-    cache.finish_populate(parent_a, claim_gen);
+    cache.finish_populate(parent_a, receipt);
     assert!(matches!(
         cache.try_claim_populate(parent_a),
         PopulateStatus::Done
@@ -589,8 +592,8 @@ async fn evict_during_in_progress_resets_populate_status() {
     let child = LoadedAddr::new_unchecked(10);
     cache.insert(parent, OsString::from("foo"), child, false);
 
-    // Claim populate (state → IN_PROGRESS).
-    let PopulateStatus::Claimed(_claim_gen) = cache.try_claim_populate(parent) else {
+    // Claim populate (state → IN_PROGRESS with claim token).
+    let PopulateStatus::Claimed(_receipt) = cache.try_claim_populate(parent) else {
         panic!("expected Claimed");
     };
 
@@ -625,7 +628,7 @@ async fn evict_during_in_progress_then_finish_populate_stays_unclaimed() {
     cache.insert(parent, OsString::from("b"), child_b, false);
 
     // Step 1: claim populate.
-    let PopulateStatus::Claimed(claim_gen) = cache.try_claim_populate(parent) else {
+    let PopulateStatus::Claimed(receipt) = cache.try_claim_populate(parent) else {
         panic!("expected Claimed");
     };
 
@@ -633,11 +636,10 @@ async fn evict_during_in_progress_then_finish_populate_stays_unclaimed() {
     // UNCLAIMED and bumps the generation.
     cache.evict(child_a);
 
-    // Step 3: finish_populate with the stale generation. Since evict
-    // already reset to UNCLAIMED, finish_populate's CAS on IN_PROGRESS
-    // may fail (already UNCLAIMED) — which is correct. Or if the
-    // generation mismatch is detected, it stores UNCLAIMED.
-    cache.finish_populate(parent, claim_gen);
+    // Step 3: finish_populate with the stale receipt. Since evict
+    // already reset to UNCLAIMED, the CAS from the receipt's token
+    // fails (already UNCLAIMED) — which is correct.
+    cache.finish_populate(parent, receipt);
 
     // The directory must be re-claimable (not stuck in DONE with stale data).
     assert!(
@@ -716,20 +718,20 @@ async fn evict_generation_bump_prevents_stale_finish_populate() {
     // Insert child so evict has something to work with.
     cache.insert(parent, OsString::from("foo"), child, false);
 
-    // Claim populate (gen=0). State: IN_PROGRESS.
-    let PopulateStatus::Claimed(claimed_gen) = cache.try_claim_populate(parent) else {
+    // Claim populate (gen=0). State: IN_PROGRESS with claim token.
+    let PopulateStatus::Claimed(receipt) = cache.try_claim_populate(parent) else {
         panic!("expected Claimed");
     };
-    assert_eq!(claimed_gen, 0);
+    assert_eq!(receipt.generation, 0);
 
     // Evict while populate is in-flight. This bumps gen to 1 and
-    // CASes IN_PROGRESS -> UNCLAIMED.
+    // resets the populate flag to UNCLAIMED.
     cache.evict(child);
 
-    // finish_populate with the now-stale claimed_gen=0. Since evict
-    // already reset to UNCLAIMED, the CAS (IN_PROGRESS -> target) should
-    // fail harmlessly. The directory must remain UNCLAIMED.
-    cache.finish_populate(parent, claimed_gen);
+    // finish_populate with the now-stale receipt. Since evict already
+    // reset to UNCLAIMED, the CAS from the receipt's token fails
+    // harmlessly. The directory must remain UNCLAIMED.
+    cache.finish_populate(parent, receipt);
 
     // The directory should be re-claimable (UNCLAIMED), not stuck at DONE.
     match cache.try_claim_populate(parent) {

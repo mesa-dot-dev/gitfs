@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::Notify;
@@ -16,19 +16,31 @@ pub struct DValue {
     pub is_dir: bool,
 }
 
-/// Population states for a directory.
-const POPULATE_UNCLAIMED: u8 = 0;
-const POPULATE_IN_PROGRESS: u8 = 1;
-const POPULATE_DONE: u8 = 2;
-
-/// CAS loop: atomically transition `DONE|IN_PROGRESS → UNCLAIMED`.
+/// Population states encoded in a single `AtomicU64`:
 ///
-/// Uses `compare_exchange_weak` in a loop to close the window that would
-/// exist between two sequential CAS operations, where a new populator
-/// could claim `IN_PROGRESS` and then be clobbered by a stale second CAS.
-fn reset_populate(flag: &AtomicU8) {
+/// - `0` = **UNCLAIMED** — no populator is active.
+/// - `u64::MAX` = **DONE** — directory is fully populated.
+/// - Any other value = **in-progress** — the value is the unique claim
+///   token assigned by [`DCache::try_claim_populate`].
+///
+/// Using the claim token as the in-progress value ensures that
+/// [`DCache::finish_populate`] and [`DCache::abort_populate`] can only
+/// affect the slot they originally claimed, preventing a stale populator
+/// from clobbering a new populator's state.
+const POPULATE_UNCLAIMED: u64 = 0;
+const POPULATE_DONE: u64 = u64::MAX;
+
+/// Returns `true` if `value` represents an in-progress populate.
+fn is_in_progress(value: u64) -> bool {
+    value != POPULATE_UNCLAIMED && value != POPULATE_DONE
+}
+
+/// CAS loop: atomically transition any non-UNCLAIMED state to UNCLAIMED.
+///
+/// Uses `compare_exchange_weak` in a loop to handle concurrent transitions.
+fn reset_populate(flag: &AtomicU64) {
     let mut current = flag.load(Ordering::Acquire);
-    while matches!(current, POPULATE_DONE | POPULATE_IN_PROGRESS) {
+    while current != POPULATE_UNCLAIMED {
         match flag.compare_exchange_weak(
             current,
             POPULATE_UNCLAIMED,
@@ -41,12 +53,26 @@ fn reset_populate(flag: &AtomicU8) {
     }
 }
 
+/// Receipt from a successful [`DCache::try_claim_populate`].
+///
+/// Carries both the unique claim token (used for CAS identity in
+/// `finish_populate`/`abort_populate`) and the generation snapshot
+/// (used to detect stale data from intervening evictions).
+#[derive(Debug, Clone, Copy)]
+pub struct ClaimReceipt {
+    /// Unique token stored in the populate flag. Only the holder of this
+    /// token can transition the flag out of in-progress.
+    pub token: u64,
+    /// Generation snapshot at claim time. If an eviction bumps the
+    /// generation before `finish_populate`, the data is stale and the
+    /// flag is reset to UNCLAIMED instead of DONE.
+    pub generation: u64,
+}
+
 /// Result of attempting to claim a directory for population.
 pub enum PopulateStatus {
     /// This caller won the race and should populate the directory.
-    /// Carries the generation at claim time so [`DCache::finish_populate`]
-    /// can detect whether an eviction invalidated the populate.
-    Claimed(u64),
+    Claimed(ClaimReceipt),
     /// Another caller is currently populating; wait and re-check.
     InProgress,
     /// The directory is already fully populated.
@@ -62,7 +88,9 @@ struct DirState {
     /// overhead in the uncontended case. Do NOT introduce `.await` calls
     /// while holding a guard — this would block the tokio worker thread.
     children: RwLock<BTreeMap<OsString, DValue>>,
-    populated: AtomicU8,
+    /// Population flag: `0` = unclaimed, `u64::MAX` = done, other = in-progress
+    /// with the value being the claim token.
+    populated: AtomicU64,
     /// Monotonically increasing counter bumped by each [`DCache::evict`] call.
     /// Allows [`DCache::finish_populate`] to detect that an eviction occurred
     /// while a populate was in flight.
@@ -75,7 +103,7 @@ impl DirState {
     fn new() -> Self {
         Self {
             children: RwLock::new(BTreeMap::new()),
-            populated: AtomicU8::new(POPULATE_UNCLAIMED),
+            populated: AtomicU64::new(POPULATE_UNCLAIMED),
             generation: AtomicU64::new(0),
             notify: Notify::new(),
         }
@@ -85,9 +113,9 @@ impl DirState {
 /// In-memory directory entry cache with per-parent child maps.
 ///
 /// Each parent directory gets its own [`DirState`] containing a
-/// [`BTreeMap`] of child entries (kept in sorted order) and an [`AtomicU8`]
-/// population flag. This makes `readdir` O(k) in the number of children
-/// with zero sorting overhead.
+/// [`BTreeMap`] of child entries (kept in sorted order) and a population
+/// flag encoded as an [`AtomicU64`] claim token. This makes `readdir`
+/// O(k) in the number of children with zero sorting overhead.
 pub struct DCache {
     dirs: scc::HashMap<LoadedAddr, Arc<DirState>>,
     /// Reverse index: child inode -> parent inode, for O(1) parent discovery
@@ -96,6 +124,9 @@ pub struct DCache {
     /// Reverse index: child inode -> entry name, for O(log n) removal from
     /// the parent's `BTreeMap` during eviction (instead of O(n) `retain`).
     child_to_name: scc::HashMap<LoadedAddr, OsString>,
+    /// Monotonically increasing counter for generating unique claim tokens.
+    /// Starts at 1 (`0` = unclaimed, `u64::MAX` = done).
+    next_claim_token: AtomicU64,
 }
 
 impl Default for DCache {
@@ -112,6 +143,7 @@ impl DCache {
             dirs: scc::HashMap::new(),
             child_to_parent: scc::HashMap::new(),
             child_to_name: scc::HashMap::new(),
+            next_claim_token: AtomicU64::new(1),
         }
     }
 
@@ -409,59 +441,67 @@ impl DCache {
 
     /// Atomically try to claim a directory for population.
     ///
-    /// Uses `compare_exchange` on the three-state flag:
-    /// - `UNCLAIMED → IN_PROGRESS`: returns `Claimed` (caller should populate)
-    /// - Already `IN_PROGRESS`: returns `InProgress` (caller should wait)
+    /// Generates a unique claim token and attempts `CAS(UNCLAIMED → token)`.
+    /// - Success: returns `Claimed(ClaimReceipt)` (caller should populate)
+    /// - Already in-progress (another token): returns `InProgress` (wait)
     /// - Already `DONE`: returns `Done` (nothing to do)
     pub fn try_claim_populate(&self, parent_ino: LoadedAddr) -> PopulateStatus {
         let state = self.dir_state(parent_ino);
+        // Allocate a unique claim token, skipping the two reserved values.
+        // At ~2^64 possible values with only 2 reserved, the loop body
+        // almost never executes more than once.
+        let token = loop {
+            let t = self.next_claim_token.fetch_add(1, Ordering::Relaxed);
+            if t != POPULATE_UNCLAIMED && t != POPULATE_DONE {
+                break t;
+            }
+        };
         match state.populated.compare_exchange(
             POPULATE_UNCLAIMED,
-            POPULATE_IN_PROGRESS,
+            token,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
             Ok(_) => {
-                let claim_gen = state.generation.load(Ordering::Acquire);
-                PopulateStatus::Claimed(claim_gen)
+                let generation = state.generation.load(Ordering::Acquire);
+                PopulateStatus::Claimed(ClaimReceipt { token, generation })
             }
-            Err(POPULATE_IN_PROGRESS) => PopulateStatus::InProgress,
-            Err(_) => PopulateStatus::Done,
+            Err(POPULATE_DONE) => PopulateStatus::Done,
+            Err(v) if is_in_progress(v) => PopulateStatus::InProgress,
+            // Should not happen, but treat unknown states as InProgress.
+            Err(_) => PopulateStatus::InProgress,
         }
     }
 
     /// Mark a directory as fully populated after successful population.
     ///
-    /// `claimed_gen` is the generation returned by [`try_claim_populate`]. If
-    /// an [`evict`](Self::evict) bumped the generation since then, the data
-    /// is stale so the flag is reset to `UNCLAIMED` instead of `DONE`.
+    /// `receipt` is the [`ClaimReceipt`] returned by [`try_claim_populate`].
+    /// The CAS uses the receipt's unique token as the expected value, so only
+    /// the original claimant can transition the flag. If an [`evict`](Self::evict)
+    /// already reset the flag (or a different populator claimed it), the CAS
+    /// fails harmlessly.
     ///
-    /// Uses CAS (`IN_PROGRESS -> target`) rather than a plain store so
-    /// that if a concurrent [`evict`](Self::evict) already reset the flag
-    /// to `UNCLAIMED`, this does not overwrite that correction.
-    pub fn finish_populate(&self, parent_ino: LoadedAddr, claimed_gen: u64) {
+    /// If the generation was bumped since the claim (indicating an intervening
+    /// eviction), the flag is reset to `UNCLAIMED` instead of `DONE`.
+    pub fn finish_populate(&self, parent_ino: LoadedAddr, receipt: ClaimReceipt) {
         let state = self.dir_state(parent_ino);
         // Acquire the read lock to serialize the generation check with
         // evict's generation bump (which happens under the write lock).
-        // Without this, a concurrent evict could bump the generation and
-        // reset the flag to UNCLAIMED, then a new populator could claim
-        // IN_PROGRESS, and this stale finish_populate would overwrite the
-        // new populator's IN_PROGRESS with DONE — serving incomplete data.
         let children_guard = state
             .children
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let current_gen = state.generation.load(Ordering::Acquire);
-        let target = if current_gen == claimed_gen {
+        let target = if current_gen == receipt.generation {
             POPULATE_DONE
         } else {
             POPULATE_UNCLAIMED
         };
-        // CAS: only transition from IN_PROGRESS. If evict already reset
-        // to UNCLAIMED, this fails harmlessly — the correct state is
-        // already in place.
+        // CAS from this populator's specific token. If evict already reset
+        // to UNCLAIMED, or a different populator claimed it, this fails
+        // harmlessly.
         let _ = state.populated.compare_exchange(
-            POPULATE_IN_PROGRESS,
+            receipt.token,
             target,
             Ordering::AcqRel,
             Ordering::Relaxed,
@@ -473,14 +513,13 @@ impl DCache {
     /// Abort a population attempt, resetting back to unclaimed so another
     /// caller can retry.
     ///
-    /// Uses CAS (`IN_PROGRESS → UNCLAIMED`) rather than a plain store so
-    /// that if a concurrent [`evict`](Self::evict) already reset the flag
-    /// to `UNCLAIMED` and a new populator claimed it, this stale abort
-    /// does not clobber the new populator's `IN_PROGRESS` state.
-    pub fn abort_populate(&self, parent_ino: LoadedAddr) {
+    /// `token` is the claim token from the [`ClaimReceipt`]. The CAS only
+    /// succeeds if the flag still holds this populator's token, preventing
+    /// a stale abort from clobbering a new populator's claim.
+    pub fn abort_populate(&self, parent_ino: LoadedAddr, token: u64) {
         let state = self.dir_state(parent_ino);
         let _ = state.populated.compare_exchange(
-            POPULATE_IN_PROGRESS,
+            token,
             POPULATE_UNCLAIMED,
             Ordering::AcqRel,
             Ordering::Relaxed,
@@ -503,7 +542,7 @@ impl DCache {
             let mut notified = std::pin::pin!(state.notify.notified());
             notified.as_mut().enable();
             let current = state.populated.load(Ordering::Acquire);
-            if current != POPULATE_IN_PROGRESS {
+            if !is_in_progress(current) {
                 return;
             }
             // SAFETY(cancel): re-entering the loop re-creates the Notified

@@ -218,14 +218,16 @@ impl InodeLifecycle {
 struct PopulateGuard<'a> {
     dcache: &'a DCache,
     parent: LoadedAddr,
+    token: u64,
     armed: bool,
 }
 
 impl<'a> PopulateGuard<'a> {
-    fn new(dcache: &'a DCache, parent: LoadedAddr) -> Self {
+    fn new(dcache: &'a DCache, parent: LoadedAddr, token: u64) -> Self {
         Self {
             dcache,
             parent,
+            token,
             armed: true,
         }
     }
@@ -244,7 +246,7 @@ impl Drop for PopulateGuard<'_> {
     /// not an error.
     fn drop(&mut self) {
         if self.armed {
-            self.dcache.abort_populate(self.parent);
+            self.dcache.abort_populate(self.parent, self.token);
         }
     }
 }
@@ -261,12 +263,12 @@ async fn prefetch_dir<DP: FsDataProvider>(
 ) {
     use crate::fs::dcache::PopulateStatus;
 
-    let claim_gen = match directory_cache.try_claim_populate(dir_addr) {
-        PopulateStatus::Claimed(claim_gen) => claim_gen,
+    let receipt = match directory_cache.try_claim_populate(dir_addr) {
+        PopulateStatus::Claimed(receipt) => receipt,
         PopulateStatus::InProgress | PopulateStatus::Done => return,
     };
 
-    let mut guard = PopulateGuard::new(&directory_cache, dir_addr);
+    let mut guard = PopulateGuard::new(&directory_cache, dir_addr, receipt.token);
 
     let Some(dir_inode) = inode_table.get(&dir_addr.addr()).await else {
         return;
@@ -288,7 +290,7 @@ async fn prefetch_dir<DP: FsDataProvider>(
             is_dir,
         );
     }
-    directory_cache.finish_populate(dir_addr, claim_gen);
+    directory_cache.finish_populate(dir_addr, receipt);
     guard.defuse();
 }
 
@@ -595,11 +597,12 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         // Uses a three-state CAS gate to prevent duplicate dp.readdir() calls.
         loop {
             match self.directory_cache.try_claim_populate(parent) {
-                PopulateStatus::Claimed(claim_gen) => {
+                PopulateStatus::Claimed(receipt) => {
                     // RAII guard: if this future is cancelled between Claimed
                     // and finish_populate, automatically abort so other waiters
                     // can retry instead of hanging forever.
-                    let mut guard = PopulateGuard::new(&self.directory_cache, parent);
+                    let mut guard =
+                        PopulateGuard::new(&self.directory_cache, parent, receipt.token);
 
                     let children = self.data_provider.readdir(parent_inode).await?;
                     for (name, child_inode) in children {
@@ -613,7 +616,7 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
                             child_inode.itype == INodeType::Directory,
                         );
                     }
-                    self.directory_cache.finish_populate(parent, claim_gen);
+                    self.directory_cache.finish_populate(parent, receipt);
                     guard.defuse();
                     self.spawn_prefetch_children(parent);
                     break;
