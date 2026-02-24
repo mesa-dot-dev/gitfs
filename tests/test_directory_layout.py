@@ -93,7 +93,22 @@ def dfs_compare(
         f"Entry mismatch at {lhs.name}: {lhs} is {lhs_info}, {rhs} is {rhs_info}"
     )
 
-    if lhs_info.kind is not EntryKind.DIRECTORY:
+    if lhs_info.kind is EntryKind.SYMLINK:
+        lhs_target = lhs.readlink()
+        rhs_target = rhs.readlink()
+        assert lhs_target == rhs_target, (
+            f"Symlink target mismatch at {lhs.name}: "
+            f"{lhs} -> {lhs_target}, {rhs} -> {rhs_target}"
+        )
+        return
+
+    if lhs_info.kind is EntryKind.FILE:
+        lhs_bytes = lhs.read_bytes()
+        rhs_bytes = rhs.read_bytes()
+        assert lhs_bytes == rhs_bytes, (
+            f"Content mismatch at {lhs.name}: "
+            f"{lhs} ({len(lhs_bytes)} bytes) != {rhs} ({len(rhs_bytes)} bytes)"
+        )
         return
 
     lhs_children = sorted(
@@ -118,6 +133,20 @@ def dfs_compare(
 
     for lhs_child, rhs_child in zip(lhs_children, rhs_children, strict=True):
         dfs_compare(lhs_child, rhs_child, excluded_globs=excluded_globs)
+
+
+def test_dfs_compare_detects_content_mismatch(tmp_path: Path) -> None:
+    """dfs_compare should fail when file contents differ."""
+    lhs = tmp_path / "lhs"
+    rhs = tmp_path / "rhs"
+    lhs.mkdir()
+    rhs.mkdir()
+
+    (lhs / "file.txt").write_text("hello")
+    (rhs / "file.txt").write_text("world")
+
+    with pytest.raises(AssertionError, match="Content mismatch"):
+        dfs_compare(lhs, rhs)
 
 
 @pytest.mark.integration
