@@ -1,5 +1,7 @@
 (ns bench.dsl
-  (:require [babashka.fs :as fs]))
+  (:require [babashka.fs :as fs]
+            [babashka.process :as proc]
+            [cheshire.core :as json]))
 
 (defn- fn->script-file
   "Serialize a quoted Clojure form to a temp .clj file in `dir`.
@@ -56,3 +58,37 @@
         (:no-shell opts)
         (conj "-N"))
       (into (map str commands))))
+
+(defn hyperfine
+  "Run hyperfine with the given options and commands.
+   Returns the parsed JSON result as a Clojure map with keyword keys.
+
+   Options:
+     :warmup        int    - warmup runs (-w)
+     :min-runs      int    - minimum runs (-m)
+     :runs          int    - exact number of runs (-r)
+     :setup         form|str - run once before all runs (-s)
+     :prepare       form|str - run before each run (-p)
+     :conclude      form|str - run after each run (-C)
+     :cleanup       form|str - run after all runs (-c)
+     :parameter-list [var vals] - parameter list (-L)
+     :shell         str    - shell to use (-S)
+     :no-shell      bool   - run without shell (-N)
+
+   Hook options (:setup, :prepare, :conclude, :cleanup) accept either
+   a string (passed verbatim) or a quoted Clojure form which will be
+   serialized to a temp Babashka script.
+
+   Example:
+     (hyperfine {:warmup 3 :runs 10}
+                \"sleep 0.01\"
+                \"sleep 0.02\")"
+  [opts & commands]
+  (let [dir       (fs/create-temp-dir {:prefix "hyperfine-"})
+        json-file (fs/file dir "results.json")
+        args      (build-args dir (str json-file) opts commands)]
+    (try
+      (apply proc/shell {:out :inherit :err :inherit} args)
+      (json/parse-string (slurp (str json-file)) true)
+      (finally
+        (fs/delete-tree dir)))))
