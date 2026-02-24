@@ -5,11 +5,7 @@ module(
     version = "0.1.4-alpha.1",
 )
 
-# --- rules_rust -----------------------------------------------------------
-
 bazel_dep(name = "rules_rust", version = "0.61.0")
-
-# --- crate_universe: generate targets from Cargo.toml --------------------
 
 crate = use_extension("@rules_rust//crate_universe:extension.bzl", "crate")
 
