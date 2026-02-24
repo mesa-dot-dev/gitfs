@@ -1,0 +1,58 @@
+"""Build targets for the git-fs binary crate and its build script."""
+
+load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+
+cargo_build_script(
+    name = "build_script",
+    srcs = ["//:build.rs"],
+    edition = "2024",
+    deps = ["@crates//:vergen-gitcl"],
+    stamp = 1,
+)
+
+rust_binary(
+    name = "git-fs",
+    srcs = glob(["**/*.rs"]),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":build_script",
+        "//lib:git_fs_lib",
+        "@crates//:async-trait",
+        "@crates//:base64",
+        "@crates//:bytes",
+        "@crates//:bytesize",
+        "@crates//:clap",
+        "@crates//:daemonize",
+        "@crates//:dirs",
+        "@crates//:fuser",
+        "@crates//:futures",
+        "@crates//:http",
+        "@crates//:inquire",
+        "@crates//:libc",
+        "@crates//:mesa-dev",
+        "@crates//:nix",
+        "@crates//:num-traits",
+        "@crates//:opentelemetry",
+        "@crates//:opentelemetry-otlp",
+        "@crates//:opentelemetry_sdk",
+        "@crates//:reqwest",
+        "@crates//:reqwest-middleware",
+        "@crates//:scc",
+        "@crates//:secrecy",
+        "@crates//:self_update",
+        "@crates//:semver",
+        "@crates//:serde",
+        "@crates//:serde_json",
+        "@crates//:serde_path_to_error",
+        "@crates//:shellexpand",
+        "@crates//:thiserror",
+        "@crates//:tokio",
+        "@crates//:toml",
+        "@crates//:tracing",
+        "@crates//:tracing-indicatif",
+        "@crates//:tracing-opentelemetry",
+        "@crates//:tracing-subscriber",
+    ],
+)
