@@ -142,6 +142,18 @@ impl DCache {
         children.get(name).cloned()
     }
 
+    /// Returns `true` if the directory at `parent_ino` has been fully
+    /// populated (i.e. [`finish_populate`](Self::finish_populate) completed
+    /// successfully and no eviction has since reset the flag).
+    #[must_use]
+    pub fn is_populated(&self, parent_ino: LoadedAddr) -> bool {
+        self.dirs
+            .read_sync(&parent_ino, |_, state| {
+                state.populated.load(Ordering::Acquire) == POPULATE_DONE
+            })
+            .unwrap_or(false)
+    }
+
     /// Atomically inserts or overwrites a child entry in the cache.
     ///
     /// Handles two kinds of stale-entry cleanup before the insert:

@@ -740,3 +740,62 @@ async fn evict_generation_bump_prevents_stale_finish_populate() {
         PopulateStatus::InProgress => panic!("unexpected InProgress"),
     }
 }
+
+#[tokio::test]
+async fn is_populated_returns_false_for_unknown_parent() {
+    let cache = DCache::new();
+    assert!(
+        !cache.is_populated(LoadedAddr::new_unchecked(1)),
+        "unknown parent should not be populated"
+    );
+}
+
+#[tokio::test]
+async fn is_populated_returns_false_before_finish_populate() {
+    let cache = DCache::new();
+    let parent = LoadedAddr::new_unchecked(1);
+    let PopulateStatus::Claimed(_gen) = cache.try_claim_populate(parent) else {
+        panic!("should claim");
+    };
+    assert!(
+        !cache.is_populated(parent),
+        "in-progress directory should not be populated"
+    );
+}
+
+#[tokio::test]
+async fn is_populated_returns_true_after_finish_populate() {
+    let cache = DCache::new();
+    let parent = LoadedAddr::new_unchecked(1);
+    let PopulateStatus::Claimed(claim_gen) = cache.try_claim_populate(parent) else {
+        panic!("should claim");
+    };
+    cache.finish_populate(parent, claim_gen);
+    assert!(
+        cache.is_populated(parent),
+        "directory should be populated after finish_populate"
+    );
+}
+
+#[tokio::test]
+async fn is_populated_returns_false_after_eviction() {
+    let cache = DCache::new();
+    let parent = LoadedAddr::new_unchecked(1);
+    cache.insert(
+        parent,
+        OsString::from("child"),
+        LoadedAddr::new_unchecked(10),
+        false,
+    );
+    let PopulateStatus::Claimed(claim_gen) = cache.try_claim_populate(parent) else {
+        panic!("should claim");
+    };
+    cache.finish_populate(parent, claim_gen);
+    assert!(cache.is_populated(parent));
+
+    cache.evict(LoadedAddr::new_unchecked(10));
+    assert!(
+        !cache.is_populated(parent),
+        "eviction should reset populated flag"
+    );
+}
