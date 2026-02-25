@@ -44,7 +44,7 @@ class BenchmarkResult:
 _REGISTRY: list[Callable[[BenchConfig], BenchmarkResult]] = []
 
 
-def bench(
+def bench(  # noqa: PLR0913
     prepare: Callable[..., Generator[Any]],
     *,
     setup: Callable[[BenchConfig], Generator[Any]] | None = None,
@@ -182,7 +182,7 @@ def git_bench(
             )
             yield dest
 
-    def prepare(config: BenchConfig, setup_ctx: Path) -> Generator[Path]:
+    def prepare(_config: BenchConfig, setup_ctx: Path) -> Generator[Path]:
         if flush_caches:
             flush_disk_caches()
         yield setup_ctx
@@ -229,7 +229,8 @@ def mesafs_bench(
     def prepare(config: BenchConfig) -> Generator[Path]:
         org_name, repo_name = repo.rsplit("/", maxsplit=1)
 
-        base_dir = Path(tempfile.gettempdir()) / f"bench-mesafs-{repo.replace('/', '-')}"
+        dir_name = f"bench-mesafs-{repo.replace('/', '-')}"
+        base_dir = Path(tempfile.gettempdir()) / dir_name
         if base_dir.exists():
             shutil.rmtree(base_dir)
         base_dir.mkdir()
