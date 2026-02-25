@@ -1,9 +1,22 @@
 [project]
-name = "git-fs-tests"
+name = "git-fs"
 version = "0.0.0"
 description = "Integration tests for git-fs (Rust/FUSE). Not a Python package."
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "click>=8.1",
+    "rich>=14",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bench"]
+
+[project.scripts]
+gitfs-bench = "bench.__main__:main"
 
 [dependency-groups]
 dev = [
@@ -40,6 +53,11 @@ ignore = [
     "S", # It's tests, no need for security
     "PLC0415", # RPyC teleport requires imports inside function body
 ]
+"bench/*" = [
+    "S",       # No security lint in benchmarks
+    "T201",    # Allow print()
+    "PLC0415", # Benchmark module imports inside function body
+]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -48,7 +66,7 @@ indent-style = "space"
 [tool.pyright]
 pythonVersion = "3.14"
 typeCheckingMode = "strict"
-include = ["tests"]
+include = ["tests", "bench"]
 reportMissingTypeStubs = false
 reportUnknownMemberType = false
 reportUnknownVariableType = false
