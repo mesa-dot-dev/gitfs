@@ -50,6 +50,7 @@ impl_fuse_reply!(
     fuser::ReplyOpen,
     fuser::ReplyData,
     fuser::ReplyWrite,
+    fuser::ReplyCreate,
 );
 
 /// Extension trait on `Result<T, std::io::Error>` for FUSE reply handling.
@@ -461,6 +462,40 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
             .fuse_reply(reply, |written, reply| {
                 debug!(bytes_written = written, "replying...");
                 reply.written(written);
+            });
+    }
+
+    #[instrument(
+        name = "FuserAdapter::create",
+        skip(self, _req, name, _mode, _umask, flags, reply)
+    )]
+    fn create(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        flags: i32,
+        reply: fuser::ReplyCreate,
+    ) {
+        let _ = flags; // flags are passed to open internally by AsyncFs::create
+        self.runtime
+            .block_on(async {
+                let (inode, open_file) = self
+                    .inner
+                    .get_fs()
+                    .create(LoadedAddr::new_unchecked(parent), name, 0o666)
+                    .await?;
+                self.inner.ward_inc(inode.addr);
+                let fh = open_file.fh;
+                self.open_files.insert(fh, Arc::clone(&open_file.reader));
+                Ok::<_, std::io::Error>((inode, fh))
+            })
+            .fuse_reply(reply, |(inode, fh), reply| {
+                let f_attr = inode_to_fuser_attr(&inode, BLOCK_SIZE);
+                debug!(?f_attr, handle = fh, "replying...");
+                reply.created(&Self::SHAMEFUL_TTL, &f_attr, 0, fh, 0);
             });
     }
 
