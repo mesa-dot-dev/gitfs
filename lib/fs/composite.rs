@@ -120,7 +120,7 @@ struct CompositeFsInner<R: CompositeRoot> {
     addr_to_slot: scc::HashMap<InodeAddr, usize>,
     /// Maps child name to slot index (for dedup on concurrent resolve).
     ///
-    /// `register_child` uses `entry_sync` on this map for per-name
+    /// `register_child` uses `entry_async` on this map for per-name
     /// exclusion, serializing concurrent registrations of the same child
     /// without a global lock. `forget` cleans up entries when a slot's
     /// bridge becomes empty.
@@ -242,31 +242,32 @@ impl<R: CompositeRoot> CompositeFs<R> {
     /// is returned. Otherwise a new slot is created with a fresh inode table
     /// and bridge mapping.
     ///
-    /// Uses `entry_sync` on `name_to_slot` for per-name exclusion:
+    /// Uses `entry_async` on `name_to_slot` for per-name exclusion:
     /// concurrent registrations of the same child are serialized by the
     /// `scc::HashMap` bucket lock, while different names proceed in
     /// parallel. `forget` may remove entries from `name_to_slot` when a
     /// slot's bridge becomes empty, but this is safe — outer inode addresses
     /// are monotonic and never reused,
     /// so `forget` cannot corrupt a replacement slot.
-    fn register_child(&self, desc: &ChildDescriptor<R::ChildDP>) -> InodeAddr
+    async fn register_child(&self, desc: &ChildDescriptor<R::ChildDP>) -> InodeAddr
     where
         R::ChildDP: Clone,
     {
-        match self.inner.name_to_slot.entry_sync(desc.name.clone()) {
+        match self.inner.name_to_slot.entry_async(desc.name.clone()).await {
             scc::hash_map::Entry::Occupied(mut occ) => {
                 let old_slot_idx = *occ.get();
                 let bridge = self
                     .inner
                     .slots
-                    .read_sync(&old_slot_idx, |_, slot| Arc::clone(&slot.bridge));
+                    .read_async(&old_slot_idx, |_, slot| Arc::clone(&slot.bridge))
+                    .await;
                 if let Some(outer) = bridge.and_then(|b| b.backward(desc.root_ino.addr)) {
                     return outer;
                 }
                 // Slot exists but bridge has no mapping — replace it.
                 let (outer_ino, new_slot_idx) = self.create_child_slot(desc);
                 *occ.get_mut() = new_slot_idx;
-                self.inner.slots.remove_sync(&old_slot_idx);
+                self.inner.slots.remove_async(&old_slot_idx).await;
                 outer_ino
             }
             scc::hash_map::Entry::Vacant(vac) => {
@@ -294,26 +295,28 @@ where
                 .await?
                 .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
-            let outer_ino = self.register_child(&desc);
+            let outer_ino = self.register_child(&desc).await;
             Ok(self.make_child_dir_inode(outer_ino))
         } else {
             let slot_idx = self
                 .inner
                 .addr_to_slot
-                .read_sync(&parent.addr, |_, &v| v)
+                .read_async(&parent.addr, |_, &v| v)
+                .await
                 .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
             // Extract Arc<ChildInner>, bridge, and inner parent address under the guard.
             let (child, bridge, inner_parent) = self
                 .inner
                 .slots
-                .read_sync(&slot_idx, |_, slot| {
+                .read_async(&slot_idx, |_, slot| {
                     (
                         Arc::clone(&slot.inner),
                         Arc::clone(&slot.bridge),
                         slot.bridge.forward(parent.addr),
                     )
                 })
+                .await
                 .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
             let inner_parent =
@@ -330,7 +333,11 @@ where
             let fallback = self.allocate_ino();
             let outer_ino = bridge.backward_or_insert(child_inode.addr, fallback);
 
-            let _ = self.inner.addr_to_slot.insert_sync(outer_ino, slot_idx);
+            let _ = self
+                .inner
+                .addr_to_slot
+                .insert_async(outer_ino, slot_idx)
+                .await;
 
             Ok(INode {
                 addr: outer_ino,
@@ -344,7 +351,7 @@ where
             let children = self.inner.root.list_children().await?;
             let mut entries = Vec::with_capacity(children.len());
             for desc in &children {
-                let outer_ino = self.register_child(desc);
+                let outer_ino = self.register_child(desc).await;
                 entries.push((desc.name.clone(), self.make_child_dir_inode(outer_ino)));
             }
             Ok(entries)
@@ -352,19 +359,21 @@ where
             let slot_idx = self
                 .inner
                 .addr_to_slot
-                .read_sync(&parent.addr, |_, &v| v)
+                .read_async(&parent.addr, |_, &v| v)
+                .await
                 .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
             let (child, bridge, inner_parent) = self
                 .inner
                 .slots
-                .read_sync(&slot_idx, |_, slot| {
+                .read_async(&slot_idx, |_, slot| {
                     (
                         Arc::clone(&slot.inner),
                         Arc::clone(&slot.bridge),
                         slot.bridge.forward(parent.addr),
                     )
                 })
+                .await
                 .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
             let inner_parent =
@@ -386,7 +395,11 @@ where
                 let fallback = self.allocate_ino();
                 let outer_ino = bridge.backward_or_insert(child_inode.addr, fallback);
 
-                let _ = self.inner.addr_to_slot.insert_sync(outer_ino, slot_idx);
+                let _ = self
+                    .inner
+                    .addr_to_slot
+                    .insert_async(outer_ino, slot_idx)
+                    .await;
                 entries.push((
                     name,
                     INode {
@@ -403,15 +416,17 @@ where
         let slot_idx = self
             .inner
             .addr_to_slot
-            .read_sync(&inode.addr, |_, &v| v)
+            .read_async(&inode.addr, |_, &v| v)
+            .await
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
         let (child, inner_ino) = self
             .inner
             .slots
-            .read_sync(&slot_idx, |_, slot| {
+            .read_async(&slot_idx, |_, slot| {
                 (Arc::clone(&slot.inner), slot.bridge.forward(inode.addr))
             })
+            .await
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
         let inner_ino = inner_ino.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
