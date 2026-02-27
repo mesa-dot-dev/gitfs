@@ -699,10 +699,16 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         let mut buf = if let Some(data) = existing {
             data.to_vec()
         } else {
+            let read_size: u32 = inode.size.try_into().unwrap_or_else(|_| {
+                tracing::error!(
+                    addr = addr.addr(),
+                    size = inode.size,
+                    "file size exceeds u32::MAX, read will be truncated"
+                );
+                u32::MAX
+            });
             let reader = self.data_provider.open(inode, OpenFlags::RDONLY).await?;
-            let data = reader
-                .read(0, inode.size.try_into().unwrap_or(u32::MAX))
-                .await?;
+            let data = reader.read(0, read_size).await?;
             data.to_vec()
         };
 
@@ -846,10 +852,16 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
                 data.to_vec()
             } else {
                 let bytes_to_read = new_size.min(inode.size);
+                let read_size: u32 = bytes_to_read.try_into().unwrap_or_else(|_| {
+                    tracing::error!(
+                        addr = addr.addr(),
+                        size = bytes_to_read,
+                        "file size exceeds u32::MAX, read will be truncated"
+                    );
+                    u32::MAX
+                });
                 let reader = self.data_provider.open(inode, OpenFlags::RDONLY).await?;
-                let data = reader
-                    .read(0, bytes_to_read.try_into().unwrap_or(u32::MAX))
-                    .await?;
+                let data = reader.read(0, read_size).await?;
                 data.to_vec()
             };
 
