@@ -18,7 +18,6 @@ pub enum ObserveError {
     #[error("failed to build gitignore matcher: {source}")]
     Build {
         /// Underlying build error from the `ignore` crate.
-        #[source]
         source: ignore::Error,
     },
 }
@@ -75,11 +74,11 @@ impl IgnoreTracker {
     /// otherwise.
     #[must_use]
     pub fn is_abspath_ignored(&self, path: &Path) -> bool {
+        let is_dir = path.is_dir();
         let inner = self
             .inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let is_dir = path.is_dir();
         inner
             .matcher
             .matched_path_or_any_parents(path, is_dir)
@@ -125,7 +124,9 @@ impl IgnoreTracker {
             .map_err(|e| ObserveError::Build { source: e })?;
 
         inner.matcher = matcher;
-        inner.observed_files.push(path.to_path_buf());
+        if !inner.observed_files.iter().any(|p| p == path) {
+            inner.observed_files.push(path.to_path_buf());
+        }
 
         Ok(())
     }
