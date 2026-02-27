@@ -618,6 +618,80 @@ async fn evict_skips_written_inode() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setattr_honors_explicit_mtime() {
+    let root = make_inode(1, INodeType::Directory, 0, None);
+    let file = make_inode(2, INodeType::File, 0, Some(1));
+
+    let state = MockFsState {
+        lookups: [((1, "test.txt".into()), file)].into_iter().collect(),
+        directories: [(1, vec![("test.txt".into(), file)])].into_iter().collect(),
+        file_contents: [(2, Bytes::from_static(b""))].into_iter().collect(),
+        ..MockFsState::default()
+    };
+    let provider = MockFsDataProvider::new(state);
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+
+    let _ = fs
+        .lookup(LoadedAddr::new_unchecked(1), "test.txt".as_ref())
+        .await
+        .unwrap();
+
+    let epoch_plus_1000 = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+    let inode = fs
+        .setattr(
+            LoadedAddr::new_unchecked(2),
+            None,
+            None,
+            Some(epoch_plus_1000),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        inode.last_modified_at, epoch_plus_1000,
+        "setattr must honor the explicit mtime, not overwrite with now()"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setattr_uses_atime_as_mtime_fallback() {
+    let root = make_inode(1, INodeType::Directory, 0, None);
+    let file = make_inode(2, INodeType::File, 0, Some(1));
+
+    let state = MockFsState {
+        lookups: [((1, "test.txt".into()), file)].into_iter().collect(),
+        directories: [(1, vec![("test.txt".into(), file)])].into_iter().collect(),
+        file_contents: [(2, Bytes::from_static(b""))].into_iter().collect(),
+        ..MockFsState::default()
+    };
+    let provider = MockFsDataProvider::new(state);
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+
+    let _ = fs
+        .lookup(LoadedAddr::new_unchecked(1), "test.txt".as_ref())
+        .await
+        .unwrap();
+
+    let epoch_plus_2000 = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2000);
+    let inode = fs
+        .setattr(
+            LoadedAddr::new_unchecked(2),
+            None,
+            Some(epoch_plus_2000),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        inode.last_modified_at, epoch_plus_2000,
+        "setattr must use atime as mtime when mtime is not provided"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn evict_removes_unwritten_inode() {
     let root = make_inode(1, INodeType::Directory, 0, None);
     let file = make_inode(2, INodeType::File, 10, Some(1));

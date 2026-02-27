@@ -767,9 +767,10 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
             inode.last_modified_at = t;
         } else if let Some(t) = atime {
             inode.last_modified_at = t;
+        } else if size.is_some() {
+            // Implicit mtime update: truncation modifies the file.
+            inode.last_modified_at = std::time::SystemTime::now();
         }
-
-        inode.last_modified_at = std::time::SystemTime::now();
         self.inode_table.insert_sync(addr.addr(), inode);
 
         Ok(inode)
