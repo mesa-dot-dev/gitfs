@@ -576,3 +576,72 @@ async fn setattr_truncate_to_zero() {
     let data = open.read(0, 1024).await.unwrap();
     assert!(data.is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evict_skips_written_inode() {
+    let root = make_inode(1, INodeType::Directory, 0, None);
+    let file = make_inode(2, INodeType::File, 0, Some(1));
+
+    let state = MockFsState {
+        lookups: [((1, "test.txt".into()), file)].into_iter().collect(),
+        directories: [(1, vec![("test.txt".into(), file)])].into_iter().collect(),
+        file_contents: [(2, Bytes::from_static(b""))].into_iter().collect(),
+        ..MockFsState::default()
+    };
+    let provider = MockFsDataProvider::new(state);
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+
+    let _ = fs
+        .lookup(LoadedAddr::new_unchecked(1), "test.txt".as_ref())
+        .await
+        .unwrap();
+
+    fs.write(
+        LoadedAddr::new_unchecked(2),
+        0,
+        Bytes::from_static(b"written data"),
+    )
+    .await
+    .unwrap();
+
+    // Evict the inode (simulates CompositeFs::forget path).
+    fs.evict(2);
+
+    assert!(
+        table.get(&2).await.is_some(),
+        "written inode must survive evict"
+    );
+
+    let inode = fs.getattr(LoadedAddr::new_unchecked(2)).await.unwrap();
+    assert_eq!(inode.size, 12);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evict_removes_unwritten_inode() {
+    let root = make_inode(1, INodeType::Directory, 0, None);
+    let file = make_inode(2, INodeType::File, 10, Some(1));
+
+    let state = MockFsState {
+        lookups: [((1, "test.txt".into()), file)].into_iter().collect(),
+        directories: [(1, vec![("test.txt".into(), file)])].into_iter().collect(),
+        file_contents: [(2, Bytes::from_static(b"original"))].into_iter().collect(),
+        ..MockFsState::default()
+    };
+    let provider = MockFsDataProvider::new(state);
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+
+    let _ = fs
+        .lookup(LoadedAddr::new_unchecked(1), "test.txt".as_ref())
+        .await
+        .unwrap();
+    assert!(table.get(&2).await.is_some());
+
+    fs.evict(2);
+
+    assert!(
+        table.get(&2).await.is_none(),
+        "unwritten inode should be evicted"
+    );
+}

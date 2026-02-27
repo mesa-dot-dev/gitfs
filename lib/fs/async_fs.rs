@@ -790,7 +790,14 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
     /// filesystem. Removes the inode from the table and calls
     /// [`FsDataProvider::forget`] so the provider can clean up auxiliary
     /// structures (path maps, etc.).
+    ///
+    /// Inodes that have locally-written data (present in `write_overlay`) are
+    /// skipped — they must persist for the lifetime of the mount, mirroring
+    /// the guard in [`InodeForget::delete`].
     pub fn evict(&self, addr: InodeAddr) {
+        if self.write_overlay.contains_sync(&addr) {
+            return;
+        }
         self.inode_table.remove_sync(&addr);
         self.directory_cache.evict(LoadedAddr::new_unchecked(addr));
         self.lookup_cache.evict_addr(addr);
