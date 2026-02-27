@@ -5,7 +5,6 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
     libfuse3-dev \
-    libgrpc++-dev \
     libprotobuf-dev \
     pkg-config \
     protobuf-compiler \
@@ -30,10 +29,6 @@ RUN apt-get update && apt-get install -y \
     findutils \
     fuse3 \
     git \
-    libgrpc++-dev \
-    libprotobuf-dev \
-    protobuf-compiler \
-    protobuf-compiler-grpc \
     && rm -rf /var/lib/apt/lists/*
 
 # Allow non-root users to mount FUSE filesystems
