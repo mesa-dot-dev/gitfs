@@ -663,6 +663,10 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
 
         // Merge with existing overlay content, or seed from provider on
         // first write so pre-existing data is not lost.
+        //
+        // TODO(MES-829): this copies the entire file on every write,
+        // making writes O(file_size). Switch to Arc<Mutex<Vec<u8>>> to
+        // mutate in place.
         let existing = self.write_overlay.get(&addr.addr()).await;
         let mut buf = if let Some(data) = existing {
             data.to_vec()
@@ -698,8 +702,15 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         updated.last_modified_at = std::time::SystemTime::now();
         self.inode_table.insert_sync(addr.addr(), updated);
 
-        // Notify the data provider (for logging / future forwarding).
-        drop(self.data_provider.write(inode, offset, data).await);
+        // Notify the data provider (fire-and-forget — the overlay is the
+        // source of truth for reads). Log failures so they are observable.
+        if let Err(e) = self.data_provider.write(inode, offset, data).await {
+            tracing::warn!(
+                addr = addr.addr(),
+                %e,
+                "data provider write failed (overlay is authoritative)"
+            );
+        }
 
         Ok(bytes_written)
     }
