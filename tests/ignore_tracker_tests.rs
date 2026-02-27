@@ -249,3 +249,47 @@ fn observe_nonexistent_file_returns_parse_error() {
     // Tracker should still have no rules after the failed observe.
     assert!(!tracker.is_abspath_ignored(&root.join("anything.txt")));
 }
+
+#[test]
+fn observe_file_picks_up_gitignore() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let gitignore = root.join(".gitignore");
+    {
+        let mut f = std::fs::File::create(&gitignore).unwrap();
+        writeln!(f, "*.log").unwrap();
+    }
+
+    let tracker = IgnoreTracker::new(root.clone());
+    assert!(tracker.observe_file(&gitignore).unwrap());
+    assert!(tracker.is_abspath_ignored(&root.join("debug.log")));
+}
+
+#[test]
+fn observe_file_picks_up_mesafs_ignore() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let mesafs_ignore = root.join(".mesafs-ignore");
+    {
+        let mut f = std::fs::File::create(&mesafs_ignore).unwrap();
+        writeln!(f, "*.tmp").unwrap();
+    }
+
+    let tracker = IgnoreTracker::new(root.clone());
+    assert!(tracker.observe_file(&mesafs_ignore).unwrap());
+    assert!(tracker.is_abspath_ignored(&root.join("scratch.tmp")));
+}
+
+#[test]
+fn observe_file_ignores_non_ignore_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let random_file = root.join("README.md");
+    std::fs::File::create(&random_file).unwrap();
+
+    let tracker = IgnoreTracker::new(root);
+    assert!(!tracker.observe_file(&random_file).unwrap());
+}

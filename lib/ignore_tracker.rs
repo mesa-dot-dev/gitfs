@@ -3,6 +3,9 @@ use std::sync::{Arc, RwLock};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
+/// File names recognized as ignore files by [`IgnoreTracker::observe_file`].
+const IGNORE_FILENAMES: &[&str] = &[".gitignore", ".mesafs-ignore"];
+
 /// Errors that can occur when observing a new ignore file.
 #[derive(Debug, thiserror::Error)]
 pub enum ObserveError {
@@ -29,6 +32,9 @@ struct IgnoreTrackerInner {
     /// Paths of all ignore files observed so far, kept to rebuild the matcher
     /// when a new file is added (the `ignore` crate's `Gitignore` is immutable
     /// once built).
+    // TODO(MES-822): consider a contiguous storage layout (e.g. a single
+    // buffer with offsets) if the number of observed files ever becomes large
+    // enough for the per-PathBuf heap allocations to matter.
     observed_files: Vec<PathBuf>,
 }
 
@@ -65,6 +71,30 @@ impl IgnoreTracker {
                 observed_files: Vec::new(),
             })),
         }
+    }
+
+    /// Observe an arbitrary file, incorporating it only if its name is
+    /// `.gitignore` or `.mesafs-ignore`.
+    ///
+    /// Returns `Ok(false)` immediately without acquiring any lock when the
+    /// file name does not match.  Returns `Ok(true)` when the file was
+    /// recognized and successfully observed.
+    ///
+    /// # Errors
+    ///
+    /// Forwards errors from [`Self::observe_ignorefile`] when the file is
+    /// an ignore file but cannot be loaded.
+    pub fn observe_file(&self, path: &Path) -> Result<bool, ObserveError> {
+        let is_ignore_file = path
+            .file_name()
+            .is_some_and(|name| IGNORE_FILENAMES.iter().any(|&f| name == f));
+
+        if !is_ignore_file {
+            return Ok(false);
+        }
+
+        self.observe_ignorefile(path)?;
+        Ok(true)
     }
 
     /// Test whether the given absolute path is ignored.
