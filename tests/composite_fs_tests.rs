@@ -520,3 +520,218 @@ async fn composite_concurrent_forget_and_lookup_preserves_name_mapping() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn composite_write_and_read_through_child() {
+    let (provider, root_ino) = make_child_provider(100, &[("file.txt", 101, INodeType::File, 20)]);
+
+    let mut children = HashMap::new();
+    children.insert(OsString::from("repo"), (provider, root_ino));
+
+    let mock_root = MockRoot::new(children);
+    let composite = CompositeFs::new(mock_root, (1000, 1000));
+    let root_inode = composite.make_root_inode();
+
+    let table = Arc::new(FutureBackedCache::default());
+    table.insert_sync(1, root_inode);
+    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table));
+
+    // Navigate to the file.
+    let child_dir = afs
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("repo"))
+        .await
+        .unwrap();
+    let file = afs
+        .lookup(
+            LoadedAddr::new_unchecked(child_dir.inode.addr),
+            OsStr::new("file.txt"),
+        )
+        .await
+        .unwrap();
+    let file_addr = file.inode.addr;
+
+    // Write through the composite layer. The payload must be at least as
+    // long as the original content ("content of file.txt", 19 bytes) so
+    // the assertion below is straightforward.
+    let written = afs
+        .write(
+            LoadedAddr::new_unchecked(file_addr),
+            0,
+            Bytes::from_static(b"completely new content!"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(written, 23);
+
+    // Read back through the composite layer.
+    let open = afs
+        .open(LoadedAddr::new_unchecked(file_addr), OpenFlags::RDONLY)
+        .await
+        .unwrap();
+    let data = open.read(0, 1024).await.unwrap();
+    assert_eq!(
+        &data[..],
+        b"completely new content!",
+        "write through composite should be readable"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn composite_create_file_in_child() {
+    let mut state = MockFsState::default();
+    state.directories.insert(100, vec![]);
+    state.next_addr = std::sync::atomic::AtomicU64::new(200);
+    let root_ino = make_inode(100, INodeType::Directory, 0, None);
+    let provider = MockFsDataProvider::new(state);
+
+    let mut children = HashMap::new();
+    children.insert(OsString::from("repo"), (provider, root_ino));
+
+    let mock_root = MockRoot::new(children);
+    let composite = CompositeFs::new(mock_root, (1000, 1000));
+    let root_inode = composite.make_root_inode();
+
+    let table = Arc::new(FutureBackedCache::default());
+    table.insert_sync(1, root_inode);
+    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table));
+
+    // Navigate to the child directory.
+    let child_dir = afs
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("repo"))
+        .await
+        .unwrap();
+    let child_addr = child_dir.inode.addr;
+
+    // Create a file inside the child.
+    let (created, open_file) = afs
+        .create(
+            LoadedAddr::new_unchecked(child_addr),
+            "newfile.txt".as_ref(),
+            0o644,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(created.itype, INodeType::File);
+    assert_eq!(created.size, 0);
+    assert!(open_file.fh > 0);
+
+    // Write to the created file and read it back.
+    afs.write(
+        LoadedAddr::new_unchecked(created.addr),
+        0,
+        Bytes::from_static(b"created content"),
+    )
+    .await
+    .unwrap();
+
+    let data = open_file.read(0, 1024).await.unwrap();
+    assert_eq!(
+        &data[..],
+        b"created content",
+        "should be able to write and read a file created through the composite layer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn composite_create_at_root_returns_erofs() {
+    let (provider, root_ino) = make_child_provider(100, &[]);
+
+    let mut children = HashMap::new();
+    children.insert(OsString::from("repo"), (provider, root_ino));
+
+    let mock_root = MockRoot::new(children);
+    let composite = CompositeFs::new(mock_root, (1000, 1000));
+    let root_inode = composite.make_root_inode();
+
+    let table = Arc::new(FutureBackedCache::default());
+    table.insert_sync(1, root_inode);
+    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table));
+
+    let err = afs
+        .create(LoadedAddr::new_unchecked(1), "nope.txt".as_ref(), 0o644)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::EROFS),
+        "creating at composite root should return EROFS"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn composite_write_at_root_returns_eisdir() {
+    let (provider, root_ino) = make_child_provider(100, &[]);
+
+    let mut children = HashMap::new();
+    children.insert(OsString::from("repo"), (provider, root_ino));
+
+    let mock_root = MockRoot::new(children);
+    let composite = CompositeFs::new(mock_root, (1000, 1000));
+    let root_inode = composite.make_root_inode();
+
+    let table = Arc::new(FutureBackedCache::default());
+    table.insert_sync(1, root_inode);
+    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table));
+
+    let err = afs
+        .write(LoadedAddr::new_unchecked(1), 0, Bytes::from_static(b"nope"))
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::EISDIR),
+        "writing to composite root (a directory) should return EISDIR"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn composite_forget_preserves_written_file() {
+    let (provider, root_ino) = make_child_provider(100, &[("file.txt", 101, INodeType::File, 20)]);
+
+    let mut children = HashMap::new();
+    children.insert(OsString::from("repo"), (provider, root_ino));
+
+    let mock_root = MockRoot::new(children);
+    let composite = CompositeFs::new(mock_root, (1000, 1000));
+    let root_inode = composite.make_root_inode();
+
+    let table = Arc::new(FutureBackedCache::default());
+    table.insert_sync(1, root_inode);
+    let afs = AsyncFs::new_preseeded(composite.clone(), Arc::clone(&table));
+
+    // Navigate to the file.
+    let child_dir = afs
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("repo"))
+        .await
+        .unwrap();
+    let file = afs
+        .lookup(
+            LoadedAddr::new_unchecked(child_dir.inode.addr),
+            OsStr::new("file.txt"),
+        )
+        .await
+        .unwrap();
+    let file_addr = file.inode.addr;
+
+    // Write to the file.
+    afs.write(
+        LoadedAddr::new_unchecked(file_addr),
+        0,
+        Bytes::from_static(b"written data"),
+    )
+    .await
+    .unwrap();
+
+    // Forget the file — should NOT evict because it was written to.
+    composite.forget(file_addr);
+
+    // The inode should still be accessible.
+    let inode = afs.getattr(LoadedAddr::new_unchecked(file_addr)).await;
+    assert!(
+        inode.is_ok(),
+        "written file should survive forget through composite layer"
+    );
+}
