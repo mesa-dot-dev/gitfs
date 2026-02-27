@@ -393,7 +393,10 @@ where
 
     /// Synchronously insert a value, overwriting any existing entry.
     ///
-    /// Suitable for seeding the cache before async operations begin.
+    /// Uses `entry_sync` rather than `scc::HashMap::insert_sync` because
+    /// the latter returns `Err((K, V))` on key collision without
+    /// overwriting. The `entry_sync` approach correctly handles both
+    /// occupied (overwrite) and vacant (fresh insert) cases.
     pub fn insert_sync(&self, key: K, value: V) {
         match self.map.entry_sync(key) {
             scc::hash_map::Entry::Occupied(mut occ) => {
