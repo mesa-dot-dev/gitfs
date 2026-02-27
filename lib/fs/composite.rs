@@ -429,6 +429,53 @@ where
         })
     }
 
+    async fn create(
+        &self,
+        parent: INode,
+        name: &OsStr,
+        mode: u32,
+    ) -> Result<INode, std::io::Error> {
+        if parent.addr == ROOT_INO {
+            return Err(std::io::Error::from_raw_os_error(libc::EROFS));
+        }
+
+        let slot_idx = self
+            .inner
+            .addr_to_slot
+            .read_sync(&parent.addr, |_, &v| v)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        let (child, bridge, inner_parent) = self
+            .inner
+            .slots
+            .read_sync(&slot_idx, |_, slot| {
+                (
+                    Arc::clone(&slot.inner),
+                    Arc::clone(&slot.bridge),
+                    slot.bridge.forward(parent.addr),
+                )
+            })
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        let inner_parent =
+            inner_parent.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        let child_inode = child
+            .get_fs()
+            .create(LoadedAddr::new_unchecked(inner_parent), name, mode)
+            .await?
+            .0;
+
+        let fallback = self.allocate_ino();
+        let outer_ino = bridge.backward_or_insert(child_inode.addr, fallback);
+        let _ = self.inner.addr_to_slot.insert_sync(outer_ino, slot_idx);
+
+        Ok(INode {
+            addr: outer_ino,
+            ..child_inode
+        })
+    }
+
     async fn write(&self, inode: INode, offset: u64, data: Bytes) -> Result<u32, std::io::Error> {
         if inode.addr == ROOT_INO {
             return Err(std::io::Error::from_raw_os_error(libc::EROFS));
