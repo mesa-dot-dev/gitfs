@@ -145,6 +145,14 @@ fn inode_type_to_fuser(itype: INodeType) -> fuser::FileType {
     }
 }
 
+/// Convert a fuser `TimeOrNow` to a `SystemTime`.
+fn resolve_fuser_time(t: fuser::TimeOrNow) -> std::time::SystemTime {
+    match t {
+        fuser::TimeOrNow::SpecificTime(t) => t,
+        fuser::TimeOrNow::Now => std::time::SystemTime::now(),
+    }
+}
+
 const BLOCK_SIZE: u32 = 4096;
 
 /// Snapshot of a directory listing created by `opendir`.
@@ -252,7 +260,7 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
     #[instrument(
         name = "FuserAdapter::setattr",
         skip(
-            self, _req, _mode, _uid, _gid, size, _atime, _mtime, _ctime, _fh, _crtime, _chgtime,
+            self, _req, _mode, _uid, _gid, size, atime, mtime, _ctime, _fh, _crtime, _chgtime,
             _bkuptime, _flags, reply
         )
     )]
@@ -264,8 +272,8 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
         _uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<std::time::SystemTime>,
         _fh: Option<u64>,
         _crtime: Option<std::time::SystemTime>,
@@ -274,11 +282,18 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
         _flags: Option<u32>,
         reply: fuser::ReplyAttr,
     ) {
+        let new_atime = atime.map(resolve_fuser_time);
+        let new_mtime = mtime.map(resolve_fuser_time);
         self.runtime
             .block_on(async {
                 self.inner
                     .get_fs()
-                    .setattr(LoadedAddr::new_unchecked(ino), size, None, None)
+                    .setattr(
+                        LoadedAddr::new_unchecked(ino),
+                        size,
+                        new_atime,
+                        new_mtime,
+                    )
                     .await
             })
             .fuse_reply(reply, |inode, reply| {
