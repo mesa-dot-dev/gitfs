@@ -85,38 +85,73 @@ impl IgnoreTracker {
             .is_ignore()
     }
 
-    /// Observe a new gitignore file and incorporate its rules.
+    /// Observe a gitignore file and incorporate its rules.
     ///
-    /// Rebuilds the internal matcher from all previously observed files plus
-    /// the new one. The `path` should point to a `.gitignore` file on disk.
+    /// If the file has not been observed before, it is added to the tracked
+    /// set.  If it has already been observed, its content is reloaded from
+    /// disk (picking up any changes).  The internal matcher is rebuilt in
+    /// either case.
     ///
     /// # Errors
     ///
-    /// Returns [`ObserveError::Parse`] if the file cannot be read/parsed, or
-    /// [`ObserveError::Build`] if the rebuilt matcher fails to compile.
+    /// Returns [`ObserveError::Parse`] if a newly observed file cannot be
+    /// read, or [`ObserveError::Build`] if the rebuilt matcher fails to compile.
     pub fn observe_ignorefile(&self, path: &Path) -> Result<(), ObserveError> {
         let mut inner = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Rebuild from scratch: GitignoreBuilder produces an immutable Gitignore,
-        // so we replay all previously observed files plus the new one.
-        let mut builder = GitignoreBuilder::new(&self.root);
+        let is_new = !inner.observed_files.iter().any(|p| p == path);
 
-        // Replay existing files.
-        for existing in &inner.observed_files {
-            if let Some(err) = builder.add(existing) {
-                tracing::warn!(?existing, %err, "re-adding previously observed ignore file produced a warning");
+        if is_new {
+            // Validate the file is readable before committing to track it.
+            let mut probe = GitignoreBuilder::new(&self.root);
+            if let Some(err) = probe.add(path) {
+                return Err(ObserveError::Parse {
+                    path: path.to_path_buf(),
+                    source: err,
+                });
             }
+            inner.observed_files.push(path.to_path_buf());
         }
 
-        // Add the new file.
-        if let Some(err) = builder.add(path) {
-            return Err(ObserveError::Parse {
-                path: path.to_path_buf(),
-                source: err,
-            });
+        Self::rebuild_matcher(&self.root, &mut inner)
+    }
+
+    /// Forget a previously observed gitignore file and remove its rules.
+    ///
+    /// If the file was not previously observed, this is a no-op.  Otherwise,
+    /// the file is removed from the tracked set and the matcher is rebuilt
+    /// from the remaining files.
+    pub fn forget_ignorefile(&self, path: &Path) {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let before = inner.observed_files.len();
+        inner.observed_files.retain(|p| p != path);
+
+        if inner.observed_files.len() == before {
+            return;
+        }
+
+        if let Err(e) = Self::rebuild_matcher(&self.root, &mut inner) {
+            tracing::warn!(%e, "rebuild after forget_ignorefile failed");
+        }
+    }
+
+    /// Rebuild the matcher from all files currently in `observed_files`.
+    ///
+    /// Must be called while holding the write lock (caller passes `&mut inner`).
+    fn rebuild_matcher(root: &Path, inner: &mut IgnoreTrackerInner) -> Result<(), ObserveError> {
+        let mut builder = GitignoreBuilder::new(root);
+
+        for existing in &inner.observed_files {
+            if let Some(err) = builder.add(existing) {
+                tracing::warn!(?existing, %err, "re-adding observed ignore file produced a warning");
+            }
         }
 
         let matcher = builder
@@ -124,10 +159,6 @@ impl IgnoreTracker {
             .map_err(|e| ObserveError::Build { source: e })?;
 
         inner.matcher = matcher;
-        if !inner.observed_files.iter().any(|p| p == path) {
-            inner.observed_files.push(path.to_path_buf());
-        }
-
         Ok(())
     }
 }

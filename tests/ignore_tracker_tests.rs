@@ -120,6 +120,115 @@ fn concurrent_reads_and_writes() {
 }
 
 #[test]
+fn observe_ignorefile_reloads_changed_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let gitignore_path = root.join(".gitignore");
+    {
+        let mut f = std::fs::File::create(&gitignore_path).unwrap();
+        writeln!(f, "*.log").unwrap();
+    }
+
+    let tracker = IgnoreTracker::new(root.clone());
+    tracker.observe_ignorefile(&gitignore_path).unwrap();
+
+    assert!(tracker.is_abspath_ignored(&root.join("debug.log")));
+    assert!(!tracker.is_abspath_ignored(&root.join("debug.tmp")));
+
+    // Change the gitignore content on disk.
+    {
+        let mut f = std::fs::File::create(&gitignore_path).unwrap();
+        writeln!(f, "*.tmp").unwrap();
+    }
+
+    // Re-observe — should pick up new content.
+    tracker.observe_ignorefile(&gitignore_path).unwrap();
+
+    // *.tmp should now be ignored, *.log should NOT (old rule replaced).
+    assert!(tracker.is_abspath_ignored(&root.join("debug.tmp")));
+    assert!(!tracker.is_abspath_ignored(&root.join("debug.log")));
+}
+
+#[test]
+fn forget_ignorefile_removes_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let gitignore_path = root.join(".gitignore");
+    {
+        let mut f = std::fs::File::create(&gitignore_path).unwrap();
+        writeln!(f, "*.log").unwrap();
+    }
+
+    let tracker = IgnoreTracker::new(root.clone());
+    tracker.observe_ignorefile(&gitignore_path).unwrap();
+
+    assert!(tracker.is_abspath_ignored(&root.join("debug.log")));
+
+    tracker.forget_ignorefile(&gitignore_path);
+
+    assert!(
+        !tracker.is_abspath_ignored(&root.join("debug.log")),
+        "after forget, *.log should no longer be ignored"
+    );
+}
+
+#[test]
+fn forget_ignorefile_only_removes_target_file_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let root_ignore = root.join(".gitignore");
+    {
+        let mut f = std::fs::File::create(&root_ignore).unwrap();
+        writeln!(f, "*.log").unwrap();
+    }
+
+    let sub_dir = root.join("subdir");
+    std::fs::create_dir_all(&sub_dir).unwrap();
+    let sub_ignore = sub_dir.join(".gitignore");
+    {
+        let mut f = std::fs::File::create(&sub_ignore).unwrap();
+        writeln!(f, "*.tmp").unwrap();
+    }
+
+    let tracker = IgnoreTracker::new(root.clone());
+    tracker.observe_ignorefile(&root_ignore).unwrap();
+    tracker.observe_ignorefile(&sub_ignore).unwrap();
+
+    assert!(tracker.is_abspath_ignored(&root.join("debug.log")));
+    assert!(tracker.is_abspath_ignored(&root.join("subdir/scratch.tmp")));
+
+    tracker.forget_ignorefile(&sub_ignore);
+
+    assert!(tracker.is_abspath_ignored(&root.join("debug.log")));
+    assert!(
+        !tracker.is_abspath_ignored(&root.join("subdir/scratch.tmp")),
+        "after forgetting subdir .gitignore, *.tmp should not be ignored"
+    );
+}
+
+#[test]
+fn forget_unobserved_file_is_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let gitignore_path = root.join(".gitignore");
+    {
+        let mut f = std::fs::File::create(&gitignore_path).unwrap();
+        writeln!(f, "*.log").unwrap();
+    }
+
+    let tracker = IgnoreTracker::new(root.clone());
+    tracker.observe_ignorefile(&gitignore_path).unwrap();
+
+    tracker.forget_ignorefile(&root.join("nonexistent/.gitignore"));
+
+    assert!(tracker.is_abspath_ignored(&root.join("debug.log")));
+}
+
+#[test]
 fn observe_nonexistent_file_returns_parse_error() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
