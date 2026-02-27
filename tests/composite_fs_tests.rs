@@ -735,3 +735,112 @@ async fn composite_forget_preserves_written_file() {
         "written file should survive forget through composite layer"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn composite_setattr_truncate_through_child() {
+    let (provider, root_ino) = make_child_provider(100, &[("file.txt", 101, INodeType::File, 20)]);
+
+    let mut children = HashMap::new();
+    children.insert(OsString::from("repo"), (provider, root_ino));
+
+    let mock_root = MockRoot::new(children);
+    let composite = CompositeFs::new(mock_root, (1000, 1000));
+    let root_inode = composite.make_root_inode();
+
+    let table = Arc::new(FutureBackedCache::default());
+    table.insert_sync(1, root_inode);
+    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table));
+
+    // Navigate to the file.
+    let child_dir = afs
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("repo"))
+        .await
+        .unwrap();
+    let file = afs
+        .lookup(
+            LoadedAddr::new_unchecked(child_dir.inode.addr),
+            OsStr::new("file.txt"),
+        )
+        .await
+        .unwrap();
+    let file_addr = file.inode.addr;
+
+    // Write through the composite layer.
+    afs.write(
+        LoadedAddr::new_unchecked(file_addr),
+        0,
+        Bytes::from_static(b"hello world"),
+    )
+    .await
+    .unwrap();
+
+    // Truncate to 5 bytes via setattr through the composite layer.
+    let inode = afs
+        .setattr(LoadedAddr::new_unchecked(file_addr), Some(5), None, None)
+        .await
+        .unwrap();
+    assert_eq!(inode.size, 5);
+
+    // Read back — should return "hello".
+    let open = afs
+        .open(LoadedAddr::new_unchecked(file_addr), OpenFlags::RDONLY)
+        .await
+        .unwrap();
+    let data = open.read(0, 1024).await.unwrap();
+    assert_eq!(
+        &data[..],
+        b"hello",
+        "setattr truncation through composite should preserve content up to new_size"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn composite_write_at_offset_preserves_provider_content() {
+    let (provider, root_ino) = make_child_provider(100, &[("file.txt", 101, INodeType::File, 20)]);
+
+    let mut children = HashMap::new();
+    children.insert(OsString::from("repo"), (provider, root_ino));
+
+    let mock_root = MockRoot::new(children);
+    let composite = CompositeFs::new(mock_root, (1000, 1000));
+    let root_inode = composite.make_root_inode();
+
+    let table = Arc::new(FutureBackedCache::default());
+    table.insert_sync(1, root_inode);
+    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table));
+
+    // Navigate to the file.
+    let child_dir = afs
+        .lookup(LoadedAddr::new_unchecked(1), OsStr::new("repo"))
+        .await
+        .unwrap();
+    let file = afs
+        .lookup(
+            LoadedAddr::new_unchecked(child_dir.inode.addr),
+            OsStr::new("file.txt"),
+        )
+        .await
+        .unwrap();
+    let file_addr = file.inode.addr;
+
+    // First write at an offset — should preserve provider content before the offset.
+    // Provider content is "content of file.txt" (19 bytes).
+    afs.write(
+        LoadedAddr::new_unchecked(file_addr),
+        11,
+        Bytes::from_static(b"REPLACED"),
+    )
+    .await
+    .unwrap();
+
+    let open = afs
+        .open(LoadedAddr::new_unchecked(file_addr), OpenFlags::RDONLY)
+        .await
+        .unwrap();
+    let data = open.read(0, 1024).await.unwrap();
+    assert_eq!(
+        &data[..],
+        b"content of REPLACED",
+        "first write at offset through composite must preserve existing provider content"
+    );
+}

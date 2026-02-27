@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::cache::async_backed::FutureBackedCache;
 use crate::drop_ward::StatelessDrop;
@@ -94,6 +94,20 @@ pub trait FsDataProvider: Clone + Send + Sync + 'static {
         _offset: u64,
         _data: Bytes,
     ) -> impl Future<Output = Result<u32, std::io::Error>> + Send {
+        async { Err(std::io::Error::from_raw_os_error(libc::EROFS)) }
+    }
+
+    /// Update file attributes (size, timestamps).
+    ///
+    /// The default implementation returns `EROFS` (read-only filesystem).
+    /// Providers that support attribute changes should override this.
+    fn setattr(
+        &self,
+        _inode: INode,
+        _size: Option<u64>,
+        _atime: Option<std::time::SystemTime>,
+        _mtime: Option<std::time::SystemTime>,
+    ) -> impl Future<Output = Result<INode, std::io::Error>> + Send {
         async { Err(std::io::Error::from_raw_os_error(libc::EROFS)) }
     }
 
@@ -414,6 +428,11 @@ pub struct AsyncFs<DP: FsDataProvider> {
     /// entries are never evicted by `InodeForget` — they persist for the
     /// lifetime of the mount.
     write_overlay: Arc<FutureBackedCache<InodeAddr, Bytes>>,
+
+    /// Per-inode write locks serializing the non-atomic read-modify-write
+    /// on `write_overlay` in [`write`](Self::write) and
+    /// [`setattr`](Self::setattr).
+    write_locks: Arc<scc::HashMap<InodeAddr, Arc<Mutex<()>>>>,
 }
 
 impl<DP: FsDataProvider> AsyncFs<DP> {
@@ -435,6 +454,7 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
             next_fh: AtomicU64::new(1),
             prefetch_semaphore: Arc::new(Semaphore::new(MAX_PREFETCH_CONCURRENCY)),
             write_overlay: Arc::new(FutureBackedCache::default()),
+            write_locks: Arc::new(scc::HashMap::new()),
         }
     }
 
@@ -455,6 +475,7 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
             next_fh: AtomicU64::new(1),
             prefetch_semaphore: Arc::new(Semaphore::new(MAX_PREFETCH_CONCURRENCY)),
             write_overlay: Arc::new(FutureBackedCache::default()),
+            write_locks: Arc::new(scc::HashMap::new()),
         }
     }
 
@@ -632,18 +653,21 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         })
     }
 
+    /// Acquire (or lazily create) the per-inode write lock.
+    async fn inode_write_lock(&self, addr: InodeAddr) -> Arc<Mutex<()>> {
+        let entry = self
+            .write_locks
+            .entry_async(addr)
+            .await
+            .or_insert_with(|| Arc::new(Mutex::new(())));
+        Arc::clone(entry.get())
+    }
+
     /// Write data to a file at the given offset.
     ///
     /// Stores the result in the write overlay cache. The overlay takes
     /// precedence over the data provider on subsequent reads. Also calls
     /// [`FsDataProvider::write`] so the provider can log or forward as needed.
-    ///
-    /// # Serialization requirement
-    ///
-    /// The read-modify-write on the overlay (`get` then `insert_sync`) is
-    /// **not** atomic. Callers must ensure that concurrent writes to the
-    /// same inode are serialized externally. The [`FuserAdapter`] guarantees
-    /// this via `&mut self` on all FUSE callbacks.
     pub async fn write(
         &self,
         addr: LoadedAddr,
@@ -660,6 +684,10 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
             reason = "data.len() fits in u32 (FUSE writes are at most 128 KiB)"
         )]
         let bytes_written = data.len() as u32;
+
+        // Acquire per-inode lock to serialize the read-modify-write on the overlay.
+        let lock = self.inode_write_lock(addr.addr()).await;
+        let guard = lock.lock().await;
 
         // Merge with existing overlay content, or seed from provider on
         // first write so pre-existing data is not lost.
@@ -702,10 +730,13 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         updated.last_modified_at = std::time::SystemTime::now();
         self.inode_table.insert_sync(addr.addr(), updated);
 
+        // Release the lock before the provider call (fire-and-forget).
+        drop(guard);
+
         // Notify the data provider (fire-and-forget — the overlay is the
         // source of truth for reads). Log failures so they are observable.
-        if let Err(e) = self.data_provider.write(inode, offset, data).await {
-            tracing::warn!(
+        if let Err(e) = self.data_provider.write(updated, offset, data).await {
+            tracing::debug!(
                 addr = addr.addr(),
                 %e,
                 "data provider write failed (overlay is authoritative)"
@@ -715,17 +746,18 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         Ok(bytes_written)
     }
 
-    /// Create a new empty file in the given parent directory.
+    /// Create a new empty file without opening it.
     ///
-    /// Allocates a new inode, inserts it into the inode table and directory
-    /// cache, initializes an empty write overlay entry, and returns the
-    /// inode along with an open file handle.
-    pub async fn create(
+    /// Performs all the metadata work of [`create`](Self::create) — provider
+    /// call, inode table insert, directory cache insert, overlay init — but
+    /// skips the `open()` step. Used by [`CompositeFs`] to avoid a
+    /// redundant double-open.
+    pub async fn create_metadata(
         &self,
         parent: LoadedAddr,
         name: &OsStr,
         mode: u32,
-    ) -> Result<(INode, OpenFile<OverlayReader<DP::Reader>>), std::io::Error> {
+    ) -> Result<INode, std::io::Error> {
         let parent_inode = self.loaded_inode(parent).await?;
         if parent_inode.itype != INodeType::Directory {
             return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
@@ -750,6 +782,22 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         // Initialize empty overlay entry so reads return empty, not 404.
         self.write_overlay.insert_sync(child.addr, Bytes::new());
 
+        Ok(child)
+    }
+
+    /// Create a new empty file in the given parent directory.
+    ///
+    /// Allocates a new inode, inserts it into the inode table and directory
+    /// cache, initializes an empty write overlay entry, and returns the
+    /// inode along with an open file handle.
+    pub async fn create(
+        &self,
+        parent: LoadedAddr,
+        name: &OsStr,
+        mode: u32,
+    ) -> Result<(INode, OpenFile<OverlayReader<DP::Reader>>), std::io::Error> {
+        let child = self.create_metadata(parent, name, mode).await?;
+
         // Open the file for the caller.
         let open_file = self
             .open(LoadedAddr::new_unchecked(child.addr), OpenFlags::RDWR)
@@ -766,12 +814,6 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
     /// - `atime`: Accepted but stored as mtime (we don't track atime separately).
     ///
     /// Returns the updated inode.
-    ///
-    /// # Serialization requirement
-    ///
-    /// When `size` is provided, the overlay read-modify-write is **not**
-    /// atomic. The same serialization constraint as [`write`](Self::write)
-    /// applies.
     pub async fn setattr(
         &self,
         addr: LoadedAddr,
@@ -782,6 +824,10 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         let mut inode = self.loaded_inode(addr).await?;
 
         if let Some(new_size) = size {
+            // Acquire per-inode lock to serialize the read-modify-write on the overlay.
+            let lock = self.inode_write_lock(addr.addr()).await;
+            let _guard = lock.lock().await;
+
             #[expect(
                 clippy::cast_possible_truncation,
                 reason = "new_size fits in usize on supported 64-bit platforms"
@@ -822,6 +868,16 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
             inode.last_modified_at = std::time::SystemTime::now();
         }
         self.inode_table.insert_sync(addr.addr(), inode);
+
+        // Notify the data provider (fire-and-forget — the overlay is
+        // authoritative). Log failures so they are observable.
+        if let Err(e) = self.data_provider.setattr(inode, size, atime, mtime).await {
+            tracing::debug!(
+                addr = addr.addr(),
+                %e,
+                "data provider setattr failed (overlay is authoritative)"
+            );
+        }
 
         Ok(inode)
     }

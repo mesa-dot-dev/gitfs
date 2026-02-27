@@ -460,15 +460,12 @@ where
         let inner_parent =
             inner_parent.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
-        // The inner `AsyncFs::create` returns `(INode, OpenFile)` but only the
-        // inode is needed here. The trait `FsDataProvider::create` returns just
-        // `INode`; the outer `AsyncFs::create` opens its own file handle via a
-        // separate `self.open()` call. The inner `OpenFile` is dropped safely.
+        // Use `create_metadata` to avoid a redundant inner open: the outer
+        // `AsyncFs::create` will open its own file handle via `self.open()`.
         let child_inode = child
             .get_fs()
-            .create(LoadedAddr::new_unchecked(inner_parent), name, mode)
-            .await?
-            .0;
+            .create_metadata(LoadedAddr::new_unchecked(inner_parent), name, mode)
+            .await?;
 
         let fallback = self.allocate_ino();
         let outer_ino = bridge.backward_or_insert(child_inode.addr, fallback);
@@ -477,6 +474,45 @@ where
         Ok(INode {
             addr: outer_ino,
             ..child_inode
+        })
+    }
+
+    async fn setattr(
+        &self,
+        inode: INode,
+        size: Option<u64>,
+        atime: Option<std::time::SystemTime>,
+        mtime: Option<std::time::SystemTime>,
+    ) -> Result<INode, std::io::Error> {
+        if inode.addr == ROOT_INO {
+            return Err(std::io::Error::from_raw_os_error(libc::EROFS));
+        }
+
+        let slot_idx = self
+            .inner
+            .addr_to_slot
+            .read_sync(&inode.addr, |_, &v| v)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        let (child, inner_addr) = self
+            .inner
+            .slots
+            .read_sync(&slot_idx, |_, slot| {
+                (Arc::clone(&slot.inner), slot.bridge.forward(inode.addr))
+            })
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        let inner_addr =
+            inner_addr.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        let inner_result = child
+            .get_fs()
+            .setattr(LoadedAddr::new_unchecked(inner_addr), size, atime, mtime)
+            .await?;
+
+        Ok(INode {
+            addr: inode.addr,
+            ..inner_result
         })
     }
 
@@ -502,6 +538,8 @@ where
         let inner_addr =
             inner_addr.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
+        // TODO(MES-832): this stores full content in both the inner and
+        // outer overlays; the inner copy is never read.
         child
             .get_fs()
             .write(LoadedAddr::new_unchecked(inner_addr), offset, data)

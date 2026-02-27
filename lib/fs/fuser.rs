@@ -170,6 +170,13 @@ enum DirSnapshot {
 /// Owns a self-referential inode table + ward + [`AsyncFs`](super::async_fs::AsyncFs),
 /// plus an open-file map, a directory-handle map, and a tokio runtime handle
 /// for blocking on async ops.
+///
+/// # Threading model
+///
+/// `fuser` 0.16 dispatches all [`Filesystem`](fuser::Filesystem) callbacks
+/// on a single thread, so `&mut self` naturally serializes them. However,
+/// [`AsyncFs`] protects write-overlay mutations with per-inode locks
+/// internally, so correctness does **not** rely on single-threaded dispatch.
 pub struct FuserAdapter<DP: FsDataProvider> {
     inner: FuseBridgeInner<DP>,
     open_files: HashMap<FileHandle, Arc<OverlayReader<DP::Reader>>>,
@@ -471,7 +478,7 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
         skip(
             self,
             _req,
-            _ino,
+            ino,
             fh,
             offset,
             data,
@@ -484,7 +491,7 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
     fn write(
         &mut self,
         _req: &fuser::Request<'_>,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         offset: i64,
         data: &[u8],
@@ -498,6 +505,10 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
             return;
         };
         let addr = reader.addr;
+        debug_assert_eq!(
+            addr, ino,
+            "write: OverlayReader addr {addr} does not match fuser ino {ino}"
+        );
         let data = Bytes::from(data.to_vec());
 
         self.runtime
