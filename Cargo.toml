@@ -15,7 +15,7 @@ clap = { version = "4.5.54", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 fuser = { version = "0.16.0", features = ["libfuse"] }
 libc = "0.2"
-mesa-dev = "1.18.0"
+mesa-dev = "1.22.0"
 num-traits = "0.2"
 http = "1"
 reqwest = { version = "0.12", default-features = false }
