@@ -78,7 +78,7 @@ mod managed_fuse {
             let fuse_adapter = FuserAdapter::new(table, composite, handle);
             let mount_opts = [
                 fuser::MountOption::FSName("git-fs".to_owned()),
-                fuser::MountOption::RO,
+                fuser::MountOption::RW,
                 fuser::MountOption::NoDev,
                 fuser::MountOption::Exec,
                 fuser::MountOption::AutoUnmount,
