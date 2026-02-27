@@ -282,8 +282,6 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
         _flags: Option<u32>,
         reply: fuser::ReplyAttr,
     ) {
-        let new_atime = atime.map(resolve_fuser_time);
-        let new_mtime = mtime.map(resolve_fuser_time);
         self.runtime
             .block_on(async {
                 self.inner
@@ -291,8 +289,8 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
                     .setattr(
                         LoadedAddr::new_unchecked(ino),
                         size,
-                        new_atime,
-                        new_mtime,
+                        atime.map(resolve_fuser_time),
+                        mtime.map(resolve_fuser_time),
                     )
                     .await
             })

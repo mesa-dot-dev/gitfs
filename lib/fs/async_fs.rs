@@ -637,6 +637,13 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
     /// Stores the result in the write overlay cache. The overlay takes
     /// precedence over the data provider on subsequent reads. Also calls
     /// [`FsDataProvider::write`] so the provider can log or forward as needed.
+    ///
+    /// # Serialization requirement
+    ///
+    /// The read-modify-write on the overlay (`get` then `insert_sync`) is
+    /// **not** atomic. Callers must ensure that concurrent writes to the
+    /// same inode are serialized externally. The [`FuserAdapter`] guarantees
+    /// this via `&mut self` on all FUSE callbacks.
     pub async fn write(
         &self,
         addr: LoadedAddr,
@@ -739,6 +746,12 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
     /// - `atime`: Accepted but stored as mtime (we don't track atime separately).
     ///
     /// Returns the updated inode.
+    ///
+    /// # Serialization requirement
+    ///
+    /// When `size` is provided, the overlay read-modify-write is **not**
+    /// atomic. The same serialization constraint as [`write`](Self::write)
+    /// applies.
     pub async fn setattr(
         &self,
         addr: LoadedAddr,
