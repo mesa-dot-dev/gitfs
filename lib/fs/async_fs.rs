@@ -661,9 +661,18 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         )]
         let bytes_written = data.len() as u32;
 
-        // Merge with existing overlay content, if any.
+        // Merge with existing overlay content, or seed from provider on
+        // first write so pre-existing data is not lost.
         let existing = self.write_overlay.get(&addr.addr()).await;
-        let mut buf = existing.map_or_else(Vec::new, |b| b.to_vec());
+        let mut buf = if let Some(data) = existing {
+            data.to_vec()
+        } else {
+            let reader = self.data_provider.open(inode, OpenFlags::RDONLY).await?;
+            let data = reader
+                .read(0, inode.size.try_into().unwrap_or(u32::MAX))
+                .await?;
+            data.to_vec()
+        };
 
         #[expect(
             clippy::cast_possible_truncation,
