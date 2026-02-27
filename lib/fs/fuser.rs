@@ -519,25 +519,26 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
 
     #[instrument(
         name = "FuserAdapter::create",
-        skip(self, _req, name, _mode, _umask, flags, reply)
+        skip(self, _req, name, mode, umask, flags, reply)
     )]
     fn create(
         &mut self,
         _req: &fuser::Request<'_>,
         parent: u64,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         flags: i32,
         reply: fuser::ReplyCreate,
     ) {
         let _ = flags; // flags are passed to open internally by AsyncFs::create
+        let effective_mode = mode & !umask;
         self.runtime
             .block_on(async {
                 let (inode, open_file) = self
                     .inner
                     .get_fs()
-                    .create(LoadedAddr::new_unchecked(parent), name, 0o666)
+                    .create(LoadedAddr::new_unchecked(parent), name, effective_mode)
                     .await?;
                 self.inner.ward_inc(inode.addr);
                 let fh = open_file.fh;
