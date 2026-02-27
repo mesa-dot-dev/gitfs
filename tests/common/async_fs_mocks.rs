@@ -2,13 +2,22 @@
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use bytes::Bytes;
 
+use tokio::sync::Mutex;
+
 use git_fs::fs::async_fs::{FileReader, FsDataProvider};
-use git_fs::fs::{INode, INodeType, InodePerms, OpenFlags};
+use git_fs::fs::dcache::DCache;
+use git_fs::fs::{INode, INodeType, InodeAddr, InodePerms, OpenFlags};
+
+/// Create a default `Arc<DCache>` rooted at `/` for test use.
+pub fn make_dcache() -> Arc<DCache> {
+    Arc::new(DCache::new(PathBuf::from("/")))
+}
 
 /// Builds an `INode` with sensible defaults. Only `addr` and `itype` are required.
 pub fn make_inode(addr: u64, itype: INodeType, size: u64, parent: Option<u64>) -> INode {
@@ -64,6 +73,19 @@ pub struct MockFsState {
     /// `create` should set this to a high value (e.g. 100) to avoid inode
     /// address collisions with statically allocated test inodes.
     pub next_addr: std::sync::atomic::AtomicU64,
+    /// Records calls to `write` as `(inode_addr, offset, data)` tuples.
+    pub write_calls: Arc<Mutex<Vec<(InodeAddr, u64, Bytes)>>>,
+    /// When `Some`, `write` will return this error instead of `Ok(data.len())`.
+    pub write_error: Option<Arc<str>>,
+    /// Records calls to `unlink` as `(parent_addr, name)` tuples.
+    pub unlink_calls: Arc<Mutex<Vec<(InodeAddr, OsString)>>>,
+    /// When `Some`, `unlink` will return this error instead of `Ok(())`.
+    pub unlink_error: Option<Arc<str>>,
+    /// Notified after each `write` call completes. Tests can await this
+    /// instead of using `tokio::time::sleep`.
+    pub write_notify: Arc<tokio::sync::Notify>,
+    /// Notified after each `unlink` call completes.
+    pub unlink_notify: Arc<tokio::sync::Notify>,
 }
 
 /// A clonable mock data provider for `AsyncFs` tests.
@@ -121,7 +143,7 @@ impl FsDataProvider for MockFsDataProvider {
         Ok(MockFileReader { data })
     }
 
-    fn forget(&self, addr: git_fs::fs::InodeAddr) {
+    fn forget(&self, addr: InodeAddr) {
         let _ = self.state.forgotten_addrs.insert_sync(addr);
     }
 
@@ -129,9 +151,19 @@ impl FsDataProvider for MockFsDataProvider {
         clippy::cast_possible_truncation,
         reason = "test mock — data stays small"
     )]
-    async fn write(&self, _inode: INode, _offset: u64, data: Bytes) -> Result<u32, std::io::Error> {
-        println!("[MockFsDataProvider] write called, {} bytes", data.len());
-        Ok(data.len() as u32)
+    async fn write(&self, inode: INode, offset: u64, data: Bytes) -> Result<u32, std::io::Error> {
+        self.state
+            .write_calls
+            .lock()
+            .await
+            .push((inode.addr, offset, data.clone()));
+        let result = if let Some(ref msg) = self.state.write_error {
+            Err(std::io::Error::other(msg.as_ref()))
+        } else {
+            Ok(data.len() as u32)
+        };
+        self.state.write_notify.notify_one();
+        result
     }
 
     #[expect(
@@ -160,5 +192,20 @@ impl FsDataProvider for MockFsDataProvider {
             itype: INodeType::File,
         };
         Ok(inode)
+    }
+
+    async fn unlink(&self, parent: INode, name: &OsStr) -> Result<(), std::io::Error> {
+        self.state
+            .unlink_calls
+            .lock()
+            .await
+            .push((parent.addr, name.to_os_string()));
+        let result = if let Some(ref msg) = self.state.unlink_error {
+            Err(std::io::Error::other(msg.as_ref()))
+        } else {
+            Ok(())
+        };
+        self.state.unlink_notify.notify_one();
+        result
     }
 }

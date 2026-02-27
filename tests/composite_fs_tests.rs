@@ -18,7 +18,7 @@ use git_fs::fs::async_fs::{AsyncFs, FsDataProvider as _};
 use git_fs::fs::composite::CompositeFs;
 use git_fs::fs::{INode, INodeType, LoadedAddr, OpenFlags};
 
-use common::async_fs_mocks::{MockFsDataProvider, MockFsState, make_inode};
+use common::async_fs_mocks::{MockFsDataProvider, MockFsState, make_dcache, make_inode};
 use common::composite_mocks::MockRoot;
 
 /// Build a child data provider with a root directory and a set of children.
@@ -61,7 +61,7 @@ async fn composite_root_lookup_resolves_child() {
 
     let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(1, root_inode);
-    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table));
+    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table), make_dcache());
 
     let tracked = afs
         .lookup(LoadedAddr::new_unchecked(1), OsStr::new("repo-a"))
@@ -99,7 +99,7 @@ async fn composite_root_readdir_lists_children() {
 
     let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(1, root_inode);
-    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table));
+    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table), make_dcache());
 
     let mut entries = Vec::new();
     afs.readdir(LoadedAddr::new_unchecked(1), 0, |de, _offset| {
@@ -134,7 +134,7 @@ async fn composite_delegated_lookup_reaches_child() {
 
     let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(1, root_inode);
-    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table));
+    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table), make_dcache());
 
     // First, lookup the child at root level.
     let child_dir = afs
@@ -177,7 +177,7 @@ async fn composite_open_and_read_through_child() {
 
     let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(1, root_inode);
-    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table));
+    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table), make_dcache());
 
     // Navigate to the file.
     let child_dir = afs
@@ -220,7 +220,7 @@ async fn composite_lookup_unknown_child_returns_enoent() {
 
     let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(1, root_inode);
-    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table));
+    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table), make_dcache());
 
     let err = afs
         .lookup(LoadedAddr::new_unchecked(1), OsStr::new("nonexistent"))
@@ -254,7 +254,7 @@ async fn composite_readdir_delegated_lists_child_contents() {
 
     let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(1, root_inode);
-    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table));
+    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table), make_dcache());
 
     // Navigate into the child.
     let child_dir = afs
@@ -295,7 +295,7 @@ async fn composite_repeated_lookup_returns_same_addr() {
 
     let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(1, root_inode);
-    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table));
+    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table), make_dcache());
 
     let first = afs
         .lookup(LoadedAddr::new_unchecked(1), OsStr::new("repo"))
@@ -326,7 +326,7 @@ async fn composite_forget_propagates_to_child_inode_table() {
 
     let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(1, root_inode);
-    let afs = AsyncFs::new_preseeded(composite.clone(), Arc::clone(&table));
+    let afs = AsyncFs::new_preseeded(composite.clone(), Arc::clone(&table), make_dcache());
 
     // Navigate to the file.
     let child_dir = afs
@@ -369,7 +369,7 @@ async fn composite_forget_cleans_up_slot_and_name_mapping() {
 
     let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(1, root_inode);
-    let afs = AsyncFs::new_preseeded(composite.clone(), Arc::clone(&table));
+    let afs = AsyncFs::new_preseeded(composite.clone(), Arc::clone(&table), make_dcache());
 
     // Look up the child and a file inside it.
     let child_dir = afs
@@ -430,7 +430,7 @@ async fn composite_forget_does_not_destroy_replacement_name_to_slot_entry() {
 
     let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(1, root_inode);
-    let afs = AsyncFs::new_preseeded(composite.clone(), Arc::clone(&table));
+    let afs = AsyncFs::new_preseeded(composite.clone(), Arc::clone(&table), make_dcache());
 
     // Step 1: establish slot S1
     let child_dir = afs
@@ -491,7 +491,7 @@ async fn composite_concurrent_forget_and_lookup_preserves_name_mapping() {
     for _ in 0..50 {
         let table = Arc::new(FutureBackedCache::default());
         table.insert_sync(1, root_inode);
-        let afs = AsyncFs::new_preseeded(composite.clone(), Arc::clone(&table));
+        let afs = AsyncFs::new_preseeded(composite.clone(), Arc::clone(&table), make_dcache());
 
         // Establish the child.
         let child = afs
@@ -534,7 +534,7 @@ async fn composite_write_and_read_through_child() {
 
     let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(1, root_inode);
-    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table));
+    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table), make_dcache());
 
     // Navigate to the file.
     let child_dir = afs
@@ -593,7 +593,7 @@ async fn composite_create_file_in_child() {
 
     let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(1, root_inode);
-    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table));
+    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table), make_dcache());
 
     // Navigate to the child directory.
     let child_dir = afs
@@ -646,7 +646,7 @@ async fn composite_create_at_root_returns_erofs() {
 
     let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(1, root_inode);
-    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table));
+    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table), make_dcache());
 
     let err = afs
         .create(LoadedAddr::new_unchecked(1), "nope.txt".as_ref(), 0o644)
@@ -673,7 +673,7 @@ async fn composite_write_at_root_returns_eisdir() {
 
     let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(1, root_inode);
-    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table));
+    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table), make_dcache());
 
     let err = afs
         .write(LoadedAddr::new_unchecked(1), 0, Bytes::from_static(b"nope"))
@@ -700,7 +700,7 @@ async fn composite_forget_preserves_written_file() {
 
     let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(1, root_inode);
-    let afs = AsyncFs::new_preseeded(composite.clone(), Arc::clone(&table));
+    let afs = AsyncFs::new_preseeded(composite.clone(), Arc::clone(&table), make_dcache());
 
     // Navigate to the file.
     let child_dir = afs
@@ -749,7 +749,7 @@ async fn composite_setattr_truncate_through_child() {
 
     let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(1, root_inode);
-    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table));
+    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table), make_dcache());
 
     // Navigate to the file.
     let child_dir = afs
@@ -807,7 +807,7 @@ async fn composite_write_at_offset_preserves_provider_content() {
 
     let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(1, root_inode);
-    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table));
+    let afs = AsyncFs::new_preseeded(composite, Arc::clone(&table), make_dcache());
 
     // Navigate to the file.
     let child_dir = afs

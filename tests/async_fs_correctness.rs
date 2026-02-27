@@ -15,7 +15,7 @@ use git_fs::cache::async_backed::FutureBackedCache;
 use git_fs::fs::async_fs::{AsyncFs, InodeLifecycle};
 use git_fs::fs::{INode, INodeType, LoadedAddr, OpenFlags};
 
-use common::async_fs_mocks::{MockFsDataProvider, MockFsState, make_inode};
+use common::async_fs_mocks::{MockFsDataProvider, MockFsState, make_dcache, make_inode};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lifecycle_inc_returns_count_after_increment() {
@@ -130,7 +130,7 @@ async fn new_seeds_root_inode_into_table() {
     let root = make_inode(1, INodeType::Directory, 0, None);
     let dp = MockFsDataProvider::new(MockFsState::default());
 
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     assert_eq!(fs.inode_count(), 1, "root should be the only inode");
     let fetched = table.get(&1).await;
@@ -146,7 +146,7 @@ async fn new_preseeded_does_not_insert_root() {
     let table: Arc<FutureBackedCache<u64, INode>> = Arc::new(FutureBackedCache::default());
     let dp = MockFsDataProvider::new(MockFsState::default());
 
-    let fs = AsyncFs::new_preseeded(dp, Arc::clone(&table));
+    let fs = AsyncFs::new_preseeded(dp, Arc::clone(&table), make_dcache());
 
     assert_eq!(
         fs.inode_count(),
@@ -161,7 +161,7 @@ async fn statfs_reports_inode_count() {
     let root = make_inode(1, INodeType::Directory, 0, None);
     let dp = MockFsDataProvider::new(MockFsState::default());
 
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
     let stats = fs.statfs();
 
     assert_eq!(stats.block_size, 4096);
@@ -176,7 +176,7 @@ async fn loaded_inode_returns_seeded_inode() {
     let root = make_inode(1, INodeType::Directory, 0, None);
     let dp = MockFsDataProvider::new(MockFsState::default());
 
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     let inode = fs.loaded_inode(LoadedAddr::new_unchecked(1)).await.unwrap();
     assert_eq!(inode.addr, 1);
@@ -189,7 +189,7 @@ async fn loaded_inode_returns_enoent_for_missing_addr() {
     let root = make_inode(1, INodeType::Directory, 0, None);
     let dp = MockFsDataProvider::new(MockFsState::default());
 
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     let err = fs
         .loaded_inode(LoadedAddr::new_unchecked(999))
@@ -204,7 +204,7 @@ async fn getattr_delegates_to_loaded_inode() {
     let root = make_inode(1, INodeType::Directory, 4096, None);
     let dp = MockFsDataProvider::new(MockFsState::default());
 
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     let inode = fs.getattr(LoadedAddr::new_unchecked(1)).await.unwrap();
     assert_eq!(inode.addr, 1);
@@ -221,7 +221,7 @@ async fn lookup_resolves_child_via_data_provider() {
     let dp = MockFsDataProvider::new(state);
 
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     let tracked = fs
         .lookup(LoadedAddr::new_unchecked(1), OsStr::new("readme.md"))
@@ -243,7 +243,7 @@ async fn lookup_populates_inode_table() {
     let dp = MockFsDataProvider::new(state);
 
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     fs.lookup(LoadedAddr::new_unchecked(1), OsStr::new("file.txt"))
         .await
@@ -268,7 +268,7 @@ async fn lookup_second_call_uses_cache() {
     let dp = MockFsDataProvider::new(state);
 
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     let first = fs
         .lookup(LoadedAddr::new_unchecked(1), OsStr::new("cached.txt"))
@@ -289,7 +289,7 @@ async fn lookup_propagates_provider_error() {
     let dp = MockFsDataProvider::new(MockFsState::default());
 
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     let err = fs
         .lookup(LoadedAddr::new_unchecked(1), OsStr::new("nonexistent"))
@@ -313,7 +313,7 @@ async fn open_returns_file_handle_and_reader() {
 
     let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(10, file);
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     let open_file = fs
         .open(LoadedAddr::new_unchecked(10), OpenFlags::RDONLY)
@@ -331,7 +331,7 @@ async fn open_returns_eisdir_for_directory() {
     let dp = MockFsDataProvider::new(MockFsState::default());
 
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     let err = fs
         .open(LoadedAddr::new_unchecked(1), OpenFlags::RDONLY)
@@ -346,7 +346,7 @@ async fn open_returns_enoent_for_missing_inode() {
     let dp = MockFsDataProvider::new(MockFsState::default());
 
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     let err = fs
         .open(LoadedAddr::new_unchecked(999), OpenFlags::RDONLY)
@@ -364,7 +364,7 @@ async fn open_assigns_unique_file_handles() {
 
     let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(10, file);
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     let fh1 = fs
         .open(LoadedAddr::new_unchecked(10), OpenFlags::RDONLY)
@@ -393,7 +393,7 @@ async fn open_file_read_with_offset() {
 
     let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(10, file);
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     let open_file = fs
         .open(LoadedAddr::new_unchecked(10), OpenFlags::RDONLY)
@@ -423,7 +423,7 @@ async fn readdir_lists_children_sorted_by_name() {
     let dp = MockFsDataProvider::new(state);
 
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     let mut entries: Vec<(OsString, u64)> = Vec::new();
     fs.readdir(LoadedAddr::new_unchecked(1), 0, |entry, _offset| {
@@ -459,7 +459,7 @@ async fn readdir_respects_offset() {
     let dp = MockFsDataProvider::new(state);
 
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     // First readdir to populate cache
     fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, _| false)
@@ -497,7 +497,7 @@ async fn readdir_stops_when_filler_returns_true() {
     let dp = MockFsDataProvider::new(state);
 
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     let mut count = 0;
     fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, _| {
@@ -519,7 +519,7 @@ async fn readdir_returns_enotdir_for_file() {
 
     let table = Arc::new(FutureBackedCache::default());
     table.insert_sync(10, file);
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     let err = fs
         .readdir(LoadedAddr::new_unchecked(10), 0, |_, _| false)
@@ -540,7 +540,7 @@ async fn readdir_populates_inode_table_with_children() {
     let dp = MockFsDataProvider::new(state);
 
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, _| false)
         .await
@@ -563,7 +563,7 @@ async fn readdir_empty_directory() {
     let dp = MockFsDataProvider::new(state);
 
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     let mut count = 0;
     fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, _| {
@@ -593,7 +593,7 @@ async fn readdir_provides_correct_next_offsets() {
     let dp = MockFsDataProvider::new(state);
 
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     let mut offsets: Vec<u64> = Vec::new();
     fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, next_offset| {
@@ -622,7 +622,7 @@ async fn lookup_after_eviction_returns_fresh_inode() {
     let state_ref = Arc::clone(&dp.state);
 
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     // First lookup → addr=10
     let first = fs
@@ -667,7 +667,7 @@ async fn lookup_after_readdir_uses_directory_cache() {
     let dp = MockFsDataProvider::new(state);
 
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     // readdir populates the directory cache.
     fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, _| false)
@@ -706,7 +706,7 @@ async fn readdir_prefetches_child_directories() {
     let readdir_count = Arc::clone(&dp.state);
 
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     // readdir on root should trigger prefetch of child_dir (addr=10)
     fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, _| false)
@@ -753,7 +753,7 @@ async fn prefetch_failure_does_not_affect_parent_readdir() {
     let dp = MockFsDataProvider::new(state);
 
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     // Parent readdir should succeed even though child prefetch will fail
     let mut entries = Vec::new();
@@ -797,7 +797,7 @@ async fn readdir_after_evict_re_fetches_from_provider() {
     let readdir_count = Arc::clone(&dp.state);
 
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     // First readdir populates cache.
     let mut entries = Vec::new();
@@ -847,7 +847,7 @@ async fn readdir_evict_all_readdir_returns_same_entries() {
     let dp = MockFsDataProvider::new(state);
 
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     // First readdir.
     let mut first = Vec::new();
@@ -903,7 +903,7 @@ async fn lookup_returns_enoent_without_remote_call_when_dir_populated() {
     let dp = MockFsDataProvider::new(state);
 
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     // Populate the directory via readdir.
     fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, _| false)
@@ -1198,7 +1198,7 @@ async fn lookup_falls_through_to_remote_after_eviction_resets_populated() {
     let dp = MockFsDataProvider::new(state);
 
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(dp, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(dp, root, Arc::clone(&table), make_dcache()).await;
 
     // Populate via readdir — directory is now DONE.
     fs.readdir(LoadedAddr::new_unchecked(1), 0, |_, _| false)

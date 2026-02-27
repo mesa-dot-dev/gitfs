@@ -17,7 +17,7 @@ use git_fs::drop_ward::StatelessDrop as _;
 use git_fs::fs::async_fs::{AsyncFs, ForgetContext, FsDataProvider as _};
 use git_fs::fs::{INodeType, InodeForget, LoadedAddr, OpenFlags};
 
-use common::async_fs_mocks::{MockFsDataProvider, MockFsState, make_inode};
+use common::async_fs_mocks::{MockFsDataProvider, MockFsState, make_dcache, make_inode};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_method_exists_on_provider() {
@@ -66,7 +66,7 @@ async fn async_fs_write_stores_data_in_overlay() {
     };
     let provider = MockFsDataProvider::new(state);
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
 
     // Load the file inode into the table via lookup.
     let _ = fs
@@ -107,7 +107,7 @@ async fn write_at_offset_merges_correctly() {
     };
     let provider = MockFsDataProvider::new(state);
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
 
     let _ = fs
         .lookup(LoadedAddr::new_unchecked(1), "test.txt".as_ref())
@@ -154,7 +154,7 @@ async fn write_updates_inode_size() {
     };
     let provider = MockFsDataProvider::new(state);
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
 
     let _ = fs
         .lookup(LoadedAddr::new_unchecked(1), "test.txt".as_ref())
@@ -180,7 +180,7 @@ async fn write_to_directory_returns_eisdir() {
     let state = MockFsState::default();
     let provider = MockFsDataProvider::new(state);
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
 
     let result = fs
         .write(LoadedAddr::new_unchecked(1), 0, Bytes::from_static(b"data"))
@@ -202,7 +202,7 @@ async fn written_inode_survives_forget() {
     };
     let provider = MockFsDataProvider::new(state);
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(provider.clone(), root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(provider.clone(), root, Arc::clone(&table), make_dcache()).await;
 
     // Look up the file to load it into the table.
     let _ = fs
@@ -226,6 +226,7 @@ async fn written_inode_survives_forget() {
         lookup_cache: fs.lookup_cache(),
         provider: provider.clone(),
         write_overlay: fs.write_overlay(),
+        unlinked_inodes: fs.unlinked_inodes(),
     };
     InodeForget::delete(&ctx, &2);
 
@@ -249,7 +250,7 @@ async fn unwritten_inode_is_evicted_on_forget() {
     };
     let provider = MockFsDataProvider::new(state);
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(provider.clone(), root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(provider.clone(), root, Arc::clone(&table), make_dcache()).await;
 
     // Look up the file to load it into the table.
     let _ = fs
@@ -265,6 +266,7 @@ async fn unwritten_inode_is_evicted_on_forget() {
         lookup_cache: fs.lookup_cache(),
         provider: provider.clone(),
         write_overlay: fs.write_overlay(),
+        unlinked_inodes: fs.unlinked_inodes(),
     };
     InodeForget::delete(&ctx, &2);
 
@@ -287,7 +289,7 @@ async fn write_then_read_round_trip() {
     };
     let provider = MockFsDataProvider::new(state);
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
 
     let _ = fs
         .lookup(LoadedAddr::new_unchecked(1), "data.bin".as_ref())
@@ -335,7 +337,7 @@ async fn write_with_gap_fills_zeros() {
     };
     let provider = MockFsDataProvider::new(state);
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
 
     let _ = fs
         .lookup(LoadedAddr::new_unchecked(1), "gap.bin".as_ref())
@@ -367,7 +369,7 @@ async fn create_file_returns_new_inode() {
     };
     let provider = MockFsDataProvider::new(state);
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
 
     let (inode, open_file) = fs
         .create(LoadedAddr::new_unchecked(1), "newfile.txt".as_ref(), 0o644)
@@ -390,7 +392,7 @@ async fn create_file_appears_in_readdir() {
     };
     let provider = MockFsDataProvider::new(state);
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
 
     // Populate the directory cache first so readdir sees the empty state.
     let mut entries_before = vec![];
@@ -433,7 +435,7 @@ async fn create_file_then_write_and_read() {
     };
     let provider = MockFsDataProvider::new(state);
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
 
     let (child, open_file) = fs
         .create(LoadedAddr::new_unchecked(1), "data.txt".as_ref(), 0o644)
@@ -465,7 +467,7 @@ async fn create_in_non_directory_returns_enotdir() {
     };
     let provider = MockFsDataProvider::new(state);
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
 
     // Load the file inode.
     let _ = fs
@@ -498,7 +500,7 @@ async fn setattr_updates_size_truncate() {
     };
     let provider = MockFsDataProvider::new(state);
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
 
     // Lookup the file to load it into the inode table.
     let _ = fs
@@ -544,7 +546,7 @@ async fn setattr_truncate_to_zero() {
     };
     let provider = MockFsDataProvider::new(state);
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
 
     // Lookup the file to load it into the inode table.
     let _ = fs
@@ -590,7 +592,7 @@ async fn evict_skips_written_inode() {
     };
     let provider = MockFsDataProvider::new(state);
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
 
     let _ = fs
         .lookup(LoadedAddr::new_unchecked(1), "test.txt".as_ref())
@@ -630,7 +632,7 @@ async fn setattr_honors_explicit_mtime() {
     };
     let provider = MockFsDataProvider::new(state);
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
 
     let _ = fs
         .lookup(LoadedAddr::new_unchecked(1), "test.txt".as_ref())
@@ -667,7 +669,7 @@ async fn setattr_uses_atime_as_mtime_fallback() {
     };
     let provider = MockFsDataProvider::new(state);
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
 
     let _ = fs
         .lookup(LoadedAddr::new_unchecked(1), "test.txt".as_ref())
@@ -707,7 +709,7 @@ async fn setattr_truncate_non_overlaid_file_preserves_content() {
     };
     let provider = MockFsDataProvider::new(state);
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
 
     // Load the file inode via lookup.
     let _ = fs
@@ -751,7 +753,7 @@ async fn write_at_offset_preserves_existing_provider_content() {
     };
     let provider = MockFsDataProvider::new(state);
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
 
     let _ = fs
         .lookup(LoadedAddr::new_unchecked(1), "test.txt".as_ref())
@@ -789,7 +791,7 @@ async fn evict_removes_unwritten_inode() {
     };
     let provider = MockFsDataProvider::new(state);
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
 
     let _ = fs
         .lookup(LoadedAddr::new_unchecked(1), "test.txt".as_ref())
@@ -820,7 +822,7 @@ async fn setattr_truncate_to_zero_non_overlaid_file() {
     };
     let provider = MockFsDataProvider::new(state);
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
 
     let _ = fs
         .lookup(LoadedAddr::new_unchecked(1), "test.txt".as_ref())
@@ -855,7 +857,7 @@ async fn setattr_extend_non_overlaid_file_zero_pads() {
     };
     let provider = MockFsDataProvider::new(state);
     let table = Arc::new(FutureBackedCache::default());
-    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
 
     let _ = fs
         .lookup(LoadedAddr::new_unchecked(1), "test.txt".as_ref())
@@ -878,5 +880,219 @@ async fn setattr_extend_non_overlaid_file_zero_pads() {
         &data[..],
         b"hello\0\0\0\0\0",
         "extending a non-overlaid file must preserve content and zero-pad the rest"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_write_called_with_full_content_after_write() {
+    let root = make_inode(1, INodeType::Directory, 0, None);
+    let file = make_inode(2, INodeType::File, 0, Some(1));
+
+    let write_calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let write_notify = Arc::new(tokio::sync::Notify::new());
+    let state = MockFsState {
+        lookups: [((1, "test.txt".into()), file)].into_iter().collect(),
+        directories: [(1, vec![("test.txt".into(), file)])].into_iter().collect(),
+        file_contents: [(2, Bytes::from_static(b""))].into_iter().collect(),
+        write_calls: Arc::clone(&write_calls),
+        write_notify: Arc::clone(&write_notify),
+        ..MockFsState::default()
+    };
+    let provider = MockFsDataProvider::new(state);
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
+
+    let _ = fs
+        .lookup(LoadedAddr::new_unchecked(1), "test.txt".as_ref())
+        .await
+        .unwrap();
+
+    fs.write(
+        LoadedAddr::new_unchecked(2),
+        0,
+        Bytes::from_static(b"hello"),
+    )
+    .await
+    .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), write_notify.notified())
+        .await
+        .expect("timed out waiting for provider write");
+
+    let calls = write_calls.lock().await;
+    assert_eq!(calls.len(), 1, "provider write should be called once");
+    assert_eq!(calls[0].0, 2, "provider write should be called for inode 2");
+    assert_eq!(
+        calls[0].1, 0,
+        "provider write should be called with offset 0"
+    );
+    assert_eq!(
+        &calls[0].2[..],
+        b"hello",
+        "provider write should receive the full file content"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_write_receives_merged_content_after_multiple_writes() {
+    let root = make_inode(1, INodeType::Directory, 0, None);
+    let file = make_inode(2, INodeType::File, 0, Some(1));
+
+    let write_calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let write_notify = Arc::new(tokio::sync::Notify::new());
+    let state = MockFsState {
+        lookups: [((1, "test.txt".into()), file)].into_iter().collect(),
+        directories: [(1, vec![("test.txt".into(), file)])].into_iter().collect(),
+        file_contents: [(2, Bytes::from_static(b""))].into_iter().collect(),
+        write_calls: Arc::clone(&write_calls),
+        write_notify: Arc::clone(&write_notify),
+        ..MockFsState::default()
+    };
+    let provider = MockFsDataProvider::new(state);
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
+
+    let _ = fs
+        .lookup(LoadedAddr::new_unchecked(1), "test.txt".as_ref())
+        .await
+        .unwrap();
+
+    // First write: "hello" at offset 0
+    fs.write(
+        LoadedAddr::new_unchecked(2),
+        0,
+        Bytes::from_static(b"hello"),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), write_notify.notified())
+        .await
+        .expect("timed out waiting for provider write");
+
+    // Second write: " world" at offset 5
+    fs.write(
+        LoadedAddr::new_unchecked(2),
+        5,
+        Bytes::from_static(b" world"),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), write_notify.notified())
+        .await
+        .expect("timed out waiting for provider write");
+
+    let calls = write_calls.lock().await;
+    assert_eq!(calls.len(), 2, "provider write should be called twice");
+    assert_eq!(calls[1].1, 0, "second provider write should use offset 0");
+    assert_eq!(
+        &calls[1].2[..],
+        b"hello world",
+        "second provider write should receive the merged content"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_write_called_after_setattr_truncation() {
+    let root = make_inode(1, INodeType::Directory, 0, None);
+    let file = make_inode(2, INodeType::File, 0, Some(1));
+
+    let write_calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let write_notify = Arc::new(tokio::sync::Notify::new());
+    let state = MockFsState {
+        lookups: [((1, "test.txt".into()), file)].into_iter().collect(),
+        directories: [(1, vec![("test.txt".into(), file)])].into_iter().collect(),
+        file_contents: [(2, Bytes::from_static(b""))].into_iter().collect(),
+        write_calls: Arc::clone(&write_calls),
+        write_notify: Arc::clone(&write_notify),
+        ..MockFsState::default()
+    };
+    let provider = MockFsDataProvider::new(state);
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
+
+    let _ = fs
+        .lookup(LoadedAddr::new_unchecked(1), "test.txt".as_ref())
+        .await
+        .unwrap();
+
+    // Write "hello world" to the file.
+    fs.write(
+        LoadedAddr::new_unchecked(2),
+        0,
+        Bytes::from_static(b"hello world"),
+    )
+    .await
+    .unwrap();
+    // Wait for the background provider write to complete before setattr.
+    tokio::time::timeout(std::time::Duration::from_secs(5), write_notify.notified())
+        .await
+        .expect("timed out waiting for provider write");
+
+    // Truncate to 5 bytes via setattr.
+    let inode = fs
+        .setattr(LoadedAddr::new_unchecked(2), Some(5), None, None)
+        .await
+        .unwrap();
+    assert_eq!(inode.size, 5);
+
+    let calls = write_calls.lock().await;
+    // The last call should be from setattr with the truncated content.
+    let last_call = calls
+        .last()
+        .expect("provider write should have been called");
+    assert_eq!(
+        last_call.0, 2,
+        "provider write should be called for inode 2"
+    );
+    assert_eq!(last_call.1, 0, "provider write should use offset 0");
+    assert_eq!(
+        &last_call.2[..],
+        b"hello",
+        "provider write after truncation should receive the truncated content"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_write_failure_does_not_affect_overlay() {
+    let root = make_inode(1, INodeType::Directory, 0, None);
+    let file = make_inode(2, INodeType::File, 0, Some(1));
+
+    let state = MockFsState {
+        lookups: [((1, "test.txt".into()), file)].into_iter().collect(),
+        directories: [(1, vec![("test.txt".into(), file)])].into_iter().collect(),
+        file_contents: [(2, Bytes::from_static(b""))].into_iter().collect(),
+        write_error: Some("simulated remote failure".into()),
+        ..MockFsState::default()
+    };
+    let provider = MockFsDataProvider::new(state);
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table), make_dcache()).await;
+
+    let _ = fs
+        .lookup(LoadedAddr::new_unchecked(1), "test.txt".as_ref())
+        .await
+        .unwrap();
+
+    // Write "hello" — provider write will return an error, but the overlay write should succeed.
+    let written = fs
+        .write(
+            LoadedAddr::new_unchecked(2),
+            0,
+            Bytes::from_static(b"hello"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(written, 5);
+
+    // The overlay should still have the data — read it back.
+    let open = fs
+        .open(LoadedAddr::new_unchecked(2), OpenFlags::RDONLY)
+        .await
+        .unwrap();
+    let data = open.read(0, 1024).await.unwrap();
+    assert_eq!(
+        &data[..],
+        b"hello",
+        "write data should be preserved in overlay despite provider write failure"
     );
 }

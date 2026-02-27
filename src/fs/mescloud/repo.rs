@@ -18,7 +18,9 @@ use tracing::warn;
 
 use git_fs::cache::fcache::FileCache;
 use git_fs::cache::traits::{AsyncReadableCache as _, AsyncWritableCache as _};
+use git_fs::fs::LoadedAddr;
 use git_fs::fs::async_fs::{FileReader, FsDataProvider};
+use git_fs::fs::dcache::DCache;
 use git_fs::fs::{INode, INodeType, InodeAddr, InodePerms, OpenFlags as AsyncOpenFlags, ROOT_INO};
 
 use super::common::{MesaApiError, mesa_api_error_to_io};
@@ -26,6 +28,59 @@ use super::common::{MesaApiError, mesa_api_error_to_io};
 #[derive(Clone)]
 pub struct MesRepoProvider {
     inner: Arc<MesRepoProviderInner>,
+}
+
+struct ChangeState {
+    client: mesa_dev::client::ChangeClient,
+    change_id: mesa_dev::grpc::ChangeId,
+    /// Bare branch name (e.g. `"main"`), used by [`Self::snapshot_and_flush`]
+    /// to move the bookmark after snapshotting.
+    branch: String,
+    /// Full ref name (e.g. `"refs/heads/main"`), used by [`Self::snapshot_and_flush`]
+    /// to resolve the current update sequence.
+    full_ref: String,
+}
+
+/// A queued remote operation, processed in FIFO order by the background
+/// consumer task. This guarantees that `create_file` always runs before
+/// the first `modify_file` for the same path.
+enum RemoteOp {
+    Create { path: String },
+    Write { path: String, data: Bytes },
+    Unlink { path: String },
+}
+
+impl ChangeState {
+    /// Snapshot the change, then move the bookmark so the new commit is
+    /// visible via the REST content API.
+    async fn snapshot_and_flush(&self, message: &str) -> Result<(), std::io::Error> {
+        let snap = self
+            .client
+            .snapshot(&self.change_id, message)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        let commit_oid = snap
+            .commit_oid
+            .ok_or_else(|| std::io::Error::other("snapshot returned no commit_oid"))?;
+
+        let ref_info = self
+            .client
+            .resolve_ref(&self.full_ref)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        // NOTE(MES-857): move_bookmark uses resolve_ref's update_seq for
+        // optimistic concurrency, but an external push between resolve_ref
+        // and move_bookmark will cause a stale-sequence error. Needs a
+        // retry-with-rebase protocol.
+        self.client
+            .move_bookmark(&self.branch, &commit_oid.value, ref_info.update_seq)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        Ok(())
+    }
 }
 
 struct MesRepoProviderInner {
@@ -50,6 +105,166 @@ struct MesRepoProviderInner {
     /// [`forget`](Self::remove_path) when the FUSE refcount reaches zero.
     path_map: scc::HashMap<InodeAddr, PathBuf>,
     file_cache: Option<Arc<FileCache<InodeAddr>>>,
+    dcache: Arc<DCache>,
+    /// Send side of the ordered operation channel. Operations are processed
+    /// sequentially by a background task, guaranteeing FIFO ordering.
+    op_tx: tokio::sync::mpsc::UnboundedSender<RemoteOp>,
+}
+
+impl MesRepoProviderInner {
+    /// Return the full Git ref name (e.g. `"refs/heads/main"`) from the bare
+    /// branch name stored in `ref_`.
+    fn full_ref_name(&self) -> String {
+        format!("refs/heads/{}", self.ref_)
+    }
+
+    /// If `child_path` is a `.gitignore` or `.mesafs-ignore` file, fetch its
+    /// content from the API and feed it to the dcache ignore matcher.
+    async fn maybe_observe_ignore_file(
+        &self,
+        parent_addr: InodeAddr,
+        child_path: &std::path::Path,
+    ) {
+        let Some(file_name @ (".gitignore" | ".mesafs-ignore")) =
+            child_path.file_name().and_then(|n| n.to_str())
+        else {
+            return;
+        };
+
+        let Some(path_str) = child_path.to_str() else {
+            return;
+        };
+
+        // Fetch the file content from the remote API.
+        let content = match self
+            .client
+            .org(&self.org_name)
+            .repos()
+            .at(&self.repo_name)
+            .content()
+            .get(Some(self.ref_.as_str()), Some(path_str), None)
+            .await
+        {
+            Ok(content) => content,
+            Err(e) => {
+                tracing::debug!(%e, path = %path_str, "failed to fetch ignore file content");
+                return;
+            }
+        };
+
+        let encoded = match content {
+            Content::File(f) => f.content.unwrap_or_default(),
+            Content::Symlink(_) | Content::Dir(_) => return,
+        };
+
+        let decoded = match base64::engine::general_purpose::STANDARD.decode(&encoded) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::debug!(%e, path = %path_str, "failed to decode ignore file content");
+                return;
+            }
+        };
+
+        let Ok(text) = std::str::from_utf8(&decoded) else {
+            tracing::debug!(path = %path_str, "ignore file is not valid UTF-8");
+            return;
+        };
+
+        self.dcache
+            .set_ignore_rules(LoadedAddr::new_unchecked(parent_addr), file_name, text);
+    }
+}
+
+async fn init_change_state(inner: &MesRepoProviderInner) -> Result<ChangeState, std::io::Error> {
+    let change_client = inner
+        .client
+        .org(&inner.org_name)
+        .repos()
+        .at(&inner.repo_name)
+        .change()
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    let change = change_client
+        .create_from_ref(&inner.full_ref_name())
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    let change_id = change
+        .id
+        .ok_or_else(|| std::io::Error::other("server returned change without id"))?;
+
+    Ok(ChangeState {
+        client: change_client,
+        change_id,
+        branch: inner.ref_.clone(),
+        full_ref: inner.full_ref_name(),
+    })
+}
+
+async fn execute_create(state: &ChangeState, path: &str) -> Result<(), std::io::Error> {
+    state
+        .client
+        .create_file(&state.change_id, path, &[], None)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    state.snapshot_and_flush(&format!("Create {path}")).await
+}
+
+async fn execute_write(state: &ChangeState, path: &str, data: &[u8]) -> Result<(), std::io::Error> {
+    state
+        .client
+        .modify_file(&state.change_id, path, data)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    state.snapshot_and_flush(&format!("Update {path}")).await
+}
+
+async fn execute_unlink(state: &ChangeState, path: &str) -> Result<(), std::io::Error> {
+    state
+        .client
+        .delete_path(&state.change_id, path, false)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    state.snapshot_and_flush(&format!("Delete {path}")).await
+}
+
+/// Background task that processes remote operations in FIFO order.
+///
+/// Lazily initializes the `ChangeState` on first operation. If a gRPC
+/// error indicates staleness, resets the state so the next operation
+/// re-initializes.
+async fn remote_op_consumer(
+    inner: Arc<MesRepoProviderInner>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<RemoteOp>,
+) {
+    let mut change_state: Option<ChangeState> = None;
+
+    while let Some(op) = rx.recv().await {
+        if change_state.is_none() {
+            match init_change_state(&inner).await {
+                Ok(state) => change_state = Some(state),
+                Err(e) => {
+                    tracing::warn!(%e, "failed to initialize change state, dropping op");
+                    continue;
+                }
+            }
+        }
+        let Some(state) = change_state.as_ref() else {
+            continue;
+        };
+        let result = match &op {
+            RemoteOp::Create { path } => execute_create(state, path).await,
+            RemoteOp::Write { path, data } => execute_write(state, path, data).await,
+            RemoteOp::Unlink { path } => execute_unlink(state, path).await,
+        };
+        if let Err(e) = result {
+            // NOTE(MES-854): no backoff — re-init is attempted on every
+            // subsequent operation, which can hammer the server during outages.
+            tracing::warn!(%e, "remote operation failed, resetting change state");
+            change_state = None;
+        }
+    }
 }
 
 impl MesRepoProvider {
@@ -61,18 +276,23 @@ impl MesRepoProvider {
         fs_owner: (u32, u32),
         file_cache: Option<Arc<FileCache<InodeAddr>>>,
     ) -> Self {
-        Self {
-            inner: Arc::new(MesRepoProviderInner {
-                client,
-                org_name,
-                repo_name,
-                ref_,
-                fs_owner,
-                next_addr: AtomicU64::new(ROOT_INO + 1),
-                path_map: scc::HashMap::new(),
-                file_cache,
-            }),
-        }
+        let dcache = Arc::new(DCache::new(PathBuf::from("/")));
+        // NOTE(MES-855): unbounded — can grow without limit if remote is slow.
+        let (op_tx, op_rx) = tokio::sync::mpsc::unbounded_channel();
+        let inner = Arc::new(MesRepoProviderInner {
+            client,
+            org_name,
+            repo_name,
+            ref_,
+            fs_owner,
+            next_addr: AtomicU64::new(ROOT_INO + 1),
+            path_map: scc::HashMap::new(),
+            file_cache,
+            dcache,
+            op_tx,
+        });
+        tokio::spawn(remote_op_consumer(Arc::clone(&inner), op_rx));
+        Self { inner }
     }
 
     /// Store the path for the root inode address.
@@ -98,6 +318,10 @@ impl MesRepoProvider {
 
 impl FsDataProvider for MesRepoProvider {
     type Reader = MesFileReader;
+
+    fn dcache(&self) -> Option<Arc<DCache>> {
+        Some(Arc::clone(&self.inner.dcache))
+    }
 
     fn lookup(
         &self,
@@ -160,7 +384,11 @@ impl FsDataProvider for MesRepoProvider {
             // addr_to_slot entries for the old address. A stable, content-addressed scheme
             // would make re-lookup return the same address and avoid the leak.
             let addr = inner.next_addr.fetch_add(1, Ordering::Relaxed);
-            drop(inner.path_map.insert_async(addr, child_path).await);
+            drop(inner.path_map.insert_async(addr, child_path.clone()).await);
+
+            inner
+                .maybe_observe_ignore_file(parent.addr, &child_path)
+                .await;
 
             Ok(INode {
                 addr,
@@ -251,7 +479,11 @@ impl FsDataProvider for MesRepoProvider {
 
                 let addr = inner.next_addr.fetch_add(1, Ordering::Relaxed);
                 let child_path = parent_path.join(&name);
-                drop(inner.path_map.insert_async(addr, child_path).await);
+                drop(inner.path_map.insert_async(addr, child_path.clone()).await);
+
+                inner
+                    .maybe_observe_ignore_file(parent.addr, &child_path)
+                    .await;
 
                 let inode = INode {
                     addr,
@@ -325,10 +557,24 @@ impl FsDataProvider for MesRepoProvider {
 
             let child_path = parent_path.join(&name);
             let addr = inner.next_addr.fetch_add(1, Ordering::Relaxed);
-            drop(inner.path_map.insert_async(addr, child_path).await);
+            drop(inner.path_map.insert_async(addr, child_path.clone()).await);
 
             let now = SystemTime::now();
             let (uid, gid) = inner.fs_owner;
+
+            if let Some(path_str) = child_path.to_str() {
+                if inner.dcache.is_name_ignored(
+                    LoadedAddr::new_unchecked(parent.addr),
+                    &name,
+                    false,
+                ) {
+                    tracing::debug!(path = %path_str, "skipping remote create for ignored file");
+                } else {
+                    drop(inner.op_tx.send(RemoteOp::Create {
+                        path: path_str.to_owned(),
+                    }));
+                }
+            }
 
             Ok(INode {
                 addr,
@@ -341,6 +587,109 @@ impl FsDataProvider for MesRepoProvider {
                 size: 0,
                 itype: INodeType::File,
             })
+        }
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "data.len() fits in u32 (FUSE writes are at most 128 KiB)"
+    )]
+    fn write(
+        &self,
+        inode: INode,
+        _offset: u64,
+        data: Bytes,
+    ) -> impl Future<Output = Result<u32, std::io::Error>> + Send {
+        let inner = Arc::clone(&self.inner);
+        async move {
+            let path = inner
+                .path_map
+                .get_async(&inode.addr)
+                .await
+                .map(|e| e.get().clone())
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+            if inner
+                .dcache
+                .is_ignored(LoadedAddr::new_unchecked(inode.addr))
+            {
+                tracing::debug!(path = ?path, "skipping remote write for ignored file");
+                let written = data.len() as u32;
+                return Ok(written);
+            }
+
+            let path_str = path.to_str().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "path contains non-UTF-8 characters",
+                )
+            })?;
+
+            drop(inner.op_tx.send(RemoteOp::Write {
+                path: path_str.to_owned(),
+                data: data.clone(),
+            }));
+
+            // If this is an ignore file, update the dcache rules directly.
+            if let Some(fname @ (".gitignore" | ".mesafs-ignore")) =
+                path.file_name().and_then(|n| n.to_str())
+                && let Ok(text) = std::str::from_utf8(&data)
+                && let Some(parent) = inner
+                    .dcache
+                    .parent_of(LoadedAddr::new_unchecked(inode.addr))
+            {
+                inner.dcache.set_ignore_rules(parent, fname, text);
+            }
+
+            let written = data.len() as u32;
+            Ok(written)
+        }
+    }
+
+    fn unlink(
+        &self,
+        parent: INode,
+        name: &OsStr,
+    ) -> impl Future<Output = Result<(), std::io::Error>> + Send {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_os_string();
+        async move {
+            let parent_path = inner
+                .path_map
+                .get_async(&parent.addr)
+                .await
+                .map(|e| e.get().clone())
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+            let child_path = parent_path.join(&name);
+            let path_str = child_path.to_str().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "path contains non-UTF-8 characters",
+                )
+            })?;
+
+            if inner
+                .dcache
+                .is_name_ignored(LoadedAddr::new_unchecked(parent.addr), &name, false)
+            {
+                tracing::debug!(path = %path_str, "skipping remote unlink for ignored file");
+                return Ok(());
+            }
+
+            drop(inner.op_tx.send(RemoteOp::Unlink {
+                path: path_str.to_owned(),
+            }));
+
+            if let Some(fname @ (".gitignore" | ".mesafs-ignore")) =
+                child_path.file_name().and_then(|n| n.to_str())
+            {
+                inner
+                    .dcache
+                    .clear_ignore_rules(LoadedAddr::new_unchecked(parent.addr), fname);
+            }
+
+            Ok(())
         }
     }
 }
