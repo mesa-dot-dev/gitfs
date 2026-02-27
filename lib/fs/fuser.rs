@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
 
-use super::async_fs::{FileReader as _, FsDataProvider};
+use bytes::Bytes;
+
+use super::async_fs::{FileReader as _, FsDataProvider, OverlayReader};
 use super::{FileHandle, INode, INodeType, InodeAddr, LoadedAddr, OpenFlags};
 use crate::cache::async_backed::FutureBackedCache;
 use tracing::{debug, error, instrument};
@@ -47,6 +49,8 @@ impl_fuse_reply!(
     fuser::ReplyDirectory,
     fuser::ReplyOpen,
     fuser::ReplyData,
+    fuser::ReplyWrite,
+    fuser::ReplyCreate,
 );
 
 /// Extension trait on `Result<T, std::io::Error>` for FUSE reply handling.
@@ -89,6 +93,7 @@ impl<DP: FsDataProvider> FuseBridgeInner<DP> {
             dcache: fs.directory_cache(),
             lookup_cache: fs.lookup_cache(),
             provider,
+            write_overlay: fs.write_overlay(),
         };
         let ward = crate::drop_ward::DropWard::new(ctx);
         Self { ward, fs }
@@ -140,6 +145,14 @@ fn inode_type_to_fuser(itype: INodeType) -> fuser::FileType {
     }
 }
 
+/// Convert a fuser `TimeOrNow` to a `SystemTime`.
+fn resolve_fuser_time(t: fuser::TimeOrNow) -> std::time::SystemTime {
+    match t {
+        fuser::TimeOrNow::SpecificTime(t) => t,
+        fuser::TimeOrNow::Now => std::time::SystemTime::now(),
+    }
+}
+
 const BLOCK_SIZE: u32 = 4096;
 
 /// Snapshot of a directory listing created by `opendir`.
@@ -157,9 +170,16 @@ enum DirSnapshot {
 /// Owns a self-referential inode table + ward + [`AsyncFs`](super::async_fs::AsyncFs),
 /// plus an open-file map, a directory-handle map, and a tokio runtime handle
 /// for blocking on async ops.
+///
+/// # Threading model
+///
+/// `fuser` 0.16 dispatches all [`Filesystem`](fuser::Filesystem) callbacks
+/// on a single thread, so `&mut self` naturally serializes them. However,
+/// [`AsyncFs`] protects write-overlay mutations with per-inode locks
+/// internally, so correctness does **not** rely on single-threaded dispatch.
 pub struct FuserAdapter<DP: FsDataProvider> {
     inner: FuseBridgeInner<DP>,
-    open_files: HashMap<FileHandle, Arc<DP::Reader>>,
+    open_files: HashMap<FileHandle, Arc<OverlayReader<DP::Reader>>>,
     dir_handles: HashMap<FileHandle, DirSnapshot>,
     /// Unified file handle counter for both file and directory handles.
     /// Prevents collisions between `open` and `opendir` handles.
@@ -237,6 +257,50 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
                 self.inner
                     .get_fs()
                     .getattr(LoadedAddr::new_unchecked(ino))
+                    .await
+            })
+            .fuse_reply(reply, |inode, reply| {
+                let attr = inode_to_fuser_attr(&inode, BLOCK_SIZE);
+                debug!(?attr, "replying...");
+                reply.attr(&Self::SHAMEFUL_TTL, &attr);
+            });
+    }
+
+    #[instrument(
+        name = "FuserAdapter::setattr",
+        skip(
+            self, _req, _mode, _uid, _gid, size, atime, mtime, _ctime, _fh, _crtime, _chgtime,
+            _bkuptime, _flags, reply
+        )
+    )]
+    fn setattr(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<std::time::SystemTime>,
+        _fh: Option<u64>,
+        _crtime: Option<std::time::SystemTime>,
+        _chgtime: Option<std::time::SystemTime>,
+        _bkuptime: Option<std::time::SystemTime>,
+        _flags: Option<u32>,
+        reply: fuser::ReplyAttr,
+    ) {
+        self.runtime
+            .block_on(async {
+                self.inner
+                    .get_fs()
+                    .setattr(
+                        LoadedAddr::new_unchecked(ino),
+                        size,
+                        atime.map(resolve_fuser_time),
+                        mtime.map(resolve_fuser_time),
+                    )
                     .await
             })
             .fuse_reply(reply, |inode, reply| {
@@ -419,6 +483,96 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
             .fuse_reply(reply, |data, reply| {
                 debug!(read_bytes = data.len(), "replying...");
                 reply.data(&data);
+            });
+    }
+
+    #[instrument(
+        name = "FuserAdapter::write",
+        skip(
+            self,
+            _req,
+            ino,
+            fh,
+            offset,
+            data,
+            _write_flags,
+            _flags,
+            _lock_owner,
+            reply
+        )
+    )]
+    fn write(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: fuser::ReplyWrite,
+    ) {
+        let Some(reader) = self.open_files.get(&fh) else {
+            reply.error(libc::EBADF);
+            return;
+        };
+        let addr = reader.addr;
+        debug_assert_eq!(
+            addr, ino,
+            "write: OverlayReader addr {addr} does not match fuser ino {ino}"
+        );
+        let data = Bytes::from(data.to_vec());
+
+        self.runtime
+            .block_on(async {
+                self.inner
+                    .get_fs()
+                    .write(
+                        LoadedAddr::new_unchecked(addr),
+                        offset.cast_unsigned(),
+                        data,
+                    )
+                    .await
+            })
+            .fuse_reply(reply, |written, reply| {
+                debug!(bytes_written = written, "replying...");
+                reply.written(written);
+            });
+    }
+
+    #[instrument(
+        name = "FuserAdapter::create",
+        skip(self, _req, name, mode, umask, flags, reply)
+    )]
+    fn create(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+        reply: fuser::ReplyCreate,
+    ) {
+        let _ = flags; // flags are passed to open internally by AsyncFs::create
+        let effective_mode = mode & !umask;
+        self.runtime
+            .block_on(async {
+                let (inode, open_file) = self
+                    .inner
+                    .get_fs()
+                    .create(LoadedAddr::new_unchecked(parent), name, effective_mode)
+                    .await?;
+                self.inner.ward_inc(inode.addr);
+                let fh = open_file.fh;
+                self.open_files.insert(fh, Arc::clone(&open_file.reader));
+                Ok::<_, std::io::Error>((inode, fh))
+            })
+            .fuse_reply(reply, |(inode, fh), reply| {
+                let f_attr = inode_to_fuser_attr(&inode, BLOCK_SIZE);
+                debug!(?f_attr, handle = fh, "replying...");
+                reply.created(&Self::SHAMEFUL_TTL, &f_attr, 0, fh, 0);
             });
     }
 

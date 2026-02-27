@@ -60,6 +60,10 @@ pub struct MockFsState {
     pub readdir_count: std::sync::atomic::AtomicU64,
     /// Tracks addresses passed to `forget`. Used to verify propagation.
     pub forgotten_addrs: scc::HashSet<u64>,
+    /// Monotonically increasing address counter for `create`. Tests that use
+    /// `create` should set this to a high value (e.g. 100) to avoid inode
+    /// address collisions with statically allocated test inodes.
+    pub next_addr: std::sync::atomic::AtomicU64,
 }
 
 /// A clonable mock data provider for `AsyncFs` tests.
@@ -119,5 +123,42 @@ impl FsDataProvider for MockFsDataProvider {
 
     fn forget(&self, addr: git_fs::fs::InodeAddr) {
         let _ = self.state.forgotten_addrs.insert_sync(addr);
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test mock — data stays small"
+    )]
+    async fn write(&self, _inode: INode, _offset: u64, data: Bytes) -> Result<u32, std::io::Error> {
+        println!("[MockFsDataProvider] write called, {} bytes", data.len());
+        Ok(data.len() as u32)
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test mock — mode fits in u16"
+    )]
+    async fn create(
+        &self,
+        parent: INode,
+        _name: &OsStr,
+        mode: u32,
+    ) -> Result<INode, std::io::Error> {
+        let addr = self
+            .state
+            .next_addr
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let inode = INode {
+            addr,
+            permissions: InodePerms::from_bits_truncate(mode as u16),
+            uid: 1000,
+            gid: 1000,
+            create_time: SystemTime::now(),
+            last_modified_at: SystemTime::now(),
+            parent: Some(parent.addr),
+            size: 0,
+            itype: INodeType::File,
+        };
+        Ok(inode)
     }
 }

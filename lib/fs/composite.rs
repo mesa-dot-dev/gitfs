@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 
 use crate::cache::async_backed::FutureBackedCache;
-use crate::fs::async_fs::{AsyncFs, FileReader, FsDataProvider, OpenFile};
+use crate::fs::async_fs::{AsyncFs, FileReader, FsDataProvider, OpenFile, OverlayReader};
 use crate::fs::bridge::ConcurrentBridge;
 use crate::fs::{INode, INodeType, InodeAddr, InodePerms, LoadedAddr, OpenFlags, ROOT_INO};
 
@@ -284,7 +284,8 @@ where
     R::ChildDP: Clone,
     <<R as CompositeRoot>::ChildDP as FsDataProvider>::Reader: 'static,
 {
-    type Reader = CompositeReader<<<R as CompositeRoot>::ChildDP as FsDataProvider>::Reader>;
+    type Reader =
+        CompositeReader<OverlayReader<<<R as CompositeRoot>::ChildDP as FsDataProvider>::Reader>>;
 
     async fn lookup(&self, parent: INode, name: &OsStr) -> Result<INode, std::io::Error> {
         if parent.addr == ROOT_INO {
@@ -431,7 +432,9 @@ where
 
         let inner_ino = inner_ino.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
-        let open_file: OpenFile<<<R as CompositeRoot>::ChildDP as FsDataProvider>::Reader> = child
+        let open_file: OpenFile<
+            OverlayReader<<<R as CompositeRoot>::ChildDP as FsDataProvider>::Reader>,
+        > = child
             .get_fs()
             .open(LoadedAddr::new_unchecked(inner_ino), flags)
             .await?;
@@ -439,6 +442,123 @@ where
         Ok(CompositeReader {
             inner: open_file.reader,
         })
+    }
+
+    async fn create(
+        &self,
+        parent: INode,
+        name: &OsStr,
+        mode: u32,
+    ) -> Result<INode, std::io::Error> {
+        if parent.addr == ROOT_INO {
+            return Err(std::io::Error::from_raw_os_error(libc::EROFS));
+        }
+
+        let slot_idx = self
+            .inner
+            .addr_to_slot
+            .read_sync(&parent.addr, |_, &v| v)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        let (child, bridge, inner_parent) = self
+            .inner
+            .slots
+            .read_sync(&slot_idx, |_, slot| {
+                (
+                    Arc::clone(&slot.inner),
+                    Arc::clone(&slot.bridge),
+                    slot.bridge.forward(parent.addr),
+                )
+            })
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        let inner_parent =
+            inner_parent.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        // Use `create_metadata` to avoid a redundant inner open: the outer
+        // `AsyncFs::create` will open its own file handle via `self.open()`.
+        let child_inode = child
+            .get_fs()
+            .create_metadata(LoadedAddr::new_unchecked(inner_parent), name, mode)
+            .await?;
+
+        let fallback = self.allocate_ino();
+        let outer_ino = bridge.backward_or_insert(child_inode.addr, fallback);
+        let _ = self.inner.addr_to_slot.insert_sync(outer_ino, slot_idx);
+
+        Ok(INode {
+            addr: outer_ino,
+            ..child_inode
+        })
+    }
+
+    async fn setattr(
+        &self,
+        inode: INode,
+        size: Option<u64>,
+        atime: Option<std::time::SystemTime>,
+        mtime: Option<std::time::SystemTime>,
+    ) -> Result<INode, std::io::Error> {
+        if inode.addr == ROOT_INO {
+            return Err(std::io::Error::from_raw_os_error(libc::EROFS));
+        }
+
+        let slot_idx = self
+            .inner
+            .addr_to_slot
+            .read_sync(&inode.addr, |_, &v| v)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        let (child, inner_addr) = self
+            .inner
+            .slots
+            .read_sync(&slot_idx, |_, slot| {
+                (Arc::clone(&slot.inner), slot.bridge.forward(inode.addr))
+            })
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        let inner_addr =
+            inner_addr.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        let inner_result = child
+            .get_fs()
+            .setattr(LoadedAddr::new_unchecked(inner_addr), size, atime, mtime)
+            .await?;
+
+        Ok(INode {
+            addr: inode.addr,
+            ..inner_result
+        })
+    }
+
+    async fn write(&self, inode: INode, offset: u64, data: Bytes) -> Result<u32, std::io::Error> {
+        if inode.addr == ROOT_INO {
+            return Err(std::io::Error::from_raw_os_error(libc::EROFS));
+        }
+
+        let slot_idx = self
+            .inner
+            .addr_to_slot
+            .read_sync(&inode.addr, |_, &v| v)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        let (child, inner_addr) = self
+            .inner
+            .slots
+            .read_sync(&slot_idx, |_, slot| {
+                (Arc::clone(&slot.inner), slot.bridge.forward(inode.addr))
+            })
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        let inner_addr =
+            inner_addr.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+        // TODO(MES-832): this stores full content in both the inner and
+        // outer overlays; the inner copy is never read.
+        child
+            .get_fs()
+            .write(LoadedAddr::new_unchecked(inner_addr), offset, data)
+            .await
     }
 
     /// Removes the composite-level address from the child's bridge map and
