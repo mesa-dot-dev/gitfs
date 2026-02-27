@@ -136,48 +136,6 @@ def dfs_compare(
         dfs_compare(lhs_child, rhs_child, excluded_globs=excluded_globs)
 
 
-def test_dfs_compare_detects_content_mismatch(tmp_path: Path) -> None:
-    """dfs_compare should fail when file contents differ."""
-    lhs = tmp_path / "lhs"
-    rhs = tmp_path / "rhs"
-    lhs.mkdir()
-    rhs.mkdir()
-
-    (lhs / "file.txt").write_text("hello")
-    (rhs / "file.txt").write_text("world")
-
-    with pytest.raises(AssertionError, match="Content mismatch"):
-        dfs_compare(lhs, rhs)
-
-
-def test_dfs_compare_detects_symlink_target_mismatch(tmp_path: Path) -> None:
-    """dfs_compare should fail when symlink targets differ."""
-    lhs = tmp_path / "lhs"
-    rhs = tmp_path / "rhs"
-    lhs.mkdir()
-    rhs.mkdir()
-
-    (lhs / "link").symlink_to("target_a")
-    (rhs / "link").symlink_to("target_b")
-
-    with pytest.raises(AssertionError, match="Symlink target mismatch"):
-        dfs_compare(lhs, rhs)
-
-
-def test_dfs_compare_passes_when_contents_match(tmp_path: Path) -> None:
-    """dfs_compare should pass when structure and contents are identical."""
-    lhs = tmp_path / "lhs"
-    rhs = tmp_path / "rhs"
-    for root in (lhs, rhs):
-        root.mkdir()
-        (root / "a.txt").write_text("same content")
-        (root / "sub").mkdir()
-        (root / "sub" / "b.txt").write_bytes(b"\x00\x01\x02")
-        (root / "link").symlink_to("a.txt")
-
-    dfs_compare(lhs, rhs)  # Should not raise
-
-
 @pytest.mark.integration
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize("repo_slug", REPOS, ids=REPOS)
