@@ -2,8 +2,14 @@
 FROM rust:1.93-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
-    pkg-config \
+    build-essential \
+    cmake \
     libfuse3-dev \
+    libgrpc++-dev \
+    libprotobuf-dev \
+    pkg-config \
+    protobuf-compiler \
+    protobuf-compiler-grpc \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -18,10 +24,16 @@ RUN cargo build --release
 FROM python:3.14-slim-bookworm
 
 RUN apt-get update && apt-get install -y \
-    fuse3 \
+    build-essential \
     ca-certificates \
+    cmake \
     findutils \
+    fuse3 \
     git \
+    libgrpc++-dev \
+    libprotobuf-dev \
+    protobuf-compiler \
+    protobuf-compiler-grpc \
     && rm -rf /var/lib/apt/lists/*
 
 # Allow non-root users to mount FUSE filesystems
