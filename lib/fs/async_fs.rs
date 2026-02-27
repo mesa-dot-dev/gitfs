@@ -688,6 +688,49 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         Ok(bytes_written)
     }
 
+    /// Create a new empty file in the given parent directory.
+    ///
+    /// Allocates a new inode, inserts it into the inode table and directory
+    /// cache, initializes an empty write overlay entry, and returns the
+    /// inode along with an open file handle.
+    pub async fn create(
+        &self,
+        parent: LoadedAddr,
+        name: &OsStr,
+        mode: u32,
+    ) -> Result<(INode, OpenFile<OverlayReader<DP::Reader>>), std::io::Error> {
+        let parent_inode = self.loaded_inode(parent).await?;
+        if parent_inode.itype != INodeType::Directory {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
+        }
+
+        // Ask the data provider to create the inode metadata.
+        let child = self.data_provider.create(parent_inode, name, mode).await?;
+
+        // Insert into inode table.
+        self.inode_table
+            .get_or_init(child.addr, || async move { child })
+            .await;
+
+        // Insert into directory cache.
+        self.directory_cache.insert(
+            parent,
+            name.to_os_string(),
+            LoadedAddr::new_unchecked(child.addr),
+            false, // not a directory
+        );
+
+        // Initialize empty overlay entry so reads return empty, not 404.
+        self.write_overlay.insert_sync(child.addr, Bytes::new());
+
+        // Open the file for the caller.
+        let open_file = self
+            .open(LoadedAddr::new_unchecked(child.addr), OpenFlags::RDWR)
+            .await?;
+
+        Ok((child, open_file))
+    }
+
     /// Returns a clone of the write overlay handle.
     ///
     /// Used by the FUSE adapter to pass into `ForgetContext` so that

@@ -355,3 +355,132 @@ async fn write_with_gap_fills_zeros() {
     assert_eq!(&data[..], b"\0\0\0\0\0XY");
     assert_eq!(data.len(), 7);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_file_returns_new_inode() {
+    let root = make_inode(1, INodeType::Directory, 0, None);
+
+    let state = MockFsState {
+        directories: [(1, vec![])].into_iter().collect(),
+        next_addr: std::sync::atomic::AtomicU64::new(100),
+        ..MockFsState::default()
+    };
+    let provider = MockFsDataProvider::new(state);
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+
+    let (inode, open_file) = fs
+        .create(LoadedAddr::new_unchecked(1), "newfile.txt".as_ref(), 0o644)
+        .await
+        .unwrap();
+
+    assert_eq!(inode.itype, INodeType::File);
+    assert_eq!(inode.size, 0);
+    assert!(open_file.fh > 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_file_appears_in_readdir() {
+    let root = make_inode(1, INodeType::Directory, 0, None);
+
+    let state = MockFsState {
+        directories: [(1, vec![])].into_iter().collect(),
+        next_addr: std::sync::atomic::AtomicU64::new(100),
+        ..MockFsState::default()
+    };
+    let provider = MockFsDataProvider::new(state);
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+
+    // Populate the directory cache first so readdir sees the empty state.
+    let mut entries_before = vec![];
+    fs.readdir(LoadedAddr::new_unchecked(1), 0, |entry, _offset| {
+        entries_before.push(entry.name.to_os_string());
+        false
+    })
+    .await
+    .unwrap();
+    assert!(entries_before.is_empty());
+
+    // Create a file.
+    let _result = fs
+        .create(LoadedAddr::new_unchecked(1), "created.txt".as_ref(), 0o644)
+        .await
+        .unwrap();
+
+    // readdir should now include the new file.
+    let mut entries_after = vec![];
+    fs.readdir(LoadedAddr::new_unchecked(1), 0, |entry, _offset| {
+        entries_after.push(entry.name.to_os_string());
+        false
+    })
+    .await
+    .unwrap();
+    assert!(
+        entries_after.contains(&std::ffi::OsString::from("created.txt")),
+        "readdir should include the newly created file"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_file_then_write_and_read() {
+    let root = make_inode(1, INodeType::Directory, 0, None);
+
+    let state = MockFsState {
+        directories: [(1, vec![])].into_iter().collect(),
+        next_addr: std::sync::atomic::AtomicU64::new(100),
+        ..MockFsState::default()
+    };
+    let provider = MockFsDataProvider::new(state);
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+
+    let (child, open_file) = fs
+        .create(LoadedAddr::new_unchecked(1), "data.txt".as_ref(), 0o644)
+        .await
+        .unwrap();
+
+    // Write data through the filesystem layer.
+    let child_addr = LoadedAddr::new_unchecked(child.addr);
+    fs.write(child_addr, 0, Bytes::from_static(b"hello create"))
+        .await
+        .unwrap();
+
+    // Read back through the open file handle.
+    let data = open_file.read(0, 1024).await.unwrap();
+    assert_eq!(&data[..], b"hello create");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_in_non_directory_returns_enotdir() {
+    let root = make_inode(1, INodeType::Directory, 0, None);
+    let file = make_inode(2, INodeType::File, 10, Some(1));
+
+    let state = MockFsState {
+        lookups: [((1, "file.txt".into()), file)].into_iter().collect(),
+        directories: [(1, vec![("file.txt".into(), file)])].into_iter().collect(),
+        file_contents: [(2, Bytes::from_static(b"content"))].into_iter().collect(),
+        next_addr: std::sync::atomic::AtomicU64::new(100),
+        ..MockFsState::default()
+    };
+    let provider = MockFsDataProvider::new(state);
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+
+    // Load the file inode.
+    let _ = fs
+        .lookup(LoadedAddr::new_unchecked(1), "file.txt".as_ref())
+        .await
+        .unwrap();
+
+    // Try to create inside a file — should fail with ENOTDIR.
+    let result = fs
+        .create(
+            LoadedAddr::new_unchecked(2),
+            "impossible.txt".as_ref(),
+            0o644,
+        )
+        .await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOTDIR));
+}
