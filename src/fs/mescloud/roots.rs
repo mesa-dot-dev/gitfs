@@ -414,6 +414,22 @@ impl FsDataProvider for OrgChildDP {
             Self::Github(c) => c.forget(addr),
         }
     }
+
+    fn create(
+        &self,
+        parent: INode,
+        name: &OsStr,
+        mode: u32,
+    ) -> impl Future<Output = Result<INode, std::io::Error>> + Send {
+        let this = self.clone();
+        let name = name.to_os_string();
+        async move {
+            match this {
+                Self::Standard(c) => c.create(parent, &name, mode).await,
+                Self::Github(c) => c.create(parent, &name, mode).await,
+            }
+        }
+    }
 }
 
 pub enum OrgChildReader {

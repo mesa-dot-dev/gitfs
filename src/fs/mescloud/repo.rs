@@ -305,6 +305,44 @@ impl FsDataProvider for MesRepoProvider {
     fn forget(&self, addr: InodeAddr) {
         self.remove_path(addr);
     }
+
+    #[expect(clippy::cast_possible_truncation, reason = "mode fits in u16")]
+    fn create(
+        &self,
+        parent: INode,
+        name: &OsStr,
+        mode: u32,
+    ) -> impl Future<Output = Result<INode, std::io::Error>> + Send {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_os_string();
+        async move {
+            let parent_path = inner
+                .path_map
+                .get_async(&parent.addr)
+                .await
+                .map(|e| e.get().clone())
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+            let child_path = parent_path.join(&name);
+            let addr = inner.next_addr.fetch_add(1, Ordering::Relaxed);
+            drop(inner.path_map.insert_async(addr, child_path).await);
+
+            let now = SystemTime::now();
+            let (uid, gid) = inner.fs_owner;
+
+            Ok(INode {
+                addr,
+                permissions: InodePerms::from_bits_truncate(mode as u16),
+                uid,
+                gid,
+                create_time: now,
+                last_modified_at: now,
+                parent: Some(parent.addr),
+                size: 0,
+                itype: INodeType::File,
+            })
+        }
+    }
 }
 
 pub struct MesFileReader {
