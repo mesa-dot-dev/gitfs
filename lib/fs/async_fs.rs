@@ -771,26 +771,31 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         let mut inode = self.loaded_inode(addr).await?;
 
         if let Some(new_size) = size {
-            let existing = self.write_overlay.get(&addr.addr()).await;
-
-            // If there is no overlay entry, read the current content from the
-            // provider so that truncation preserves real data rather than
-            // replacing it with zeros.
-            let mut buf = if let Some(data) = existing {
-                data.to_vec()
-            } else {
-                let reader = self.data_provider.open(inode, OpenFlags::RDONLY).await?;
-                let data = reader
-                    .read(0, inode.size.try_into().unwrap_or(u32::MAX))
-                    .await?;
-                data.to_vec()
-            };
-
             #[expect(
                 clippy::cast_possible_truncation,
                 reason = "new_size fits in usize on supported 64-bit platforms"
             )]
             let new_len = new_size as usize;
+
+            let existing = self.write_overlay.get(&addr.addr()).await;
+
+            // When truncating to zero, skip reading the provider entirely —
+            // the result is always an empty buffer regardless of content.
+            // For other sizes, only read min(new_size, old_size) bytes from
+            // the provider rather than the full file.
+            let mut buf = if new_size == 0 {
+                Vec::new()
+            } else if let Some(data) = existing {
+                data.to_vec()
+            } else {
+                let bytes_to_read = new_size.min(inode.size);
+                let reader = self.data_provider.open(inode, OpenFlags::RDONLY).await?;
+                let data = reader
+                    .read(0, bytes_to_read.try_into().unwrap_or(u32::MAX))
+                    .await?;
+                data.to_vec()
+            };
+
             buf.resize(new_len, 0);
             self.write_overlay
                 .insert_sync(addr.addr(), Bytes::from(buf));

@@ -804,3 +804,40 @@ async fn evict_removes_unwritten_inode() {
         "unwritten inode should be evicted"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setattr_truncate_to_zero_non_overlaid_file() {
+    let root = make_inode(1, INodeType::Directory, 0, None);
+    let file = make_inode(2, INodeType::File, 11, Some(1));
+
+    let state = MockFsState {
+        lookups: [((1, "test.txt".into()), file)].into_iter().collect(),
+        directories: [(1, vec![("test.txt".into(), file)])].into_iter().collect(),
+        file_contents: [(2, Bytes::from_static(b"hello world"))]
+            .into_iter()
+            .collect(),
+        ..MockFsState::default()
+    };
+    let provider = MockFsDataProvider::new(state);
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+
+    let _ = fs
+        .lookup(LoadedAddr::new_unchecked(1), "test.txt".as_ref())
+        .await
+        .unwrap();
+
+    // Truncate to 0 without ever writing to the overlay.
+    let inode = fs
+        .setattr(LoadedAddr::new_unchecked(2), Some(0), None, None)
+        .await
+        .unwrap();
+    assert_eq!(inode.size, 0);
+
+    let open = fs
+        .open(LoadedAddr::new_unchecked(2), OpenFlags::RDONLY)
+        .await
+        .unwrap();
+    let data = open.read(0, 1024).await.unwrap();
+    assert!(data.is_empty(), "truncate to 0 should produce empty file");
+}
