@@ -484,3 +484,95 @@ async fn create_in_non_directory_returns_enotdir() {
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOTDIR));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setattr_updates_size_truncate() {
+    let root = make_inode(1, INodeType::Directory, 0, None);
+    let file = make_inode(2, INodeType::File, 0, Some(1));
+
+    let state = MockFsState {
+        lookups: [((1, "test.txt".into()), file)].into_iter().collect(),
+        directories: [(1, vec![("test.txt".into(), file)])].into_iter().collect(),
+        file_contents: [(2, Bytes::from_static(b""))].into_iter().collect(),
+        ..MockFsState::default()
+    };
+    let provider = MockFsDataProvider::new(state);
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+
+    // Lookup the file to load it into the inode table.
+    let _ = fs
+        .lookup(LoadedAddr::new_unchecked(1), "test.txt".as_ref())
+        .await
+        .unwrap();
+
+    // Write "hello world" to the file.
+    fs.write(
+        LoadedAddr::new_unchecked(2),
+        0,
+        Bytes::from_static(b"hello world"),
+    )
+    .await
+    .unwrap();
+
+    // Truncate to 5 bytes via setattr.
+    let inode = fs
+        .setattr(LoadedAddr::new_unchecked(2), Some(5), None, None)
+        .await
+        .unwrap();
+    assert_eq!(inode.size, 5);
+
+    // Read back — should return "hello".
+    let open = fs
+        .open(LoadedAddr::new_unchecked(2), OpenFlags::RDONLY)
+        .await
+        .unwrap();
+    let data = open.read(0, 1024).await.unwrap();
+    assert_eq!(&data[..], b"hello");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setattr_truncate_to_zero() {
+    let root = make_inode(1, INodeType::Directory, 0, None);
+    let file = make_inode(2, INodeType::File, 0, Some(1));
+
+    let state = MockFsState {
+        lookups: [((1, "test.txt".into()), file)].into_iter().collect(),
+        directories: [(1, vec![("test.txt".into(), file)])].into_iter().collect(),
+        file_contents: [(2, Bytes::from_static(b""))].into_iter().collect(),
+        ..MockFsState::default()
+    };
+    let provider = MockFsDataProvider::new(state);
+    let table = Arc::new(FutureBackedCache::default());
+    let fs = AsyncFs::new(provider, root, Arc::clone(&table)).await;
+
+    // Lookup the file to load it into the inode table.
+    let _ = fs
+        .lookup(LoadedAddr::new_unchecked(1), "test.txt".as_ref())
+        .await
+        .unwrap();
+
+    // Write "content" to the file.
+    fs.write(
+        LoadedAddr::new_unchecked(2),
+        0,
+        Bytes::from_static(b"content"),
+    )
+    .await
+    .unwrap();
+
+    // Truncate to 0 bytes via setattr.
+    let inode = fs
+        .setattr(LoadedAddr::new_unchecked(2), Some(0), None, None)
+        .await
+        .unwrap();
+    assert_eq!(inode.size, 0);
+
+    // Read back — should return empty.
+    let open = fs
+        .open(LoadedAddr::new_unchecked(2), OpenFlags::RDONLY)
+        .await
+        .unwrap();
+    let data = open.read(0, 1024).await.unwrap();
+    assert!(data.is_empty());
+}

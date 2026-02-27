@@ -731,6 +731,50 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         Ok((child, open_file))
     }
 
+    /// Update file attributes (size, timestamps).
+    ///
+    /// Currently supports:
+    /// - `size`: Truncate or extend the file (updates write overlay).
+    /// - `mtime`: Update the last-modified timestamp.
+    /// - `atime`: Accepted but stored as mtime (we don't track atime separately).
+    ///
+    /// Returns the updated inode.
+    pub async fn setattr(
+        &self,
+        addr: LoadedAddr,
+        size: Option<u64>,
+        atime: Option<std::time::SystemTime>,
+        mtime: Option<std::time::SystemTime>,
+    ) -> Result<INode, std::io::Error> {
+        let mut inode = self.loaded_inode(addr).await?;
+
+        if let Some(new_size) = size {
+            let existing = self.write_overlay.get(&addr.addr()).await;
+            let mut buf = existing.map_or_else(Vec::new, |b| b.to_vec());
+
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "new_size fits in usize on supported 64-bit platforms"
+            )]
+            let new_len = new_size as usize;
+            buf.resize(new_len, 0);
+            self.write_overlay
+                .insert_sync(addr.addr(), Bytes::from(buf));
+            inode.size = new_size;
+        }
+
+        if let Some(t) = mtime {
+            inode.last_modified_at = t;
+        } else if let Some(t) = atime {
+            inode.last_modified_at = t;
+        }
+
+        inode.last_modified_at = std::time::SystemTime::now();
+        self.inode_table.insert_sync(addr.addr(), inode);
+
+        Ok(inode)
+    }
+
     /// Returns a clone of the write overlay handle.
     ///
     /// Used by the FUSE adapter to pass into `ForgetContext` so that

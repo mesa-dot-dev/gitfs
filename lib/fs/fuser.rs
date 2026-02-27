@@ -249,6 +249,45 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
             });
     }
 
+    #[instrument(
+        name = "FuserAdapter::setattr",
+        skip(
+            self, _req, _mode, _uid, _gid, size, _atime, _mtime, _ctime, _fh, _crtime, _chgtime,
+            _bkuptime, _flags, reply
+        )
+    )]
+    fn setattr(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<fuser::TimeOrNow>,
+        _mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<std::time::SystemTime>,
+        _fh: Option<u64>,
+        _crtime: Option<std::time::SystemTime>,
+        _chgtime: Option<std::time::SystemTime>,
+        _bkuptime: Option<std::time::SystemTime>,
+        _flags: Option<u32>,
+        reply: fuser::ReplyAttr,
+    ) {
+        self.runtime
+            .block_on(async {
+                self.inner
+                    .get_fs()
+                    .setattr(LoadedAddr::new_unchecked(ino), size, None, None)
+                    .await
+            })
+            .fuse_reply(reply, |inode, reply| {
+                let attr = inode_to_fuser_attr(&inode, BLOCK_SIZE);
+                debug!(?attr, "replying...");
+                reply.attr(&Self::SHAMEFUL_TTL, &attr);
+            });
+    }
+
     #[instrument(name = "FuserAdapter::opendir", skip(self, _req, _flags, reply))]
     fn opendir(
         &mut self,
