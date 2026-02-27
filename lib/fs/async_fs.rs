@@ -96,6 +96,19 @@ pub trait FsDataProvider: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<u32, std::io::Error>> + Send {
         async { Err(std::io::Error::from_raw_os_error(libc::EROFS)) }
     }
+
+    /// Create a new file in the given parent directory.
+    ///
+    /// Returns the inode for the newly created file. The default
+    /// implementation returns `EROFS` (read-only filesystem).
+    fn create(
+        &self,
+        _parent: INode,
+        _name: &OsStr,
+        _mode: u32,
+    ) -> impl Future<Output = Result<INode, std::io::Error>> + Send {
+        async { Err(std::io::Error::from_raw_os_error(libc::EROFS)) }
+    }
 }
 
 /// Zero-sized cleanup tag for inode eviction.

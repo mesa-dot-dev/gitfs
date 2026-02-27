@@ -20,6 +20,25 @@ use git_fs::fs::{INodeType, InodeForget, LoadedAddr, OpenFlags};
 use common::async_fs_mocks::{MockFsDataProvider, MockFsState, make_inode};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_method_exists_on_provider() {
+    let parent = make_inode(1, INodeType::Directory, 0, None);
+
+    let state = MockFsState {
+        next_addr: std::sync::atomic::AtomicU64::new(100),
+        ..MockFsState::default()
+    };
+    let provider = MockFsDataProvider::new(state);
+
+    let result = provider.create(parent, "newfile.txt".as_ref(), 0o644).await;
+    assert!(result.is_ok());
+    let inode = result.unwrap();
+    assert_eq!(inode.addr, 100);
+    assert_eq!(inode.itype, INodeType::File);
+    assert_eq!(inode.size, 0);
+    assert_eq!(inode.parent, Some(1));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_method_exists_on_provider() {
     let _root = make_inode(1, INodeType::Directory, 0, None);
     let file = make_inode(2, INodeType::File, 0, Some(1));
