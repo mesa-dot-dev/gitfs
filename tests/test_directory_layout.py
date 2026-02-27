@@ -1,4 +1,4 @@
-"""Compare directory layout of git-fs mounted repos vs git clone --depth 1."""
+"""Compare directory layout and file contents of git-fs vs git clone."""
 
 from __future__ import annotations
 
@@ -81,7 +81,8 @@ def dfs_compare(
     """Recursively compare two directory trees, raising AssertionError on mismatch.
 
     Walks both trees simultaneously via sorted iterdir(), comparing child
-    names and entry types at each level, then recursing into subdirectories.
+    names, entry types, file contents, and symlink targets at each level,
+    then recursing into subdirectories.
     """
 
     def _is_excluded(name: str) -> bool:
@@ -93,7 +94,22 @@ def dfs_compare(
         f"Entry mismatch at {lhs.name}: {lhs} is {lhs_info}, {rhs} is {rhs_info}"
     )
 
-    if lhs_info.kind is not EntryKind.DIRECTORY:
+    if lhs_info.kind is EntryKind.SYMLINK:
+        lhs_target = lhs.readlink()
+        rhs_target = rhs.readlink()
+        assert lhs_target == rhs_target, (
+            f"Symlink target mismatch at {lhs.name}: "
+            f"{lhs} -> {lhs_target}, {rhs} -> {rhs_target}"
+        )
+        return
+
+    if lhs_info.kind is EntryKind.FILE:
+        lhs_bytes = lhs.read_bytes()
+        rhs_bytes = rhs.read_bytes()
+        assert lhs_bytes == rhs_bytes, (
+            f"Content mismatch at {lhs.name}: "
+            f"{lhs} ({len(lhs_bytes)} bytes) != {rhs} ({len(rhs_bytes)} bytes)"
+        )
         return
 
     lhs_children = sorted(
@@ -127,7 +143,8 @@ def dfs_compare(
 def test_directory_layout_matches_clone(repo_slug: str) -> None:
     """Compare the directory tree visible through git-fs with a shallow clone.
 
-    Only entry names and types (file/directory/symlink) are compared, NOT contents.
+    Entry names, types (file/directory/symlink), file contents, and symlink
+    targets are all compared.
     """
     owner, repo = repo_slug.split("/", 1)
     clone_dest = shallow_clone(repo_slug)
