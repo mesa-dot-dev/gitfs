@@ -1286,9 +1286,9 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "mesa-dev"
-version = "1.15.0"
+version = "1.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92979030f29144d605a5f077fe21502b5397b30af92da92d2ca3d11051c8ff6c"
+checksum = "c9cecde64da76a423a5324f8e9c29d654c7bb5609bff442fe7946b42d1dab662"
 dependencies = [
  "async-stream",
  "futures-core",
@@ -1303,9 +1303,9 @@ dependencies = [
 
 [[package]]
 name = "mesa_dev_oapi"
-version = "1.15.0"
+version = "1.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4456b424726e1dbf9e3ac4763438eda69939458a6cd50ca06dd65d7333b75ff1"
+checksum = "abe015140391f9039cf46907020012c1a68eb647d0757da305b779fa19ccc25b"
 dependencies = [
  "reqwest",
  "reqwest-middleware",
