@@ -460,6 +460,10 @@ where
         let inner_parent =
             inner_parent.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
 
+        // The inner `AsyncFs::create` returns `(INode, OpenFile)` but only the
+        // inode is needed here. The trait `FsDataProvider::create` returns just
+        // `INode`; the outer `AsyncFs::create` opens its own file handle via a
+        // separate `self.open()` call. The inner `OpenFile` is dropped safely.
         let child_inode = child
             .get_fs()
             .create(LoadedAddr::new_unchecked(inner_parent), name, mode)
