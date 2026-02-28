@@ -603,6 +603,35 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
             });
     }
 
+    #[instrument(name = "FuserAdapter::rename", skip(self, _req, _flags, reply))]
+    fn rename(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        _flags: u32,
+        reply: fuser::ReplyEmpty,
+    ) {
+        self.runtime
+            .block_on(async {
+                self.inner
+                    .get_fs()
+                    .rename(
+                        LoadedAddr::new_unchecked(parent),
+                        name,
+                        LoadedAddr::new_unchecked(newparent),
+                        newname,
+                    )
+                    .await
+            })
+            .fuse_reply(reply, |(), reply| {
+                debug!("replying ok");
+                reply.ok();
+            });
+    }
+
     #[instrument(
         name = "FuserAdapter::release",
         skip(self, _req, _ino, fh, _flags, _lock_owner, _flush, reply)
