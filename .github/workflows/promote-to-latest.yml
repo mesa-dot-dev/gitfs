@@ -42,9 +42,9 @@ jobs:
           echo "Found canary release: ${CANARY_TAG}"
           echo "tag=${CANARY_TAG}" >> "$GITHUB_OUTPUT"
 
-          # Extract the version from the release title (e.g. "git-fs 0.1.0+024e288 (canary)")
+          # Extract the version from the release title (e.g. "mesafs 0.1.0+024e288 (canary)")
           VERSION=$(gh release view "${CANARY_TAG}" --json name --jq '.name' \
-            | sed 's/^git-fs //' | sed 's/ (canary)$//')
+            | sed 's/^mesafs //' | sed 's/ (canary)$//')
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
           BASE_VERSION=$(echo "${VERSION}" | sed 's/+.*//')
@@ -67,14 +67,14 @@ jobs:
       - name: Rename assets to stable paths
         run: |
           cd assets
-          for f in git-fs_*.deb; do
-            # e.g. git-fs_ubuntu-24.04_0.1.1-alpha+abc1234_arm64.deb → git-fs_ubuntu-24.04_arm64.deb
-            stable=$(echo "$f" | sed -E 's/git-fs_([^_]+)_[^_]+_([^.]+)\.deb/git-fs_\1_\2.deb/')
+          for f in mesafs_*.deb; do
+            # e.g. mesafs_ubuntu-24.04_0.1.1-alpha+abc1234_arm64.deb → mesafs_ubuntu-24.04_arm64.deb
+            stable=$(echo "$f" | sed -E 's/mesafs_([^_]+)_[^_]+_([^.]+)\.deb/mesafs_\1_\2.deb/')
             [ "$f" != "$stable" ] && mv "$f" "$stable"
           done
-          for f in git-fs_*.rpm; do
-            # e.g. git-fs_rocky-8_0.1.0+abc1234-1.x86_64.rpm → git-fs_rocky-8.x86_64.rpm
-            stable=$(echo "$f" | sed -E 's/git-fs_([^_]+)_.+\.(x86_64|aarch64)\.rpm/git-fs_\1.\2.rpm/')
+          for f in mesafs_*.rpm; do
+            # e.g. mesafs_rocky-8_0.1.0+abc1234-1.x86_64.rpm → mesafs_rocky-8.x86_64.rpm
+            stable=$(echo "$f" | sed -E 's/mesafs_([^_]+)_.+\.(x86_64|aarch64)\.rpm/mesafs_\1.\2.rpm/')
             [ "$f" != "$stable" ] && mv "$f" "$stable"
           done
           echo "Renamed assets:"
@@ -103,8 +103,8 @@ jobs:
           TARGET: ${{ steps.canary.outputs.target }}
         run: |
           gh release create latest \
-            --title "git-fs ${VERSION}" \
-            --notes "Stable release of git-fs ${VERSION}.
+            --title "mesafs ${VERSION}" \
+            --notes "Stable release of mesafs ${VERSION}.
 
           Promoted from canary release [\`${CANARY_TAG}\`](https://github.com/${{ github.repository }}/releases/tag/${CANARY_TAG})." \
             --target "${TARGET}" \
@@ -123,8 +123,8 @@ jobs:
             exit 0
           fi
           gh release create "${TAG}" \
-            --title "git-fs ${BASE_VERSION}" \
-            --notes "Stable release of git-fs ${BASE_VERSION}." \
+            --title "mesafs ${BASE_VERSION}" \
+            --notes "Stable release of mesafs ${BASE_VERSION}." \
             --target "${TARGET}" \
             assets/*
 
@@ -148,7 +148,7 @@ jobs:
           latest-path: Formula/mesafs.rb
           versioned-path: "Formula/mesafs@${VERSION}.rb"
           version: ${{ needs.promote.outputs.base_version }}
-          url: "https://github.com/${{ github.repository }}/releases/download/v${{ needs.promote.outputs.base_version }}/git-fs-macos-universal.tar.gz"
-          commit-message: "git-fs ${VERSION}"
+          url: "https://github.com/${{ github.repository }}/releases/download/v${{ needs.promote.outputs.base_version }}/mesafs-macos-universal.tar.gz"
+          commit-message: "mesafs ${VERSION}"
           committer-name: "mesa-ci[bot]"
           committer-email: ci-bot@mesa.dev
