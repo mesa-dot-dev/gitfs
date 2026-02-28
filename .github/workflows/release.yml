@@ -29,7 +29,7 @@ jobs:
         run: |
           SHORT_SHA=$(git rev-parse --short HEAD)
           BASE_VERSION=$(cargo metadata --no-deps --format-version=1 \
-            | jq -r '.packages[] | select(.name == "git-fs") | .version')
+            | jq -r '.packages[] | select(.name == "mesafs") | .version')
           VERSION="${BASE_VERSION}+${SHORT_SHA}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
@@ -108,8 +108,8 @@ jobs:
 
       - name: Rename deb with distro tag
         run: |
-          for f in target/debian/git-fs_*.deb; do
-            newname=$(echo "$f" | sed "s/git-fs_/git-fs_${{ matrix.distro.name }}_/")
+          for f in target/debian/mesafs_*.deb; do
+            newname=$(echo "$f" | sed "s/mesafs_/mesafs_${{ matrix.distro.name }}_/")
             mv "$f" "$newname"
           done
 
@@ -117,7 +117,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: deb-${{ matrix.distro.name }}-${{ matrix.arch.name }}
-          path: target/debian/git-fs_*.deb
+          path: target/debian/mesafs_*.deb
 
   linux-rpm:
     name: Linux RPM (${{ matrix.distro.name }} ${{ matrix.arch.name }})
@@ -220,8 +220,8 @@ jobs:
 
       - name: Rename rpm with distro tag
         run: |
-          for f in target/generate-rpm/git-fs-*.rpm; do
-            newname=$(echo "$f" | sed "s/git-fs-/git-fs_${{ matrix.distro.name }}_/")
+          for f in target/generate-rpm/mesafs-*.rpm; do
+            newname=$(echo "$f" | sed "s/mesafs-/mesafs_${{ matrix.distro.name }}_/")
             mv "$f" "$newname"
           done
 
@@ -229,7 +229,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rpm-${{ matrix.distro.name }}-${{ matrix.arch.name }}
-          path: target/generate-rpm/git-fs_*.rpm
+          path: target/generate-rpm/mesafs_*.rpm
 
   linux-tarball:
     name: Linux tarball (${{ matrix.arch }})
@@ -283,16 +283,16 @@ jobs:
 
       - name: Create tarball
         run: |
-          chmod +x target/release/git-fs
-          TARBALL="git-fs-linux-${{ matrix.arch }}.tar.gz"
-          tar -czf "${TARBALL}" -C target/release git-fs
+          chmod +x target/release/mesafs
+          TARBALL="mesafs-linux-${{ matrix.arch }}.tar.gz"
+          tar -czf "${TARBALL}" -C target/release mesafs
           echo "Created ${TARBALL}"
 
       - name: Upload tarball
         uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.arch }}
-          path: git-fs-linux-${{ matrix.arch }}.tar.gz
+          path: mesafs-linux-${{ matrix.arch }}.tar.gz
 
   macos-build:
     name: macOS (${{ matrix.arch }})
@@ -328,7 +328,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.arch }}
-          path: target/${{ matrix.target }}/release/git-fs
+          path: target/${{ matrix.target }}/release/mesafs
 
   macos-universal:
     name: macOS universal binary
@@ -349,19 +349,19 @@ jobs:
 
       - name: Create universal binary
         run: |
-          lipo -create x86_64/git-fs arm64/git-fs -output git-fs
-          chmod +x git-fs
-          file git-fs
-          lipo -info git-fs
+          lipo -create x86_64/mesafs arm64/mesafs -output mesafs
+          chmod +x mesafs
+          file mesafs
+          lipo -info mesafs
 
       - name: Create tarball
-        run: tar -czf git-fs-macos-universal.tar.gz git-fs
+        run: tar -czf mesafs-macos-universal.tar.gz mesafs
 
       - name: Upload universal tarball
         uses: actions/upload-artifact@v4
         with:
           name: macos-universal
-          path: git-fs-macos-universal.tar.gz
+          path: mesafs-macos-universal.tar.gz
 
   release:
     name: Create GitHub Release
@@ -384,7 +384,7 @@ jobs:
           TAG="canary-${SHORT_SHA}"
           gh release create "${TAG}" \
             --prerelease \
-            --title "git-fs ${{ needs.version.outputs.version }} (canary)" \
+            --title "mesafs ${{ needs.version.outputs.version }} (canary)" \
             --notes "⚠️ **Canary release** — built automatically from \`main\` at ${{ github.sha }}. Not a stable release." \
             --target "${{ github.sha }}" \
             install.sh \

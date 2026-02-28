@@ -177,8 +177,8 @@ jobs:
       - name: Run install.sh -y
         run: sh install.sh -y
 
-      - name: Verify git-fs is on PATH
-        run: git-fs --version
+      - name: Verify mesafs is in PATH
+        run: mesafs --version
 
   test-install-rpm:
     name: RPM · ${{ matrix.distro.name }}
@@ -209,8 +209,8 @@ jobs:
       - name: Run install.sh -y
         run: sh install.sh -y
 
-      - name: Verify git-fs is on PATH
-        run: git-fs --version
+      - name: Verify mesafs on PATH
+        run: mesafs --version
 
   test-install-tarball:
     name: Tarball · archlinux
@@ -229,8 +229,8 @@ jobs:
       - name: Run install.sh -y
         run: sh install.sh -y
 
-      - name: Verify git-fs was installed
-        run: test -x /usr/local/bin/git-fs
+      - name: Verify mesafs was installed
+        run: test -x /usr/local/bin/mesafs
 
   test-install-macos:
     name: macOS · homebrew
@@ -243,5 +243,5 @@ jobs:
       - name: Run install.sh
         run: sh install.sh
 
-      - name: Verify git-fs is on PATH
-        run: git-fs --version
+      - name: Verify mesafs is on PATH
+        run: mesafs --version
