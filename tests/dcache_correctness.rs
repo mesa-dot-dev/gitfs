@@ -1,13 +1,14 @@
 #![allow(clippy::unwrap_used, clippy::doc_markdown, missing_docs)]
 
 use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 
 use git_fs::fs::LoadedAddr;
 use git_fs::fs::dcache::{DCache, PopulateStatus};
 
 #[tokio::test]
 async fn lookup_returns_none_for_missing_entry() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     assert!(
         cache
             .lookup(LoadedAddr::new_unchecked(1), OsStr::new("foo"))
@@ -17,7 +18,7 @@ async fn lookup_returns_none_for_missing_entry() {
 
 #[tokio::test]
 async fn insert_then_lookup() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     cache.insert(
         LoadedAddr::new_unchecked(1),
         OsString::from("foo"),
@@ -33,7 +34,7 @@ async fn insert_then_lookup() {
 
 #[tokio::test]
 async fn readdir_returns_only_children_of_parent() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     cache.insert(
         LoadedAddr::new_unchecked(1),
         OsString::from("a"),
@@ -64,7 +65,7 @@ async fn readdir_returns_only_children_of_parent() {
 
 #[tokio::test]
 async fn readdir_empty_parent_returns_empty() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let mut children = Vec::new();
     cache.readdir(LoadedAddr::new_unchecked(1), |name, dvalue| {
         children.push((name.to_os_string(), dvalue.clone()));
@@ -74,7 +75,7 @@ async fn readdir_empty_parent_returns_empty() {
 
 #[tokio::test]
 async fn try_claim_populate_unclaimed_returns_claimed() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     assert!(matches!(
         cache.try_claim_populate(LoadedAddr::new_unchecked(1)),
         PopulateStatus::Claimed(_)
@@ -83,7 +84,7 @@ async fn try_claim_populate_unclaimed_returns_claimed() {
 
 #[tokio::test]
 async fn finish_populate_then_claim_returns_done() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let PopulateStatus::Claimed(receipt) = cache.try_claim_populate(LoadedAddr::new_unchecked(1))
     else {
         panic!("expected Claimed")
@@ -97,7 +98,7 @@ async fn finish_populate_then_claim_returns_done() {
 
 #[tokio::test]
 async fn double_claim_returns_in_progress() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     assert!(matches!(
         cache.try_claim_populate(LoadedAddr::new_unchecked(1)),
         PopulateStatus::Claimed(_)
@@ -110,7 +111,7 @@ async fn double_claim_returns_in_progress() {
 
 #[tokio::test]
 async fn abort_populate_allows_reclaim() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let PopulateStatus::Claimed(receipt) = cache.try_claim_populate(LoadedAddr::new_unchecked(1))
     else {
         panic!("expected Claimed")
@@ -124,7 +125,7 @@ async fn abort_populate_allows_reclaim() {
 
 #[tokio::test]
 async fn insert_does_not_mark_populated() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     cache.insert(
         LoadedAddr::new_unchecked(1),
         OsString::from("foo"),
@@ -142,7 +143,7 @@ async fn insert_does_not_mark_populated() {
 
 #[tokio::test]
 async fn upsert_overwrites_existing_entry() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     cache.insert(
         LoadedAddr::new_unchecked(1),
         OsString::from("foo"),
@@ -164,7 +165,7 @@ async fn upsert_overwrites_existing_entry() {
 
 #[tokio::test]
 async fn readdir_returns_entries_in_sorted_order() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     for (i, name) in ["zebra", "apple", "mango"].iter().enumerate() {
         cache.insert(
             LoadedAddr::new_unchecked(1),
@@ -182,7 +183,7 @@ async fn readdir_returns_entries_in_sorted_order() {
 
 #[tokio::test]
 async fn child_dir_addrs_returns_only_directories() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let parent = LoadedAddr::new_unchecked(1);
     cache.insert(
         parent,
@@ -217,14 +218,14 @@ async fn child_dir_addrs_returns_only_directories() {
 
 #[tokio::test]
 async fn child_dir_addrs_returns_empty_for_unknown_parent() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let dirs = cache.child_dir_addrs(LoadedAddr::new_unchecked(999));
     assert!(dirs.is_empty());
 }
 
 #[tokio::test]
 async fn remove_child_returns_removed_entry() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let parent = LoadedAddr::new_unchecked(1);
     cache.insert(
         parent,
@@ -245,14 +246,14 @@ async fn remove_child_returns_removed_entry() {
 
 #[tokio::test]
 async fn remove_child_returns_none_for_missing_entry() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let parent = LoadedAddr::new_unchecked(1);
     assert!(cache.remove_child(parent, OsStr::new("nope")).is_none());
 }
 
 #[tokio::test]
 async fn remove_child_does_not_affect_siblings() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let parent = LoadedAddr::new_unchecked(1);
     cache.insert(
         parent,
@@ -275,7 +276,7 @@ async fn remove_child_does_not_affect_siblings() {
 
 #[tokio::test]
 async fn remove_parent_resets_populate_status() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let parent = LoadedAddr::new_unchecked(1);
     cache.insert(
         parent,
@@ -308,7 +309,7 @@ async fn remove_parent_resets_populate_status() {
 
 #[tokio::test]
 async fn remove_parent_returns_false_for_unknown() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     assert!(
         !cache.remove_parent(LoadedAddr::new_unchecked(999)),
         "should return false for unknown parent"
@@ -317,7 +318,7 @@ async fn remove_parent_returns_false_for_unknown() {
 
 #[tokio::test]
 async fn evict_removes_child_and_resets_populate_status() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let parent = LoadedAddr::new_unchecked(1);
     let child = LoadedAddr::new_unchecked(10);
     cache.insert(parent, OsString::from("foo"), child, false);
@@ -343,14 +344,14 @@ async fn evict_removes_child_and_resets_populate_status() {
 
 #[tokio::test]
 async fn evict_unknown_child_is_noop() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     // Should not panic or corrupt state.
     cache.evict(LoadedAddr::new_unchecked(999));
 }
 
 #[tokio::test]
 async fn evict_does_not_affect_siblings() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let parent = LoadedAddr::new_unchecked(1);
     cache.insert(
         parent,
@@ -382,7 +383,7 @@ async fn evict_does_not_affect_siblings() {
 
 #[tokio::test]
 async fn evict_child_from_multiple_parents_removes_from_correct_parent() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let parent_a = LoadedAddr::new_unchecked(1);
     let parent_b = LoadedAddr::new_unchecked(2);
     let child = LoadedAddr::new_unchecked(10);
@@ -399,7 +400,7 @@ async fn evict_child_from_multiple_parents_removes_from_correct_parent() {
 
 #[tokio::test]
 async fn evict_during_populate_invalidates_generation() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let parent = LoadedAddr::new_unchecked(1);
     let child = LoadedAddr::new_unchecked(10);
     cache.insert(parent, OsString::from("foo"), child, false);
@@ -427,7 +428,7 @@ async fn evict_during_populate_invalidates_generation() {
 
 #[tokio::test]
 async fn evict_then_reinsert_same_child_leaves_consistent_state() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let parent_a = LoadedAddr::new_unchecked(1);
     let parent_b = LoadedAddr::new_unchecked(2);
     let child = LoadedAddr::new_unchecked(10);
@@ -456,7 +457,7 @@ async fn evict_then_reinsert_same_child_leaves_consistent_state() {
 async fn evict_with_concurrent_reparent_does_not_corrupt() {
     // Simulates the interleaving where insert re-parents a child between
     // evict's parent lookup and write-lock acquisition.
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let parent_a = LoadedAddr::new_unchecked(1);
     let parent_b = LoadedAddr::new_unchecked(2);
     let child = LoadedAddr::new_unchecked(10);
@@ -491,7 +492,7 @@ async fn evict_with_concurrent_reparent_does_not_corrupt() {
 
 #[tokio::test]
 async fn insert_reparent_removes_stale_entry_from_old_parent() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let parent_a = LoadedAddr::new_unchecked(1);
     let parent_b = LoadedAddr::new_unchecked(2);
     let child = LoadedAddr::new_unchecked(10);
@@ -513,7 +514,7 @@ async fn insert_reparent_removes_stale_entry_from_old_parent() {
 
 #[tokio::test]
 async fn insert_reparent_resets_old_parent_populate_status() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let parent_a = LoadedAddr::new_unchecked(1);
     let parent_b = LoadedAddr::new_unchecked(2);
     let child = LoadedAddr::new_unchecked(10);
@@ -543,7 +544,7 @@ async fn insert_reparent_resets_old_parent_populate_status() {
 
 #[tokio::test]
 async fn insert_reparent_does_not_remove_reused_name_in_old_parent() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let parent_a = LoadedAddr::new_unchecked(1);
     let parent_b = LoadedAddr::new_unchecked(2);
     let child_1 = LoadedAddr::new_unchecked(10);
@@ -587,7 +588,7 @@ async fn insert_reparent_does_not_remove_reused_name_in_old_parent() {
 /// the window.
 #[tokio::test]
 async fn evict_during_in_progress_resets_populate_status() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let parent = LoadedAddr::new_unchecked(1);
     let child = LoadedAddr::new_unchecked(10);
     cache.insert(parent, OsString::from("foo"), child, false);
@@ -620,7 +621,7 @@ async fn evict_during_in_progress_resets_populate_status() {
 /// with stale generation must leave the directory re-claimable.
 #[tokio::test]
 async fn evict_during_in_progress_then_finish_populate_stays_unclaimed() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let parent = LoadedAddr::new_unchecked(1);
     let child_a = LoadedAddr::new_unchecked(10);
     let child_b = LoadedAddr::new_unchecked(11);
@@ -650,7 +651,7 @@ async fn evict_during_in_progress_then_finish_populate_stays_unclaimed() {
 
 #[tokio::test]
 async fn insert_reparent_same_parent_removes_old_name() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let parent = LoadedAddr::new_unchecked(1);
     let child = LoadedAddr::new_unchecked(10);
 
@@ -672,7 +673,7 @@ async fn insert_reparent_same_parent_removes_old_name() {
 /// removed), remove_parent must not clobber the new reverse-index entries.
 #[tokio::test]
 async fn remove_parent_does_not_clobber_concurrent_reinsert_reverse_index() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let parent_a = LoadedAddr::new_unchecked(1);
     let parent_b = LoadedAddr::new_unchecked(2);
     let child = LoadedAddr::new_unchecked(10);
@@ -711,7 +712,7 @@ async fn remove_parent_does_not_clobber_concurrent_reinsert_reverse_index() {
 /// 4. A subsequent try_claim_populate must succeed (UNCLAIMED, not DONE).
 #[tokio::test]
 async fn evict_generation_bump_prevents_stale_finish_populate() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let parent = LoadedAddr::new_unchecked(1);
     let child = LoadedAddr::new_unchecked(10);
 
@@ -745,7 +746,7 @@ async fn evict_generation_bump_prevents_stale_finish_populate() {
 
 #[tokio::test]
 async fn is_populated_returns_false_for_unknown_parent() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     assert!(
         !cache.is_populated(LoadedAddr::new_unchecked(1)),
         "unknown parent should not be populated"
@@ -754,7 +755,7 @@ async fn is_populated_returns_false_for_unknown_parent() {
 
 #[tokio::test]
 async fn is_populated_returns_false_before_finish_populate() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let parent = LoadedAddr::new_unchecked(1);
     let PopulateStatus::Claimed(_gen) = cache.try_claim_populate(parent) else {
         panic!("should claim");
@@ -767,7 +768,7 @@ async fn is_populated_returns_false_before_finish_populate() {
 
 #[tokio::test]
 async fn is_populated_returns_true_after_finish_populate() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let parent = LoadedAddr::new_unchecked(1);
     let PopulateStatus::Claimed(claim_gen) = cache.try_claim_populate(parent) else {
         panic!("should claim");
@@ -781,7 +782,7 @@ async fn is_populated_returns_true_after_finish_populate() {
 
 #[tokio::test]
 async fn is_populated_returns_false_after_eviction() {
-    let cache = DCache::new();
+    let cache = DCache::new(PathBuf::from("/"));
     let parent = LoadedAddr::new_unchecked(1);
     cache.insert(
         parent,

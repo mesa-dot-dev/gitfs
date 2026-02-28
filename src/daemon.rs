@@ -43,7 +43,8 @@ mod managed_fuse {
             let mut org_children = Vec::new();
             for (org_name, org_conf) in &config.organizations {
                 let client =
-                    crate::fs::mescloud::build_mesa_client(org_conf.api_key.expose_secret());
+                    crate::fs::mescloud::build_mesa_client(org_conf.api_key.expose_secret())
+                        .map_err(std::io::Error::other)?;
                 let dp = if org_name == "github" {
                     let github_org_root = crate::fs::mescloud::roots::GithubOrgRoot::new(
                         client,

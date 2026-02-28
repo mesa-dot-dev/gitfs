@@ -49,7 +49,7 @@ impl reqwest_middleware::Middleware for OtelPropagationMiddleware {
     }
 }
 
-pub fn build_mesa_client(api_key: &str) -> MesaClient {
+pub fn build_mesa_client(api_key: &str) -> Result<MesaClient, mesa_dev::BuildError> {
     let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
         .with(OtelPropagationMiddleware)
         .build();

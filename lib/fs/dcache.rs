@@ -1,11 +1,17 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use ignore::gitignore::Gitignore;
 use tokio::sync::Notify;
 
 use crate::fs::LoadedAddr;
+
+/// File names recognized as directory-scoped ignore rule sources.
+#[expect(dead_code, reason = "will be used by upcoming DCache callers")]
+pub(crate) const IGNORE_FILENAMES: &[&str] = &[".gitignore", ".mesafs-ignore"];
 
 /// Cached metadata for a directory entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +94,10 @@ struct DirState {
     /// overhead in the uncontended case. Do NOT introduce `.await` calls
     /// while holding a guard — this would block the tokio worker thread.
     children: RwLock<BTreeMap<OsString, DValue>>,
+    /// Per-directory gitignore matchers, keyed by source filename (e.g.
+    /// `".gitignore"`, `".mesafs-ignore"`). Multiple ignore files in the same
+    /// directory coexist; all matchers are checked during ignore queries.
+    ignore: RwLock<HashMap<String, Gitignore>>,
     /// Population flag: `0` = unclaimed, `u64::MAX` = done, other = in-progress
     /// with the value being the claim token.
     populated: AtomicU64,
@@ -103,6 +113,7 @@ impl DirState {
     fn new() -> Self {
         Self {
             children: RwLock::new(BTreeMap::new()),
+            ignore: RwLock::new(HashMap::new()),
             populated: AtomicU64::new(POPULATE_UNCLAIMED),
             generation: AtomicU64::new(0),
             notify: Notify::new(),
@@ -117,6 +128,7 @@ impl DirState {
 /// flag encoded as an [`AtomicU64`] claim token. This makes `readdir`
 /// O(k) in the number of children with zero sorting overhead.
 pub struct DCache {
+    root: PathBuf,
     dirs: scc::HashMap<LoadedAddr, Arc<DirState>>,
     /// Reverse index: child inode -> parent inode, for O(1) parent discovery
     /// during eviction.
@@ -129,17 +141,12 @@ pub struct DCache {
     next_claim_token: AtomicU64,
 }
 
-impl Default for DCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl DCache {
-    /// Creates an empty directory cache.
+    /// Creates an empty directory cache rooted at `root`.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(root: PathBuf) -> Self {
         Self {
+            root,
             dirs: scc::HashMap::new(),
             child_to_parent: scc::HashMap::new(),
             child_to_name: scc::HashMap::new(),
@@ -549,5 +556,185 @@ impl DCache {
             // future, so spurious wakeups just re-check the flag.
             notified.await;
         }
+    }
+
+    /// Walk the `child_to_parent` chain from `ino` up to the root, collecting
+    /// path components. Returns the absolute path (prefixed with `self.root`).
+    ///
+    /// Returns `self.root` if `ino` has no parent mapping (i.e., it is the root).
+    fn resolve_path(&self, ino: LoadedAddr) -> PathBuf {
+        let mut components = Vec::new();
+        let mut current = ino;
+
+        // These two reads are not atomic; a concurrent evict/insert could make
+        // them inconsistent. This is acceptable: a stale path only affects
+        // ignore rule scoping, which is corrected on the next observation.
+        loop {
+            let name = self.child_to_name.read_sync(&current, |_, n| n.clone());
+            let parent = self.child_to_parent.read_sync(&current, |_, &p| p);
+
+            match (name, parent) {
+                (Some(n), Some(p)) => {
+                    components.push(n);
+                    current = p;
+                }
+                _ => break,
+            }
+        }
+
+        components.reverse();
+        let mut path = self.root.clone();
+        for c in &components {
+            path.push(c);
+        }
+        path
+    }
+
+    /// Set ignore rules for a directory from the content of an ignore file.
+    ///
+    /// `parent_ino` is the directory containing the ignore file.
+    /// `filename` is the name of the ignore file (e.g. `".gitignore"` or
+    /// `".mesafs-ignore"`). Multiple files coexist — setting rules for one
+    /// filename does not affect rules loaded from another.
+    /// `content` is the text content of the ignore file.
+    ///
+    /// The rules are scoped to `parent_ino`'s subtree by using its resolved
+    /// path as the `GitignoreBuilder` root.
+    pub fn set_ignore_rules(&self, parent_ino: LoadedAddr, filename: &str, content: &str) {
+        let dir_path = self.resolve_path(parent_ino);
+
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(&dir_path);
+        let ignore_file_path = dir_path.join(filename);
+        for line in content.lines() {
+            if let Err(e) = builder.add_line(Some(ignore_file_path.clone()), line) {
+                tracing::warn!(%e, "failed to parse ignore rule line");
+            }
+        }
+
+        match builder.build() {
+            Ok(matcher) => {
+                let state = self.dir_state(parent_ino);
+                let mut guard = state
+                    .ignore
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.insert(filename.to_owned(), matcher);
+            }
+            Err(e) => {
+                tracing::warn!(%e, "failed to build ignore matcher");
+            }
+        }
+    }
+
+    /// Remove ignore rules loaded from a specific file in a directory (e.g.,
+    /// when `.gitignore` is deleted). Rules from other files (e.g.
+    /// `.mesafs-ignore`) are preserved.
+    pub fn clear_ignore_rules(&self, parent_ino: LoadedAddr, filename: &str) {
+        if let Some(state) = self.dirs.read_sync(&parent_ino, |_, v| Arc::clone(v)) {
+            let mut guard = state
+                .ignore
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.remove(filename);
+        }
+    }
+
+    /// Check whether a child inode is ignored by any ancestor's ignore rules.
+    ///
+    /// Walks from `child_ino` up to the root via `child_to_parent`. At each
+    /// ancestor directory, if a `Gitignore` matcher is present, the child's
+    /// resolved path is tested. The deepest matching rule wins (Git semantics).
+    ///
+    /// Returns `false` if the child is not in the cache or has no matching
+    /// ignore rule.
+    #[must_use]
+    pub fn is_ignored(&self, child_ino: LoadedAddr) -> bool {
+        let child_path = self.resolve_path(child_ino);
+
+        // Determine is_dir from the child's DValue in its parent's children
+        // map. Each lock is acquired and released independently to avoid a
+        // lock-ordering inversion with `evict()`, which acquires
+        // `children.write()` before `child_to_parent` bucket locks.
+        let parent = self.child_to_parent.read_sync(&child_ino, |_, &p| p);
+        let name = self.child_to_name.read_sync(&child_ino, |_, n| n.clone());
+        let is_dir = match (parent, name) {
+            (Some(p), Some(n)) => self
+                .dirs
+                .read_sync(&p, |_, state| {
+                    let children = state
+                        .children
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    children.get(&n).map(|dv| dv.is_dir)
+                })
+                .flatten(),
+            _ => None,
+        }
+        .unwrap_or(false);
+
+        let mut current = child_ino;
+        while let Some(parent) = self.child_to_parent.read_sync(&current, |_, &p| p) {
+            if let Some(state) = self.dirs.read_sync(&parent, |_, v| Arc::clone(v)) {
+                let guard = state
+                    .ignore
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for matcher in guard.values() {
+                    let m = matcher.matched_path_or_any_parents(&child_path, is_dir);
+                    if m.is_ignore() {
+                        return true;
+                    }
+                    if m.is_whitelist() {
+                        return false;
+                    }
+                }
+            }
+            current = parent;
+        }
+
+        false
+    }
+
+    /// Check whether a child with the given name under `parent_ino` would be
+    /// ignored by any ancestor's ignore rules.
+    ///
+    /// Unlike `is_ignored`, this does not require the child to already be in
+    /// the cache. Used for checking new files before they are inserted.
+    #[must_use]
+    pub fn is_name_ignored(&self, parent_ino: LoadedAddr, name: &OsStr, is_dir: bool) -> bool {
+        let parent_path = self.resolve_path(parent_ino);
+        let child_path = parent_path.join(name);
+
+        let mut current = parent_ino;
+        loop {
+            if let Some(state) = self.dirs.read_sync(&current, |_, v| Arc::clone(v)) {
+                let guard = state
+                    .ignore
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for matcher in guard.values() {
+                    let m = matcher.matched_path_or_any_parents(&child_path, is_dir);
+                    if m.is_ignore() {
+                        return true;
+                    }
+                    if m.is_whitelist() {
+                        return false;
+                    }
+                }
+            }
+
+            match self.child_to_parent.read_sync(&current, |_, &p| p) {
+                Some(p) => current = p,
+                None => break,
+            }
+        }
+
+        false
+    }
+
+    /// Returns the parent inode of a child, if known.
+    #[must_use]
+    pub fn parent_of(&self, child: LoadedAddr) -> Option<LoadedAddr> {
+        self.child_to_parent.read_sync(&child, |_, &p| p)
     }
 }

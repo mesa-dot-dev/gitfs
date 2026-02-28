@@ -84,7 +84,11 @@ pub trait FsDataProvider: Clone + Send + Sync + 'static {
     /// automatically when the refcount drops to zero.
     fn forget(&self, _addr: InodeAddr) {}
 
-    /// Write data to a file at the given offset.
+    /// Sync the full file content to the remote backend.
+    ///
+    /// Called by `AsyncFs::write` with `offset = 0` and the complete merged
+    /// file content after the overlay has been updated. The `offset` parameter
+    /// is reserved for future partial-write support but is currently always 0.
     ///
     /// The default implementation returns `EROFS` (read-only filesystem).
     /// Providers that support writes should override this.
@@ -123,6 +127,28 @@ pub trait FsDataProvider: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<INode, std::io::Error>> + Send {
         async { Err(std::io::Error::from_raw_os_error(libc::EROFS)) }
     }
+
+    /// Remove a file from the given parent directory.
+    ///
+    /// The default implementation returns `EROFS` (read-only filesystem).
+    /// Providers that support deletion should override this.
+    fn unlink(
+        &self,
+        _parent: INode,
+        _name: &OsStr,
+    ) -> impl Future<Output = Result<(), std::io::Error>> + Send {
+        async { Err(std::io::Error::from_raw_os_error(libc::EROFS)) }
+    }
+
+    /// Returns the shared directory cache, if the provider owns one.
+    ///
+    /// Providers that need to share their [`DCache`] with the wrapping
+    /// [`AsyncFs`] (e.g. for ignore-rule checking) override this to return
+    /// their `Arc<DCache>`. The default returns `None`, causing
+    /// [`AsyncFs`] to create its own cache.
+    fn dcache(&self) -> Option<Arc<DCache>> {
+        None
+    }
 }
 
 /// Zero-sized cleanup tag for inode eviction.
@@ -156,6 +182,9 @@ pub struct ForgetContext<DP: FsDataProvider> {
     pub provider: DP,
     /// Write overlay — inodes present here must not be evicted.
     pub write_overlay: Arc<FutureBackedCache<InodeAddr, Bytes>>,
+    /// Inodes removed via `unlink` — on forget, these get full cleanup
+    /// including `write_overlay` removal.
+    pub unlinked_inodes: Arc<scc::HashSet<InodeAddr>>,
 }
 
 /// Evicts the inode from the table, directory cache, and lookup cache, then
@@ -170,6 +199,16 @@ pub struct ForgetContext<DP: FsDataProvider> {
 /// index, ensuring O(k) eviction instead of O(N) full-cache scan.
 impl<DP: FsDataProvider> StatelessDrop<ForgetContext<DP>, InodeAddr> for InodeForget {
     fn delete(ctx: &ForgetContext<DP>, key: &InodeAddr) {
+        let is_unlinked = ctx.unlinked_inodes.remove_sync(key).is_some();
+        if is_unlinked {
+            // Unlinked inode: FUSE refcount hit zero, safe to fully clean up.
+            ctx.write_overlay.remove_sync(key);
+            ctx.inode_table.remove_sync(key);
+            ctx.dcache.evict(LoadedAddr::new_unchecked(*key));
+            ctx.lookup_cache.evict_addr(*key);
+            ctx.provider.forget(*key);
+            return;
+        }
         if ctx.write_overlay.contains_sync(key) {
             return;
         }
@@ -435,6 +474,12 @@ pub struct AsyncFs<DP: FsDataProvider> {
     /// on `write_overlay` in [`write`](Self::write) and
     /// [`setattr`](Self::setattr).
     write_locks: Arc<scc::HashMap<InodeAddr, Arc<Mutex<()>>>>,
+
+    /// Inodes that have been unlinked but may still have open file handles.
+    /// The `InodeForget` cleanup path checks this set and performs full
+    /// eviction (`inode_table` + `write_overlay` removal) when the FUSE
+    /// refcount drops to zero.
+    unlinked_inodes: Arc<scc::HashSet<InodeAddr>>,
 }
 
 impl<DP: FsDataProvider> AsyncFs<DP> {
@@ -443,6 +488,7 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         data_provider: DP,
         root: INode,
         inode_table: Arc<FutureBackedCache<InodeAddr, INode>>,
+        directory_cache: Arc<DCache>,
     ) -> Self {
         inode_table
             .get_or_init(root.addr, || async move { root })
@@ -451,12 +497,13 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         Self {
             inode_table,
             lookup_cache: Arc::new(IndexedLookupCache::default()),
-            directory_cache: Arc::new(DCache::new()),
+            directory_cache,
             data_provider,
             next_fh: AtomicU64::new(1),
             prefetch_semaphore: Arc::new(Semaphore::new(MAX_PREFETCH_CONCURRENCY)),
             write_overlay: Arc::new(FutureBackedCache::default()),
             write_locks: Arc::new(scc::HashMap::new()),
+            unlinked_inodes: Arc::new(scc::HashSet::new()),
         }
     }
 
@@ -468,16 +515,18 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
     pub fn new_preseeded(
         data_provider: DP,
         inode_table: Arc<FutureBackedCache<InodeAddr, INode>>,
+        directory_cache: Arc<DCache>,
     ) -> Self {
         Self {
             inode_table,
             lookup_cache: Arc::new(IndexedLookupCache::default()),
-            directory_cache: Arc::new(DCache::new()),
+            directory_cache,
             data_provider,
             next_fh: AtomicU64::new(1),
             prefetch_semaphore: Arc::new(Semaphore::new(MAX_PREFETCH_CONCURRENCY)),
             write_overlay: Arc::new(FutureBackedCache::default()),
             write_locks: Arc::new(scc::HashMap::new()),
+            unlinked_inodes: Arc::new(scc::HashSet::new()),
         }
     }
 
@@ -585,6 +634,7 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         // the same (parent, name) may each independently call dp.lookup().
         // This is acceptable: the cost of a redundant API call on error is
         // low compared to the complexity of error-channel deduplication.
+        // NOTE(MES-853): Arc::from(name) allocates on every lookup call.
         let name_arc: Arc<OsStr> = Arc::from(name);
         let lookup_key = (parent.addr(), Arc::clone(&name_arc));
         let dp = self.data_provider.clone();
@@ -701,9 +751,9 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         // Merge with existing overlay content, or seed from provider on
         // first write so pre-existing data is not lost.
         //
-        // TODO(MES-829): this copies the entire file on every write,
-        // making writes O(file_size). Switch to Arc<Mutex<Vec<u8>>> to
-        // mutate in place.
+        // TODO(MES-829, MES-851): this copies the entire file on every write,
+        // making writes O(file_size). Switch to Arc<Mutex<Vec<u8>>> or
+        // BytesMut to mutate in place.
         let existing = self.write_overlay.get(&addr.addr()).await;
         let mut buf = if let Some(data) = existing {
             data.to_vec()
@@ -736,6 +786,7 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         buf[offset_usize..end].copy_from_slice(&data);
 
         let new_content = Bytes::from(buf);
+        let provider_content = Bytes::clone(&new_content);
         let new_size = new_content.len() as u64;
         self.write_overlay.insert_sync(addr.addr(), new_content);
 
@@ -745,18 +796,23 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         updated.last_modified_at = std::time::SystemTime::now();
         self.inode_table.insert_sync(addr.addr(), updated);
 
-        // Release the lock before the provider call (fire-and-forget).
-        drop(guard);
-
-        // Notify the data provider (fire-and-forget — the overlay is the
-        // source of truth for reads). Log failures so they are observable.
-        if let Err(e) = self.data_provider.write(updated, offset, data).await {
-            tracing::debug!(
-                addr = addr.addr(),
+        // Notify the data provider with the full content while still
+        // holding the per-inode write lock. This ensures MPSC ordering
+        // is consistent with overlay ordering — a concurrent
+        // setattr(truncate) cannot enqueue between our overlay update
+        // and provider notification. For MPSC-based providers (e.g.
+        // MesRepoProvider) this is non-blocking (just a channel send).
+        // NOTE(MES-846): each FUSE write chunk queues a full-file upload;
+        // the consumer should coalesce consecutive writes to the same path.
+        if let Err(e) = self.data_provider.write(updated, 0, provider_content).await {
+            tracing::warn!(
+                addr = updated.addr,
                 %e,
                 "data provider write failed (overlay is authoritative)"
             );
         }
+
+        drop(guard);
 
         Ok(bytes_written)
     }
@@ -821,6 +877,67 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         Ok((child, open_file))
     }
 
+    /// Remove a file from a directory.
+    ///
+    /// Removes the entry from the directory cache and lookup cache.
+    /// The `inode_table` and `write_overlay` entries are intentionally kept
+    /// so that open file handles remain valid (POSIX). Full cleanup
+    /// happens in [`InodeForget::delete`] when the FUSE refcount drops
+    /// to zero. Calls [`FsDataProvider::unlink`] as a spawned
+    /// fire-and-forget task so the FUSE response is not blocked.
+    pub async fn unlink(&self, parent: LoadedAddr, name: &OsStr) -> Result<(), std::io::Error> {
+        let parent_inode = self.loaded_inode(parent).await?;
+        if parent_inode.itype != INodeType::Directory {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
+        }
+
+        // Check is_dir before removing from dcache to avoid a window where
+        // the directory entry is temporarily missing from readdir results.
+        let (child_addr, is_dir) = if let Some(entry) = self.directory_cache.lookup(parent, name) {
+            (entry.ino.addr(), entry.is_dir)
+        } else {
+            // Dcache miss — fall back to provider lookup.
+            let child = self.data_provider.lookup(parent_inode, name).await?;
+            (child.addr, child.itype == INodeType::Directory)
+        };
+
+        // POSIX: unlink() must return EISDIR for directories.
+        if is_dir {
+            return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
+        }
+
+        // Safe to remove now — we've confirmed it's not a directory.
+        self.directory_cache.remove_child(parent, name);
+
+        // Remove from lookup cache so a subsequent lookup calls the
+        // provider fresh instead of returning the deleted inode.
+        self.lookup_cache
+            .remove_sync(&(parent.addr(), Arc::from(name)));
+
+        // Mark as unlinked. The inode_table and write_overlay entries are
+        // intentionally kept so that open file handles remain valid (POSIX).
+        // InodeForget::delete will perform full cleanup when the FUSE
+        // refcount drops to zero.
+        let _ = self.unlinked_inodes.insert_sync(child_addr);
+
+        // Notify the data provider (fire-and-forget). Spawned so the
+        // FUSE response is not blocked by remote round-trips.
+        let dp = self.data_provider.clone();
+        let name_owned = name.to_os_string();
+        tokio::spawn(async move {
+            if let Err(e) = dp.unlink(parent_inode, &name_owned).await {
+                tracing::warn!(
+                    parent = parent_inode.addr,
+                    ?name_owned,
+                    %e,
+                    "data provider unlink failed (local state is authoritative)"
+                );
+            }
+        });
+
+        Ok(())
+    }
+
     /// Update file attributes (size, timestamps).
     ///
     /// Currently supports:
@@ -838,11 +955,20 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
     ) -> Result<INode, std::io::Error> {
         let mut inode = self.loaded_inode(addr).await?;
 
-        if let Some(new_size) = size {
-            // Acquire per-inode lock to serialize the read-modify-write on the overlay.
-            let lock = self.inode_write_lock(addr.addr()).await;
-            let _guard = lock.lock().await;
+        // When truncating, hold the per-inode write lock for the entire
+        // operation — overlay mutation through provider sync. This prevents
+        // a concurrent write() from interleaving and sending stale content
+        // to the remote (TOCTOU).
+        let write_lock = match size {
+            Some(_) => Some(self.inode_write_lock(addr.addr()).await),
+            None => None,
+        };
+        let _write_guard = match write_lock {
+            Some(ref lock) => Some(lock.lock().await),
+            None => None,
+        };
 
+        let truncated_content = if let Some(new_size) = size {
             #[expect(
                 clippy::cast_possible_truncation,
                 reason = "new_size fits in usize on supported 64-bit platforms"
@@ -875,10 +1001,14 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
             };
 
             buf.resize(new_len, 0);
+            let content = Bytes::from(buf);
             self.write_overlay
-                .insert_sync(addr.addr(), Bytes::from(buf));
+                .insert_sync(addr.addr(), Bytes::clone(&content));
             inode.size = new_size;
-        }
+            Some(content)
+        } else {
+            None
+        };
 
         if let Some(t) = mtime {
             inode.last_modified_at = t;
@@ -900,6 +1030,22 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
             );
         }
 
+        // Sync truncated content to remote when size changed. Runs under
+        // the per-inode write lock to prevent TOCTOU with concurrent write().
+        // Skip when content is empty — the file already exists on remote
+        // (via a background create task) and writing zero bytes would only
+        // contend on the per-inode lock for no benefit.
+        if let Some(content) = truncated_content
+            && !content.is_empty()
+            && let Err(e) = self.data_provider.write(inode, 0, content).await
+        {
+            tracing::debug!(
+                addr = inode.addr,
+                %e,
+                "data provider write failed (overlay is authoritative)"
+            );
+        }
+
         Ok(inode)
     }
 
@@ -910,6 +1056,42 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
     #[must_use]
     pub fn write_overlay(&self) -> Arc<FutureBackedCache<InodeAddr, Bytes>> {
         Arc::clone(&self.write_overlay)
+    }
+
+    /// Shared reference to the set of unlinked inodes.
+    #[must_use]
+    pub fn unlinked_inodes(&self) -> Arc<scc::HashSet<InodeAddr>> {
+        Arc::clone(&self.unlinked_inodes)
+    }
+
+    /// Set ignore rules for a directory in the directory cache.
+    pub fn set_ignore_rules(&self, parent: LoadedAddr, filename: &str, content: &str) {
+        self.directory_cache
+            .set_ignore_rules(parent, filename, content);
+    }
+
+    /// Clear ignore rules for a specific file in a directory.
+    pub fn clear_ignore_rules(&self, parent: LoadedAddr, filename: &str) {
+        self.directory_cache.clear_ignore_rules(parent, filename);
+    }
+
+    /// Check whether a child inode is ignored by any ancestor's ignore rules.
+    #[must_use]
+    pub fn is_ignored(&self, child_ino: LoadedAddr) -> bool {
+        self.directory_cache.is_ignored(child_ino)
+    }
+
+    /// Check whether a child with the given name would be ignored.
+    #[must_use]
+    pub fn is_name_ignored(&self, parent_ino: LoadedAddr, name: &OsStr, is_dir: bool) -> bool {
+        self.directory_cache
+            .is_name_ignored(parent_ino, name, is_dir)
+    }
+
+    /// Returns the parent inode of a child, if known.
+    #[must_use]
+    pub fn parent_of(&self, child: LoadedAddr) -> Option<LoadedAddr> {
+        self.directory_cache.parent_of(child)
     }
 
     /// Evict an inode from the inode table and notify the data provider.
@@ -923,6 +1105,15 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
     /// skipped — they must persist for the lifetime of the mount, mirroring
     /// the guard in [`InodeForget::delete`].
     pub fn evict(&self, addr: InodeAddr) {
+        if self.unlinked_inodes.remove_sync(&addr).is_some() {
+            // Unlinked inode: full cleanup including write overlay.
+            self.write_overlay.remove_sync(&addr);
+            self.inode_table.remove_sync(&addr);
+            self.directory_cache.evict(LoadedAddr::new_unchecked(addr));
+            self.lookup_cache.evict_addr(addr);
+            self.data_provider.forget(addr);
+            return;
+        }
         if self.write_overlay.contains_sync(&addr) {
             return;
         }

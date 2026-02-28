@@ -8,6 +8,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -16,6 +17,7 @@ use bytes::Bytes;
 use crate::cache::async_backed::FutureBackedCache;
 use crate::fs::async_fs::{AsyncFs, FileReader, FsDataProvider, OpenFile, OverlayReader};
 use crate::fs::bridge::ConcurrentBridge;
+use crate::fs::dcache::DCache;
 use crate::fs::{INode, INodeType, InodeAddr, InodePerms, LoadedAddr, OpenFlags, ROOT_INO};
 
 /// Descriptor for a child filesystem returned by [`CompositeRoot`].
@@ -61,7 +63,10 @@ pub struct ChildInner<DP: FsDataProvider> {
 impl<DP: FsDataProvider> ChildInner<DP> {
     pub(crate) fn create(table: FutureBackedCache<InodeAddr, INode>, provider: DP) -> Self {
         let table = Arc::new(table);
-        let fs = AsyncFs::new_preseeded(provider, table);
+        let dcache = provider
+            .dcache()
+            .unwrap_or_else(|| Arc::new(DCache::new(PathBuf::from("/"))));
+        let fs = AsyncFs::new_preseeded(provider, table, dcache);
         Self { fs }
     }
 
@@ -490,6 +495,41 @@ where
             addr: outer_ino,
             ..child_inode
         })
+    }
+
+    fn unlink(
+        &self,
+        parent: INode,
+        name: &OsStr,
+    ) -> impl Future<Output = Result<(), std::io::Error>> + Send {
+        let name = name.to_os_string();
+        async move {
+            if parent.addr == ROOT_INO {
+                return Err(std::io::Error::from_raw_os_error(libc::EROFS));
+            }
+
+            let slot_idx = self
+                .inner
+                .addr_to_slot
+                .read_sync(&parent.addr, |_, &v| v)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+            let (child, inner_parent) = self
+                .inner
+                .slots
+                .read_sync(&slot_idx, |_, slot| {
+                    (Arc::clone(&slot.inner), slot.bridge.forward(parent.addr))
+                })
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+            let inner_parent =
+                inner_parent.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+            child
+                .get_fs()
+                .unlink(LoadedAddr::new_unchecked(inner_parent), &name)
+                .await
+        }
     }
 
     async fn setattr(

@@ -430,6 +430,37 @@ impl FsDataProvider for OrgChildDP {
             }
         }
     }
+
+    fn unlink(
+        &self,
+        parent: INode,
+        name: &OsStr,
+    ) -> impl Future<Output = Result<(), std::io::Error>> + Send {
+        let this = self.clone();
+        let name = name.to_os_string();
+        async move {
+            match this {
+                Self::Standard(c) => c.unlink(parent, &name).await,
+                Self::Github(c) => c.unlink(parent, &name).await,
+            }
+        }
+    }
+
+    fn setattr(
+        &self,
+        inode: INode,
+        size: Option<u64>,
+        atime: Option<SystemTime>,
+        mtime: Option<SystemTime>,
+    ) -> impl Future<Output = Result<INode, std::io::Error>> + Send {
+        let this = self.clone();
+        async move {
+            match this {
+                Self::Standard(c) => c.setattr(inode, size, atime, mtime).await,
+                Self::Github(c) => c.setattr(inode, size, atime, mtime).await,
+            }
+        }
+    }
 }
 
 pub enum OrgChildReader {

@@ -2,11 +2,13 @@
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
 
 use super::async_fs::{FileReader as _, FsDataProvider, OverlayReader};
+use super::dcache::DCache;
 use super::{FileHandle, INode, INodeType, InodeAddr, LoadedAddr, OpenFlags};
 use crate::cache::async_backed::FutureBackedCache;
 use tracing::{debug, error, instrument};
@@ -41,8 +43,8 @@ macro_rules! impl_fuse_reply {
     };
 }
 
-// ReplyEmpty and ReplyStatfs are excluded: release and statfs
-// do not follow the block_on -> fuse_reply pattern.
+// ReplyStatfs is excluded: statfs does not follow the
+// block_on -> fuse_reply pattern.
 impl_fuse_reply!(
     fuser::ReplyEntry,
     fuser::ReplyAttr,
@@ -51,6 +53,7 @@ impl_fuse_reply!(
     fuser::ReplyData,
     fuser::ReplyWrite,
     fuser::ReplyCreate,
+    fuser::ReplyEmpty,
 );
 
 /// Extension trait on `Result<T, std::io::Error>` for FUSE reply handling.
@@ -87,13 +90,16 @@ struct FuseBridgeInner<DP: FsDataProvider> {
 impl<DP: FsDataProvider> FuseBridgeInner<DP> {
     fn create(table: FutureBackedCache<InodeAddr, INode>, provider: DP) -> Self {
         let table = Arc::new(table);
-        let fs = super::async_fs::AsyncFs::new_preseeded(provider.clone(), Arc::clone(&table));
+        let dcache = Arc::new(DCache::new(PathBuf::from("/")));
+        let fs =
+            super::async_fs::AsyncFs::new_preseeded(provider.clone(), Arc::clone(&table), dcache);
         let ctx = super::async_fs::ForgetContext {
             inode_table: table,
             dcache: fs.directory_cache(),
             lookup_cache: fs.lookup_cache(),
             provider,
             write_overlay: fs.write_overlay(),
+            unlinked_inodes: fs.unlinked_inodes(),
         };
         let ward = crate::drop_ward::DropWard::new(ctx);
         Self { ward, fs }
@@ -573,6 +579,27 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
                 let f_attr = inode_to_fuser_attr(&inode, BLOCK_SIZE);
                 debug!(?f_attr, handle = fh, "replying...");
                 reply.created(&Self::SHAMEFUL_TTL, &f_attr, 0, fh, 0);
+            });
+    }
+
+    #[instrument(name = "FuserAdapter::unlink", skip(self, _req, reply))]
+    fn unlink(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        self.runtime
+            .block_on(async {
+                self.inner
+                    .get_fs()
+                    .unlink(LoadedAddr::new_unchecked(parent), name)
+                    .await
+            })
+            .fuse_reply(reply, |(), reply| {
+                debug!("replying ok");
+                reply.ok();
             });
     }
 
