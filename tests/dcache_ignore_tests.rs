@@ -2,8 +2,8 @@
 
 use std::path::PathBuf;
 
-use git_fs::fs::LoadedAddr;
-use git_fs::fs::dcache::DCache;
+use mesafs::fs::LoadedAddr;
+use mesafs::fs::dcache::DCache;
 
 fn addr(n: u64) -> LoadedAddr {
     LoadedAddr::new_unchecked(n)

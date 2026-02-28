@@ -192,7 +192,7 @@ impl<K: Eq + Hash + Send + Sync + Copy + 'static> FileCache<K> {
     // as invalid, and thus provide a worse user experience. Do not change this unless you have a
     // very good reason to do so. Changing this will break backwards compatibility with existing
     // cache directories.
-    const GITFS_MARKER_FILE: &'static str = ".gitfs_cache";
+    const MESAFS_MARKER_FILE: &'static str = ".mesafs_cache";
 
     // The total maximum number of times we will try to read a "deleted" file before giving up and
     // treating it as a hard error.
@@ -229,7 +229,7 @@ impl<K: Eq + Hash + Send + Sync + Copy + 'static> FileCache<K> {
                 let mut entries = tokio::fs::read_dir(&p).await?;
                 let is_empty = entries.next_entry().await?.is_none();
 
-                p.push(Self::GITFS_MARKER_FILE);
+                p.push(Self::MESAFS_MARKER_FILE);
                 let marker_exists = tokio::fs::try_exists(&p).await?;
                 p.pop();
 
@@ -250,7 +250,7 @@ impl<K: Eq + Hash + Send + Sync + Copy + 'static> FileCache<K> {
 
         // Create marker file so that subsequent restarts of this application gracefully handle the
         // existing cache directory.
-        pbuf.push(Self::GITFS_MARKER_FILE);
+        pbuf.push(Self::MESAFS_MARKER_FILE);
         tokio::fs::OpenOptions::new()
             .create(true)
             .truncate(true)

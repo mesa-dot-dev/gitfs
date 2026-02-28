@@ -3,7 +3,7 @@
 mod common;
 
 use common::{MockCtx, MockDeleter, wait_for_culls};
-use git_fs::cache::eviction::lru::LruEvictionTracker;
+use mesafs::cache::eviction::lru::LruEvictionTracker;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn evicts_least_recently_inserted() {

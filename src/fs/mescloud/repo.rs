@@ -16,12 +16,12 @@ use mesa_dev::low_level::content::{Content, DirEntry as MesaDirEntry};
 use num_traits::cast::ToPrimitive as _;
 use tracing::warn;
 
-use git_fs::cache::fcache::FileCache;
-use git_fs::cache::traits::{AsyncReadableCache as _, AsyncWritableCache as _};
-use git_fs::fs::LoadedAddr;
-use git_fs::fs::async_fs::{FileReader, FsDataProvider};
-use git_fs::fs::dcache::DCache;
-use git_fs::fs::{INode, INodeType, InodeAddr, InodePerms, OpenFlags as AsyncOpenFlags, ROOT_INO};
+use mesafs::cache::fcache::FileCache;
+use mesafs::cache::traits::{AsyncReadableCache as _, AsyncWritableCache as _};
+use mesafs::fs::LoadedAddr;
+use mesafs::fs::async_fs::{FileReader, FsDataProvider};
+use mesafs::fs::dcache::DCache;
+use mesafs::fs::{INode, INodeType, InodeAddr, InodePerms, OpenFlags as AsyncOpenFlags, ROOT_INO};
 
 use super::common::{MesaApiError, mesa_api_error_to_io};
 
@@ -94,7 +94,7 @@ struct MesRepoProviderInner {
     /// Maps inode addresses to repo-relative paths (e.g. `"src/main.rs"`).
     /// Root maps to an empty `PathBuf`.
     ///
-    /// Exists alongside the [`DCache`](git_fs::fs::dcache::DCache) because
+    /// Exists alongside the [`DCache`](mesafs::fs::dcache::DCache) because
     /// they serve different purposes: the dcache maps
     /// `(parent_addr, child_name) -> child_addr` (single-hop name resolution),
     /// while this map provides the full repo-relative path needed for Mesa API

@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, missing_docs)]
 
-use git_fs::fs::bridge::ConcurrentBridge;
+use mesafs::fs::bridge::ConcurrentBridge;
 
 #[test]
 fn insert_then_forward_returns_inner() {

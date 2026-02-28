@@ -1,5 +1,5 @@
 #!/bin/sh
-GIT_FS_LOG=debug nohup mesafs --config-path /etc/mesafs/config.toml run \
+MESAFS_LOG=debug nohup mesafs --config-path /etc/mesafs/config.toml run \
     > /tmp/mesafs-stdout.log 2> /tmp/mesafs-stderr.log &
 
 # Wait for FUSE mount, then hand off to CMD

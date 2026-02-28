@@ -13,10 +13,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use git_fs::cache::async_backed::FutureBackedCache;
-use git_fs::fs::async_fs::{AsyncFs, FsDataProvider as _};
-use git_fs::fs::composite::CompositeFs;
-use git_fs::fs::{INode, INodeType, LoadedAddr, OpenFlags};
+use mesafs::cache::async_backed::FutureBackedCache;
+use mesafs::fs::async_fs::{AsyncFs, FsDataProvider as _};
+use mesafs::fs::composite::CompositeFs;
+use mesafs::fs::{INode, INodeType, LoadedAddr, OpenFlags};
 
 use common::async_fs_mocks::{MockFsDataProvider, MockFsState, make_dcache, make_inode};
 use common::composite_mocks::MockRoot;

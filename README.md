@@ -5,7 +5,7 @@ Mount Mesa repositories as **read-only** local directories without cloning.
 `mesafs` is a FUSE-based virtual filesystem ideal for agents, CI pipelines, and
 large monorepos where a full clone is impractical. Supports macOS and Linux.
 
-> **Alpha Software** - GitFS is early-stage. If you run into issues, please
+> **Alpha Software** - mesafs is early-stage. If you run into issues, please
 > [open an issue](https://github.com/mesa-dot-dev/mesafs/issues).
 
 ## Quick Start

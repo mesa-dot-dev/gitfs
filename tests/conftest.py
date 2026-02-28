@@ -16,12 +16,12 @@ if TYPE_CHECKING:
 IMAGE_TAG = "mesafs-test:latest"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-_GITFS_READY_TIMEOUT = 60
-_GITFS_READY_POLL_INTERVAL = 2
+_MESAFS_READY_TIMEOUT = 60
+_MESAFS_READY_POLL_INTERVAL = 2
 
 
 @contextlib.contextmanager
-def gitfs_container_factory(port: int) -> Iterator[DockerContainer]:
+def mesafs_container_factory(port: int) -> Iterator[DockerContainer]:
     """Create a privileged container with mesafs mounted and ready."""
     subprocess.run(
         [
@@ -41,14 +41,14 @@ def gitfs_container_factory(port: int) -> Iterator[DockerContainer]:
         DockerContainer(IMAGE_TAG).with_kwargs(privileged=True).with_exposed_ports(port)
     )
     with container:
-        deadline = time.monotonic() + _GITFS_READY_TIMEOUT
+        deadline = time.monotonic() + _MESAFS_READY_TIMEOUT
         while time.monotonic() < deadline:
             exit_code, _ = container.exec(["test", "-f", "/tmp/mesafs-ready"])
             if exit_code == 0:
                 break
-            time.sleep(_GITFS_READY_POLL_INTERVAL)
+            time.sleep(_MESAFS_READY_POLL_INTERVAL)
         else:
-            msg = f"mesafs mount did not become ready within {_GITFS_READY_TIMEOUT}s"
+            msg = f"mesafs mount did not become ready within {_MESAFS_READY_TIMEOUT}s"
             raise TimeoutError(msg)
 
         yield container

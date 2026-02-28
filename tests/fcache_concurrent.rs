@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use git_fs::cache::fcache::FileCache;
-use git_fs::cache::traits::{AsyncReadableCache as _, AsyncWritableCache as _};
+use mesafs::cache::fcache::FileCache;
+use mesafs::cache::traits::{AsyncReadableCache as _, AsyncWritableCache as _};
 use tokio::task::JoinSet;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

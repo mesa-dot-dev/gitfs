@@ -3,8 +3,8 @@
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
-use git_fs::fs::LoadedAddr;
-use git_fs::fs::dcache::{DCache, PopulateStatus};
+use mesafs::fs::LoadedAddr;
+use mesafs::fs::dcache::{DCache, PopulateStatus};
 
 #[tokio::test]
 async fn lookup_returns_none_for_missing_entry() {

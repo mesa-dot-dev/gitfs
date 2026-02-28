@@ -11,9 +11,9 @@ mod common;
 use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
 
-use git_fs::cache::async_backed::FutureBackedCache;
-use git_fs::fs::async_fs::{AsyncFs, InodeLifecycle};
-use git_fs::fs::{INode, INodeType, LoadedAddr, OpenFlags};
+use mesafs::cache::async_backed::FutureBackedCache;
+use mesafs::fs::async_fs::{AsyncFs, InodeLifecycle};
+use mesafs::fs::{INode, INodeType, LoadedAddr, OpenFlags};
 
 use common::async_fs_mocks::{MockFsDataProvider, MockFsState, make_dcache, make_inode};
 
@@ -929,7 +929,7 @@ async fn lookup_returns_enoent_without_remote_call_when_dir_populated() {
 /// entries intact. This is the O(k) replacement for the old O(N) scan.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn indexed_lookup_cache_evict_removes_only_related_entries() {
-    use git_fs::fs::IndexedLookupCache;
+    use mesafs::fs::IndexedLookupCache;
 
     let cache = IndexedLookupCache::default();
 
@@ -1035,7 +1035,7 @@ async fn indexed_lookup_cache_evict_removes_only_related_entries() {
 ///    the factory (cache miss).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn evict_parent_then_old_child_must_not_delete_repopulated_entry() {
-    use git_fs::fs::IndexedLookupCache;
+    use mesafs::fs::IndexedLookupCache;
 
     let cache = IndexedLookupCache::default();
     let parent: u64 = 1;
@@ -1084,7 +1084,7 @@ async fn evict_parent_then_old_child_must_not_delete_repopulated_entry() {
 /// contain only 1 entry per addr side (not N duplicates).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repeated_lookups_must_not_grow_reverse_index() {
-    use git_fs::fs::IndexedLookupCache;
+    use mesafs::fs::IndexedLookupCache;
 
     let cache = IndexedLookupCache::default();
     let parent: u64 = 1;
@@ -1129,7 +1129,7 @@ async fn repeated_lookups_must_not_grow_reverse_index() {
 /// as an acceptable orphan — it is harmless and cleaned on child eviction.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remove_sync_cleans_cache_and_parent_reverse_index() {
-    use git_fs::fs::IndexedLookupCache;
+    use mesafs::fs::IndexedLookupCache;
 
     let cache = IndexedLookupCache::default();
     let parent: u64 = 1;
@@ -1231,7 +1231,7 @@ async fn lookup_falls_through_to_remote_after_eviction_resets_populated() {
 ///    The freshly-indexed entry `(key, C2)` under parent P must survive.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn evict_old_child_must_not_remove_new_childs_reverse_entry() {
-    use git_fs::fs::IndexedLookupCache;
+    use mesafs::fs::IndexedLookupCache;
 
     let cache = IndexedLookupCache::default();
     let parent: u64 = 100;

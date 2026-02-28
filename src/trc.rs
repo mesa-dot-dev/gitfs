@@ -99,7 +99,7 @@ impl Default for Trc {
     fn default() -> Self {
         let use_ansi = term::should_use_color(&std::io::stderr());
         let maybe_env_filter =
-            EnvFilter::try_from_env("GIT_FS_LOG").or_else(|_| EnvFilter::try_from_default_env());
+            EnvFilter::try_from_env("MESAFS_LOG").or_else(|_| EnvFilter::try_from_default_env());
 
         match maybe_env_filter {
             Ok(env_filter) => {

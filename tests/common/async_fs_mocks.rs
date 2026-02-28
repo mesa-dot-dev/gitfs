@@ -10,9 +10,9 @@ use bytes::Bytes;
 
 use tokio::sync::Mutex;
 
-use git_fs::fs::async_fs::{FileReader, FsDataProvider};
-use git_fs::fs::dcache::DCache;
-use git_fs::fs::{INode, INodeType, InodeAddr, InodePerms, OpenFlags};
+use mesafs::fs::async_fs::{FileReader, FsDataProvider};
+use mesafs::fs::dcache::DCache;
+use mesafs::fs::{INode, INodeType, InodeAddr, InodePerms, OpenFlags};
 
 /// Recorded rename calls: `(old_parent_addr, old_name, new_parent_addr, new_name)`.
 type RenameCalls = Vec<(InodeAddr, OsString, InodeAddr, OsString)>;

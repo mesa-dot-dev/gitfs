@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
 
-use git_fs::fs::INode;
-use git_fs::fs::composite::{ChildDescriptor, CompositeRoot};
+use mesafs::fs::INode;
+use mesafs::fs::composite::{ChildDescriptor, CompositeRoot};
 
 use super::async_fs_mocks::MockFsDataProvider;
 

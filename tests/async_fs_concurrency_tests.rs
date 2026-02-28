@@ -13,17 +13,17 @@ mod common;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use git_fs::cache::async_backed::FutureBackedCache;
-use git_fs::drop_ward::StatelessDrop as _;
-use git_fs::fs::async_fs::{AsyncFs, ForgetContext};
-use git_fs::fs::{INodeType, InodeForget, LoadedAddr, OpenFlags};
+use mesafs::cache::async_backed::FutureBackedCache;
+use mesafs::drop_ward::StatelessDrop as _;
+use mesafs::fs::async_fs::{AsyncFs, ForgetContext};
+use mesafs::fs::{INodeType, InodeForget, LoadedAddr, OpenFlags};
 
 use common::async_fs_mocks::{MockFsDataProvider, MockFsState, make_dcache, make_inode};
 
 /// Helper: build an `AsyncFs` with a single file `test.txt` (addr=2) under root (addr=1).
 async fn setup_single_file() -> (
     Arc<AsyncFs<MockFsDataProvider>>,
-    Arc<FutureBackedCache<u64, git_fs::fs::INode>>,
+    Arc<FutureBackedCache<u64, mesafs::fs::INode>>,
     Arc<MockFsState>,
 ) {
     let root = make_inode(1, INodeType::Directory, 0, None);

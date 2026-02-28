@@ -12,10 +12,10 @@ mod common;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use git_fs::cache::async_backed::FutureBackedCache;
-use git_fs::drop_ward::StatelessDrop as _;
-use git_fs::fs::async_fs::{AsyncFs, ForgetContext, FsDataProvider as _};
-use git_fs::fs::{INodeType, InodeForget, LoadedAddr, OpenFlags};
+use mesafs::cache::async_backed::FutureBackedCache;
+use mesafs::drop_ward::StatelessDrop as _;
+use mesafs::fs::async_fs::{AsyncFs, ForgetContext, FsDataProvider as _};
+use mesafs::fs::{INodeType, InodeForget, LoadedAddr, OpenFlags};
 
 use common::async_fs_mocks::{MockFsDataProvider, MockFsState, make_dcache, make_inode};
 

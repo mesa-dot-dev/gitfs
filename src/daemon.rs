@@ -13,11 +13,11 @@ mod managed_fuse {
 
     use nix::errno::Errno;
 
-    use git_fs::cache::async_backed::FutureBackedCache;
+    use mesafs::cache::async_backed::FutureBackedCache;
 
     use super::{app_config, debug, error};
     use fuser::BackgroundSession;
-    use git_fs::fs::fuser::FuserAdapter;
+    use mesafs::fs::fuser::FuserAdapter;
     use secrecy::ExposeSecret as _;
 
     pub struct FuseCoreScope {
@@ -53,7 +53,7 @@ mod managed_fuse {
                         fs_owner,
                     );
                     crate::fs::mescloud::roots::OrgChildDP::Github(
-                        git_fs::fs::composite::CompositeFs::new(github_org_root, fs_owner),
+                        mesafs::fs::composite::CompositeFs::new(github_org_root, fs_owner),
                     )
                 } else {
                     let standard_org_root = crate::fs::mescloud::roots::StandardOrgRoot::new(
@@ -63,18 +63,18 @@ mod managed_fuse {
                         fs_owner,
                     );
                     crate::fs::mescloud::roots::OrgChildDP::Standard(
-                        git_fs::fs::composite::CompositeFs::new(standard_org_root, fs_owner),
+                        mesafs::fs::composite::CompositeFs::new(standard_org_root, fs_owner),
                     )
                 };
                 org_children.push((std::ffi::OsString::from(org_name), dp));
             }
 
             let mesa_root = crate::fs::mescloud::roots::MesaRoot::new(org_children);
-            let composite = git_fs::fs::composite::CompositeFs::new(mesa_root, fs_owner);
+            let composite = mesafs::fs::composite::CompositeFs::new(mesa_root, fs_owner);
 
             let table = FutureBackedCache::default();
             let root_inode = composite.make_root_inode();
-            table.insert_sync(git_fs::fs::ROOT_INO, root_inode);
+            table.insert_sync(mesafs::fs::ROOT_INO, root_inode);
 
             let fuse_adapter = FuserAdapter::new(table, composite, handle);
             let mount_opts = [

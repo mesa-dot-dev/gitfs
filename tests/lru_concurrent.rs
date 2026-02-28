@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{MockCtx, MockDeleter, wait_for_culls};
-use git_fs::cache::eviction::lru::LruEvictionTracker;
+use mesafs::cache::eviction::lru::LruEvictionTracker;
 use tokio::task::JoinSet;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

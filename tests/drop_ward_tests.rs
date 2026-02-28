@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use git_fs::drop_ward::{DropWard, StatelessDrop};
+use mesafs::drop_ward::{DropWard, StatelessDrop};
 
 /// Context that tracks how many times `delete` has been called.
 struct DeleteCounter {

@@ -17,10 +17,10 @@ use futures::TryStreamExt as _;
 use mesa_dev::MesaClient;
 use tracing::warn;
 
-use git_fs::cache::fcache::FileCache;
-use git_fs::fs::async_fs::{FileReader, FsDataProvider, OverlayReader};
-use git_fs::fs::composite::{ChildDescriptor, CompositeFs, CompositeReader, CompositeRoot};
-use git_fs::fs::{INode, INodeType, InodeAddr, InodePerms, OpenFlags, ROOT_INO};
+use mesafs::cache::fcache::FileCache;
+use mesafs::fs::async_fs::{FileReader, FsDataProvider, OverlayReader};
+use mesafs::fs::composite::{ChildDescriptor, CompositeFs, CompositeReader, CompositeRoot};
+use mesafs::fs::{INode, INodeType, InodeAddr, InodePerms, OpenFlags, ROOT_INO};
 
 use super::common::{MesaApiError, mesa_api_error_to_io};
 use super::repo::{MesFileReader, MesRepoProvider};

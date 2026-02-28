@@ -6,7 +6,7 @@ pub mod composite_mocks;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use git_fs::cache::eviction::lru::{Deleter, LruEvictionTracker, Versioned};
+use mesafs::cache::eviction::lru::{Deleter, LruEvictionTracker, Versioned};
 
 /// Minimal versioned context for LRU tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

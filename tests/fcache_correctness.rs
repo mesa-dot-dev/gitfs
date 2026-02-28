@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, missing_docs)]
 
-use git_fs::cache::fcache::{FileCache, InvalidRootPathError};
-use git_fs::cache::traits::{AsyncReadableCache as _, AsyncWritableCache as _};
+use mesafs::cache::fcache::{FileCache, InvalidRootPathError};
+use mesafs::cache::traits::{AsyncReadableCache as _, AsyncWritableCache as _};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn new_creates_directory_and_marker() {
@@ -10,7 +10,7 @@ async fn new_creates_directory_and_marker() {
 
     let _cache = FileCache::<u64>::new(&cache_path, 4096).await.unwrap();
 
-    assert!(cache_path.join(".gitfs_cache").exists());
+    assert!(cache_path.join(".mesafs_cache").exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -19,7 +19,7 @@ async fn new_with_existing_empty_directory() {
     // tmp.path() is an existing empty directory
     let _cache = FileCache::<u64>::new(tmp.path(), 4096).await.unwrap();
 
-    assert!(tmp.path().join(".gitfs_cache").exists());
+    assert!(tmp.path().join(".mesafs_cache").exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -72,7 +72,7 @@ async fn new_cleans_previously_used_directory() {
 
     // Recreate the directory with a marker to simulate a restart
     std::fs::create_dir_all(&cache_path).unwrap();
-    std::fs::write(cache_path.join(".gitfs_cache"), b"").unwrap();
+    std::fs::write(cache_path.join(".mesafs_cache"), b"").unwrap();
     std::fs::write(cache_path.join("leftover"), b"stale").unwrap();
 
     // Second use: should clean old contents

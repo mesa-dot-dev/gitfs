@@ -13,7 +13,7 @@ from typing import Self
 
 import pytest
 
-from tests.conftest import gitfs_container_factory
+from tests.conftest import mesafs_container_factory
 
 REPOS = [
     "kelseyhightower/nocode",
@@ -139,7 +139,7 @@ def dfs_compare(
 @pytest.mark.integration
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize("repo_slug", REPOS, ids=REPOS)
-@pytest.mark.in_container(factory=gitfs_container_factory)
+@pytest.mark.in_container(factory=mesafs_container_factory)
 def test_directory_layout_matches_clone(repo_slug: str) -> None:
     """Compare the directory tree visible through mesafs with a shallow clone.
 
@@ -148,6 +148,6 @@ def test_directory_layout_matches_clone(repo_slug: str) -> None:
     """
     owner, repo = repo_slug.split("/", 1)
     clone_dest = shallow_clone(repo_slug)
-    gitfs_root = Path(f"{MOUNT_POINT}/github/{owner}/{repo}")
+    mesafs_root = Path(f"{MOUNT_POINT}/github/{owner}/{repo}")
 
-    dfs_compare(clone_dest, gitfs_root, excluded_globs={".git"})
+    dfs_compare(clone_dest, mesafs_root, excluded_globs={".git"})

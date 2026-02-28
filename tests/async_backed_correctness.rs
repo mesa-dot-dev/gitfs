@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::oneshot;
 
-use git_fs::cache::async_backed::FutureBackedCache;
+use mesafs::cache::async_backed::FutureBackedCache;
 
 #[tokio::test]
 async fn try_init_ok_caches_value() {

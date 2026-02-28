@@ -14,9 +14,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use common::async_fs_mocks::{MockFsDataProvider, MockFsState, make_dcache, make_inode};
-use git_fs::cache::async_backed::FutureBackedCache;
-use git_fs::fs::async_fs::AsyncFs;
-use git_fs::fs::{INodeType, LoadedAddr};
+use mesafs::cache::async_backed::FutureBackedCache;
+use mesafs::fs::async_fs::AsyncFs;
+use mesafs::fs::{INodeType, LoadedAddr};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unlink_returns_eisdir_for_directory() {
