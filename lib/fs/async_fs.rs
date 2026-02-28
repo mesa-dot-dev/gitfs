@@ -959,15 +959,13 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         // operation — overlay mutation through provider sync. This prevents
         // a concurrent write() from interleaving and sending stale content
         // to the remote (TOCTOU).
-        let write_lock = if size.is_some() {
-            Some(self.inode_write_lock(addr.addr()).await)
-        } else {
-            None
+        let write_lock = match size {
+            Some(_) => Some(self.inode_write_lock(addr.addr()).await),
+            None => None,
         };
-        let _write_guard = if let Some(ref lock) = write_lock {
-            Some(lock.lock().await)
-        } else {
-            None
+        let _write_guard = match write_lock {
+            Some(ref lock) => Some(lock.lock().await),
+            None => None,
         };
 
         let truncated_content = if let Some(new_size) = size {
