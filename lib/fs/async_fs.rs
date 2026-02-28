@@ -971,6 +971,10 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         new_parent: LoadedAddr,
         new_name: &OsStr,
     ) -> Result<(), std::io::Error> {
+        if old_parent == new_parent && old_name == new_name {
+            return Ok(());
+        }
+
         let old_parent_inode = self.loaded_inode(old_parent).await?;
         if old_parent_inode.itype != INodeType::Directory {
             return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));

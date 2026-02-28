@@ -603,7 +603,7 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
             });
     }
 
-    #[instrument(name = "FuserAdapter::rename", skip(self, _req, _flags, reply))]
+    #[instrument(name = "FuserAdapter::rename", skip(self, _req, flags, reply))]
     fn rename(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -611,9 +611,15 @@ impl<DP: FsDataProvider> fuser::Filesystem for FuserAdapter<DP> {
         name: &OsStr,
         newparent: u64,
         newname: &OsStr,
-        _flags: u32,
+        flags: u32,
         reply: fuser::ReplyEmpty,
     ) {
+        // Reject unsupported rename2 flags (RENAME_EXCHANGE, RENAME_WHITEOUT,
+        // RENAME_NOREPLACE). Only plain rename (flags == 0) is supported.
+        if flags != 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
         self.runtime
             .block_on(async {
                 self.inner
