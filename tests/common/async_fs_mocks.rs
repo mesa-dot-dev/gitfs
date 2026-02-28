@@ -14,6 +14,9 @@ use git_fs::fs::async_fs::{FileReader, FsDataProvider};
 use git_fs::fs::dcache::DCache;
 use git_fs::fs::{INode, INodeType, InodeAddr, InodePerms, OpenFlags};
 
+/// Recorded rename calls: `(old_parent_addr, old_name, new_parent_addr, new_name)`.
+type RenameCalls = Vec<(InodeAddr, OsString, InodeAddr, OsString)>;
+
 /// Create a default `Arc<DCache>` rooted at `/` for test use.
 pub fn make_dcache() -> Arc<DCache> {
     Arc::new(DCache::new(PathBuf::from("/")))
@@ -87,7 +90,7 @@ pub struct MockFsState {
     /// Notified after each `unlink` call completes.
     pub unlink_notify: Arc<tokio::sync::Notify>,
     /// Records calls to `rename` as `(old_parent_addr, old_name, new_parent_addr, new_name)` tuples.
-    pub rename_calls: Arc<Mutex<Vec<(InodeAddr, OsString, InodeAddr, OsString)>>>,
+    pub rename_calls: Arc<Mutex<RenameCalls>>,
     /// When `Some`, `rename` will return this error instead of `Ok(())`.
     pub rename_error: Option<Arc<str>>,
     /// Notified after each `rename` call completes.

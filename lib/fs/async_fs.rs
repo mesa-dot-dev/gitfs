@@ -952,6 +952,105 @@ impl<DP: FsDataProvider> AsyncFs<DP> {
         Ok(())
     }
 
+    /// Rename or move a file within the filesystem.
+    ///
+    /// Updates the directory cache and lookup cache to reflect the new
+    /// location. The `inode_table` and `write_overlay` entries are left
+    /// unchanged — the inode address does not change on rename.
+    ///
+    /// If a file already exists at `(new_parent, new_name)`, it is
+    /// implicitly unlinked (marked for cleanup when FUSE refcount drops
+    /// to zero).
+    ///
+    /// Calls [`FsDataProvider::rename`] as a spawned fire-and-forget task
+    /// so the FUSE response is not blocked by remote round-trips.
+    pub async fn rename(
+        &self,
+        old_parent: LoadedAddr,
+        old_name: &OsStr,
+        new_parent: LoadedAddr,
+        new_name: &OsStr,
+    ) -> Result<(), std::io::Error> {
+        let old_parent_inode = self.loaded_inode(old_parent).await?;
+        if old_parent_inode.itype != INodeType::Directory {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
+        }
+
+        let new_parent_inode = self.loaded_inode(new_parent).await?;
+        if new_parent_inode.itype != INodeType::Directory {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
+        }
+
+        // Resolve the source inode.
+        let (child_addr, is_dir) =
+            if let Some(entry) = self.directory_cache.lookup(old_parent, old_name) {
+                (entry.ino, entry.is_dir)
+            } else {
+                let child = self
+                    .data_provider
+                    .lookup(old_parent_inode, old_name)
+                    .await?;
+                (
+                    LoadedAddr::new_unchecked(child.addr),
+                    child.itype == INodeType::Directory,
+                )
+            };
+
+        // If there is an existing entry at the target, mark it as unlinked
+        // so it gets cleaned up when its FUSE refcount drops to zero.
+        if let Some(target_entry) = self.directory_cache.lookup(new_parent, new_name) {
+            let _ = self.unlinked_inodes.insert_sync(target_entry.ino.addr());
+            self.directory_cache.remove_child(new_parent, new_name);
+            self.lookup_cache
+                .remove_sync(&(new_parent.addr(), Arc::from(new_name)));
+        }
+
+        // Remove from old location caches.
+        self.directory_cache.remove_child(old_parent, old_name);
+        self.lookup_cache
+            .remove_sync(&(old_parent.addr(), Arc::from(old_name)));
+
+        // Insert at new location. DCache.insert handles cleanup_stale_entry
+        // automatically (same-parent rename and cross-parent move).
+        self.directory_cache
+            .insert(new_parent, new_name.to_os_string(), child_addr, is_dir);
+
+        // Update the inode's parent field if it changed.
+        if old_parent != new_parent
+            && let Some(mut inode) = self.inode_table.get(&child_addr.addr()).await
+        {
+            inode.parent = Some(new_parent.addr());
+            self.inode_table.insert_sync(child_addr.addr(), inode);
+        }
+
+        // Notify the data provider (fire-and-forget).
+        let dp = self.data_provider.clone();
+        let old_name_owned = old_name.to_os_string();
+        let new_name_owned = new_name.to_os_string();
+        tokio::spawn(async move {
+            if let Err(e) = dp
+                .rename(
+                    old_parent_inode,
+                    &old_name_owned,
+                    new_parent_inode,
+                    &new_name_owned,
+                )
+                .await
+            {
+                tracing::warn!(
+                    old_parent = old_parent_inode.addr,
+                    ?old_name_owned,
+                    new_parent = new_parent_inode.addr,
+                    ?new_name_owned,
+                    %e,
+                    "data provider rename failed (local state is authoritative)"
+                );
+            }
+        });
+
+        Ok(())
+    }
+
     /// Update file attributes (size, timestamps).
     ///
     /// Currently supports:
