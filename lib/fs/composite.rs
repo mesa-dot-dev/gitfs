@@ -532,6 +532,69 @@ where
         }
     }
 
+    fn rename(
+        &self,
+        old_parent: INode,
+        old_name: &OsStr,
+        new_parent: INode,
+        new_name: &OsStr,
+    ) -> impl Future<Output = Result<(), std::io::Error>> + Send {
+        let old_name = old_name.to_os_string();
+        let new_name = new_name.to_os_string();
+        async move {
+            // Reject renames at the composite root (child directories are virtual).
+            if old_parent.addr == ROOT_INO || new_parent.addr == ROOT_INO {
+                return Err(std::io::Error::from_raw_os_error(libc::EROFS));
+            }
+
+            let old_slot_idx = self
+                .inner
+                .addr_to_slot
+                .read_sync(&old_parent.addr, |_, &v| v)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+            let new_slot_idx = self
+                .inner
+                .addr_to_slot
+                .read_sync(&new_parent.addr, |_, &v| v)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+            // Cross-child renames (moving a file between different child
+            // filesystems) are not supported — each child has its own
+            // backend, so there is no single rename operation to delegate to.
+            if old_slot_idx != new_slot_idx {
+                return Err(std::io::Error::from_raw_os_error(libc::EXDEV));
+            }
+
+            let (child, inner_old_parent, inner_new_parent) = self
+                .inner
+                .slots
+                .read_sync(&old_slot_idx, |_, slot| {
+                    (
+                        Arc::clone(&slot.inner),
+                        slot.bridge.forward(old_parent.addr),
+                        slot.bridge.forward(new_parent.addr),
+                    )
+                })
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+            let inner_old_parent =
+                inner_old_parent.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+            let inner_new_parent =
+                inner_new_parent.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+            child
+                .get_fs()
+                .rename(
+                    LoadedAddr::new_unchecked(inner_old_parent),
+                    &old_name,
+                    LoadedAddr::new_unchecked(inner_new_parent),
+                    &new_name,
+                )
+                .await
+        }
+    }
+
     async fn setattr(
         &self,
         inode: INode,
