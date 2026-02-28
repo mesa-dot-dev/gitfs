@@ -68,12 +68,12 @@ impl std::fmt::Display for ExpandedPathBuf {
 fn mesa_runtime_dir() -> Option<PathBuf> {
     let runtime_dir = dirs::runtime_dir();
     if let Some(path) = runtime_dir {
-        return Some(path.join("git-fs"));
+        return Some(path.join("mesafs"));
     }
 
     let home_dir = dirs::home_dir();
     if let Some(path) = home_dir {
-        return Some(path.join(".local").join("share").join("git-fs"));
+        return Some(path.join(".local").join("share").join("mesafs"));
     }
 
     None
@@ -81,14 +81,14 @@ fn mesa_runtime_dir() -> Option<PathBuf> {
 
 fn default_pid_file() -> ExpandedPathBuf {
     ExpandedPathBuf::new(mesa_runtime_dir().map_or_else(
-        || PathBuf::from("/var/run/git-fs.pid"),
-        |rd| rd.join("git-fs.pid"),
+        || PathBuf::from("/var/run/mesafs.pid"),
+        |rd| rd.join("mesafs.pid"),
     ))
 }
 
 fn default_mount_point() -> ExpandedPathBuf {
     ExpandedPathBuf::new(
-        mesa_runtime_dir().map_or_else(|| PathBuf::from("/tmp/git-fs/mnt"), |rd| rd.join("mnt")),
+        mesa_runtime_dir().map_or_else(|| PathBuf::from("/tmp/mesafs/mnt"), |rd| rd.join("mnt")),
     )
 }
 
@@ -117,7 +117,7 @@ impl Default for CacheConfig {
             max_size: None,
             path: ExpandedPathBuf::new(
                 mesa_runtime_dir()
-                    .map_or_else(|| PathBuf::from("/tmp/git-fs/cache"), |rd| rd.join("cache")),
+                    .map_or_else(|| PathBuf::from("/tmp/mesafs/cache"), |rd| rd.join("cache")),
             ),
         }
     }
@@ -315,7 +315,7 @@ impl<'a> From<&'a OrganizationConfig> for DangerousOrganizationConfig<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct DaemonConfig {
-    /// The path to the PID file for the daemon. Uses /var/run/git-fs.pid if not specified.
+    /// The path to the PID file for the daemon. Uses /var/run/mesafs.pid if not specified.
     #[serde(default = "default_pid_file")]
     pub pid_file: ExpandedPathBuf,
 
@@ -517,14 +517,14 @@ impl Config {
 
         #[cfg(not(target_os = "macos"))]
         if let Some(xdg) = dirs::config_dir() {
-            paths.push(xdg.join("git-fs").join("config.toml"));
+            paths.push(xdg.join("mesafs").join("config.toml"));
         }
 
         if let Some(home) = dirs::home_dir() {
-            paths.push(home.join(".config").join("git-fs").join("config.toml"));
+            paths.push(home.join(".config").join("mesafs").join("config.toml"));
         }
 
-        paths.push(PathBuf::from("/etc/git-fs/config.toml"));
+        paths.push(PathBuf::from("/etc/mesafs/config.toml"));
 
         paths
     }

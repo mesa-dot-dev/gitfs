@@ -1,10 +1,10 @@
 [package]
-name = "git-fs"
+name = "mesafs"
 version = "0.2.0-alpha.1"
 edition = "2024"
 description = "Mount Mesa, GitHub and Gitlab repositories as local filesystems via FUSE"
 license = "MIT"
-repository = "https://github.com/mesa-dot-dev/git-fs"
+repository = "https://github.com/mesa-dot-dev/mesafs"
 authors = ["Marko Vejnovic <marko@mesa.dev>"]
 
 [lib]
@@ -131,14 +131,14 @@ section = "utility"
 priority = "optional"
 depends = "$auto"
 assets = [
-    ["target/release/git-fs", "usr/bin/", "755"],
-    ["README.md", "usr/share/doc/git-fs/README.md", "644"],
+    ["target/release/mesafs", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/mesafs/README.md", "644"],
 ]
 
 [package.metadata.generate-rpm]
 assets = [
-    { source = "target/release/git-fs", dest = "/usr/bin/git-fs", mode = "755" },
-    { source = "README.md", dest = "/usr/share/doc/git-fs/README.md", mode = "644", doc = true },
+    { source = "target/release/mesafs", dest = "/usr/bin/mesafs", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/mesafs/README.md", mode = "644", doc = true },
 ]
 
 [package.metadata.generate-rpm.requires]

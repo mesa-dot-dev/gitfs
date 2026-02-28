@@ -2,7 +2,7 @@
 # shellcheck disable=SC1091  # /etc/os-release is not available at lint time
 set -eu
 
-BASE_URL="https://github.com/mesa-dot-dev/git-fs/releases/latest/download"
+BASE_URL="https://github.com/mesa-dot-dev/mesafs/releases/latest/download"
 DEFAULT_INSTALL_DIR="/usr/local/bin"
 AUTO_YES=false
 TMPDIR=""
@@ -45,7 +45,7 @@ parse_args() {
             -y|--yes) AUTO_YES=true ;;
             -h|--help)
                 printf "Usage: install.sh [OPTIONS]\n\n"
-                printf "Install or update git-fs.\n\n"
+                printf "Install or update mesafs.\n\n"
                 printf "Options:\n"
                 printf "  -y, --yes    Non-interactive mode (use defaults, requires root)\n"
                 printf "  -h, --help   Show this help message\n"
@@ -176,9 +176,9 @@ prompt_tarball_install() {
 build_filename() {
     _pkg_type="$1" _distro="$2" _arch_deb="$3" _arch_rpm="$4" _arch_tar="$5"
     case "${_pkg_type}" in
-        deb)     echo "git-fs_${_distro}_${_arch_deb}.deb" ;;
-        rpm)     echo "git-fs_${_distro}.${_arch_rpm}.rpm" ;;
-        tarball) echo "git-fs-linux-${_arch_tar}.tar.gz" ;;
+        deb)     echo "mesafs_${_distro}_${_arch_deb}.deb" ;;
+        rpm)     echo "mesafs_${_distro}.${_arch_rpm}.rpm" ;;
+        tarball) echo "mesafs-linux-${_arch_tar}.tar.gz" ;;
         *)       error "Unknown package type: ${_pkg_type}" ;;
     esac
 }
@@ -211,8 +211,8 @@ install_package() {
         tarball)
             info "Installing binary to ${_install_dir}..."
             tar -xzf "${_filepath}" -C "$(dirname "${_filepath}")"
-            sudo_cmd install -m 755 "$(dirname "${_filepath}")/git-fs" "${_install_dir}/git-fs"
-            warn "Note: git-fs requires FUSE3. Install it with your package manager if not already present."
+            sudo_cmd install -m 755 "$(dirname "${_filepath}")/mesafs" "${_install_dir}/mesafs"
+            warn "Note: mesafs requires FUSE3. Install it with your package manager if not already present."
             ;;
         *)
             error "Unknown package type: ${_pkg_type}"
@@ -221,11 +221,11 @@ install_package() {
 }
 
 verify_install() {
-    if command -v git-fs >/dev/null 2>&1; then
-        _version=$(git-fs --version 2>/dev/null || echo "unknown")
-        success "git-fs installed successfully! (${_version})"
+    if command -v mesafs >/dev/null 2>&1; then
+        _version=$(mesafs --version 2>/dev/null || echo "unknown")
+        success "mesafs installed successfully! (${_version})"
     else
-        success "git-fs installed successfully!"
+        success "mesafs installed successfully!"
     fi
 }
 
@@ -243,12 +243,12 @@ install_macos() {
     fi
 
     # Install or upgrade
-    if brew list --formula git-fs >/dev/null 2>&1; then
-        info "git-fs is already installed. Upgrading..."
-        brew upgrade "${_tap}/git-fs" || info "git-fs is already up to date."
+    if brew list --formula mesafs >/dev/null 2>&1; then
+        info "mesafs is already installed. Upgrading..."
+        brew upgrade "${_tap}/mesafs" || info "mesafs is already up to date."
     else
-        info "Installing git-fs..."
-        brew install "${_tap}/git-fs"
+        info "Installing mesafs..."
+        brew install "${_tap}/mesafs"
     fi
 }
 
@@ -256,7 +256,7 @@ main() {
     parse_args "$@"
 
     printf "\n"
-    info "${BOLD}git-fs installer${RESET}"
+    info "${BOLD}mesafs installer${RESET}"
     printf "\n"
 
     detect_os

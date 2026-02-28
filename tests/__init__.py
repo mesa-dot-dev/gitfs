@@ -1,1 +1,1 @@
-"""Integration tests for git-fs."""
+"""Integration tests for mesafs."""

@@ -12,27 +12,27 @@ use crate::{
 };
 
 const WELCOME_MESSAGE: &str = "
-    \x1b[32m@@@@\x1b[0m      Welcome to \x1b[1mgit-fs\x1b[0m! Let's get you started!
+    \x1b[32m@@@@\x1b[0m      Welcome to \x1b[1mmesafs\x1b[0m! Let's get you started!
     \x1b[32m@@@@ @@@\x1b[0m
-    \x1b[32m@@@@ @@@\x1b[0m  \x1b[1mgit-fs\x1b[0m allows you to mount all of GitHub on your local filesystem.
+    \x1b[32m@@@@ @@@\x1b[0m  \x1b[1mmesafs\x1b[0m allows you to mount all of GitHub on your local filesystem.
 \x1b[32m@@@ @@@@@@@@\x1b[0m  It works by mirroring GitHub repositories to fast caches hosted on \x1b]8;;https://mesa.dev\x1b\\\x1b[1mmesa.dev\x1b[0m\x1b]8;;\x1b\\.
  \x1b[32m@@@@@@@@@@\x1b[0m
   \x1b[32m@@@@@@@@\x1b[0m
     \x1b[32m@@@@\x1b[0m      Mesa ships a fast on-demand VCS, optimized for agentic AI.
-    \x1b[32m@@@@\x1b[0m      You do not need to use Mesa products to use \x1b[1mgit-fs\x1b[0m, but if you
-    \x1b[32m@@@@\x1b[0m      like \x1b[1mgit-fs\x1b[0m, we're sure you're going to love \x1b]8;;https://mesa.dev\x1b\\\x1b[1mmesa.dev\x1b[0m\x1b]8;;\x1b\\.
+    \x1b[32m@@@@\x1b[0m      You do not need to use Mesa products to use \x1b[1mmesafs\x1b[0m, but if you
+    \x1b[32m@@@@\x1b[0m      like \x1b[1mmesafs\x1b[0m, we're sure you're going to love \x1b]8;;https://mesa.dev\x1b\\\x1b[1mmesa.dev\x1b[0m\x1b]8;;\x1b\\.
 ";
 
 const WELCOME_MESSAGE_PLAIN: &str = "
-    @@@@      Welcome to git-fs! Let's get you started!
+    @@@@      Welcome to mesafs! Let's get you started!
     @@@@ @@@
-    @@@@ @@@  git-fs allows you to mount all of GitHub on your local filesystem.
+    @@@@ @@@  mesafs allows you to mount all of GitHub on your local filesystem.
 @@@ @@@@@@@@  It works by mirroring GitHub repositories to fast caches hosted on mesa.dev.
  @@@@@@@@@@
   @@@@@@@@
     @@@@      Mesa ships a fast on-demand VCS, optimized for agentic AI.
-    @@@@      You do not need to use Mesa products to use git-fs, but if you
-    @@@@      like git-fs, we're sure you're going to love mesa.dev.
+    @@@@      You do not need to use Mesa products to use mesafs, but if you
+    @@@@      like mesafs, we're sure you're going to love mesa.dev.
 ";
 
 /// Error type for onboarding wizard failures.
@@ -67,7 +67,7 @@ pub fn run_wizard() -> Result<Config, OnboardingError> {
 
     let defaults = Config::default();
 
-    let mount_point_str = Text::new("Where should git-fs mount the filesystem?")
+    let mount_point_str = Text::new("Where should mesafs mount the filesystem?")
         .with_default(&defaults.mount_point.display().to_string())
         .prompt()?;
     let mount_point = ExpandedPathBuf::new(PathBuf::from(
@@ -117,7 +117,7 @@ pub fn run_wizard() -> Result<Config, OnboardingError> {
     }
 
     let enable_vendor_telemetry = Confirm::new(
-        "Would you like to share anonymous usage data with Mesa to help improve git-fs?",
+        "Would you like to share anonymous usage data with Mesa to help improve mesafs?",
     )
     .with_default(true)
     .with_help_message(

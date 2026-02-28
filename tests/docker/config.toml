@@ -1,9 +1,9 @@
-mount-point = "/mnt/git-fs"
+mount-point = "/mnt/mesafs"
 uid = 0
 gid = 0
 
 [cache]
-path = "/tmp/git-fs-cache"
+path = "/tmp/mesafs-cache"
 
 [daemon]
-pid-file = "/tmp/git-fs.pid"
+pid-file = "/tmp/mesafs.pid"

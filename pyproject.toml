@@ -1,7 +1,7 @@
 [project]
-name = "git-fs-tests"
+name = "mesafs-tests"
 version = "0.0.0"
-description = "Integration tests for git-fs (Rust/FUSE). Not a Python package."
+description = "Integration tests for mesafs (Rust/FUSE). Not a Python package."
 requires-python = ">=3.14"
 dependencies = []
 

@@ -140,12 +140,13 @@ jobs:
 
       - uses: mesa-dot-dev/homebrew-tap-action@main
         with:
+          name: mesafs
           tap: mesa-dot-dev/homebrew-tap
           tap-token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           tap-branch: staged
           template: formula.rb
-          latest-path: Formula/git-fs.rb
-          versioned-path: "Formula/git-fs@${VERSION}.rb"
+          latest-path: Formula/mesafs.rb
+          versioned-path: "Formula/mesafs@${VERSION}.rb"
           version: ${{ needs.promote.outputs.base_version }}
           url: "https://github.com/${{ github.repository }}/releases/download/v${{ needs.promote.outputs.base_version }}/git-fs-macos-universal.tar.gz"
           commit-message: "git-fs ${VERSION}"

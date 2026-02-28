@@ -1,4 +1,4 @@
-"""Compare directory layout and file contents of git-fs vs git clone."""
+"""Compare directory layout and file contents of mesafs vs git clone."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ REPOS = [
     "github-samples/planventure",
 ]
 
-MOUNT_POINT = "/mnt/git-fs"
+MOUNT_POINT = "/mnt/mesafs"
 
 
 def shallow_clone(repo_slug: str) -> Path:
@@ -141,7 +141,7 @@ def dfs_compare(
 @pytest.mark.parametrize("repo_slug", REPOS, ids=REPOS)
 @pytest.mark.in_container(factory=gitfs_container_factory)
 def test_directory_layout_matches_clone(repo_slug: str) -> None:
-    """Compare the directory tree visible through git-fs with a shallow clone.
+    """Compare the directory tree visible through mesafs with a shallow clone.
 
     Entry names, types (file/directory/symlink), file contents, and symlink
     targets are all compared.

@@ -1,4 +1,4 @@
-# Stage 1: Build the git-fs binary
+# Stage 1: Build the mesafs binary
 FROM rust:1.93-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
@@ -34,10 +34,10 @@ RUN apt-get update && apt-get install -y \
 # Allow non-root users to mount FUSE filesystems
 RUN sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf || true
 
-COPY --from=builder /src/target/release/git-fs /usr/local/bin/git-fs
+COPY --from=builder /src/target/release/mesafs /usr/local/bin/mesafs
 
-RUN mkdir -p /mnt/git-fs /etc/git-fs
-COPY tests/docker/config.toml /etc/git-fs/config.toml
+RUN mkdir -p /mnt/mesafs /etc/mesafs
+COPY tests/docker/config.toml /etc/mesafs/config.toml
 COPY tests/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

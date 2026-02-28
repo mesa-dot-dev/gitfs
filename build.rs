@@ -1,4 +1,4 @@
-//! Build script for git-fs that emits git metadata via vergen.
+//! Build script for mesafs that emits git metadata via vergen.
 
 /// Emit compile-time git metadata so it is available at runtime.
 ///

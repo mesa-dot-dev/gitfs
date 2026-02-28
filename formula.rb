@@ -1,7 +1,7 @@
 class ${FORMULA_CLASS_NAME} < Formula
   desc "Mount Mesa, GitHub and GitLab repositories as local filesystems via FUSE"
   homepage "${REPO_URL}"
-  url "https://github.com/mesa-dot-dev/git-fs/releases/download/v${VERSION}/git-fs-macos-universal.tar.gz"
+  url "https://github.com/mesa-dot-dev/mesafs/releases/download/v${VERSION}/mesafs-macos-universal.tar.gz"
   version "${VERSION}"
   sha256 "${SHA256}"
   license "MIT"
@@ -9,12 +9,12 @@ class ${FORMULA_CLASS_NAME} < Formula
   depends_on :macos
 
   def install
-    bin.install "git-fs"
+    bin.install "mesafs"
   end
 
   def caveats
     <<~EOS
-      git-fs requires macFUSE. Install it from:
+      mesafs requires macFUSE. Install it from:
         https://macfuse.github.io/
 
       The Homebrew cask version of macFUSE is outdated.

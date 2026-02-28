@@ -78,7 +78,7 @@ mod managed_fuse {
 
             let fuse_adapter = FuserAdapter::new(table, composite, handle);
             let mount_opts = [
-                fuser::MountOption::FSName("git-fs".to_owned()),
+                fuser::MountOption::FSName("mesafs".to_owned()),
                 fuser::MountOption::RW,
                 fuser::MountOption::NoDev,
                 fuser::MountOption::Exec,
@@ -229,7 +229,7 @@ pub async fn run(
     let fuse = managed_fuse::ManagedFuse::new(&config);
     {
         let _session = fuse.spawn(config, handle.clone())?;
-        info!("git-fs is running. Press Ctrl+C to stop.");
+        info!("mesafs is running. Press Ctrl+C to stop.");
 
         wait_for_exit().await?;
     }

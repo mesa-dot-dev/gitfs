@@ -80,7 +80,7 @@ fn macos_major_version() -> Option<u32> {
 pub enum FuseCheckError {
     /// macFUSE is not installed at all.
     #[error(
-        "macFUSE is not installed. git-fs requires macFUSE to mount filesystems.\n\
+        "macFUSE is not installed. mesafs requires macFUSE to mount filesystems.\n\
          Install it from: https://macfuse.github.io/"
     )]
     NotInstalled,
@@ -118,7 +118,7 @@ pub enum FuseCheckError {
 
     /// macFUSE is installed with the `FSKit` backend, which is not supported.
     #[error(
-        "macFUSE is installed with the FSKit backend, which git-fs does not support.\n\
+        "macFUSE is installed with the FSKit backend, which mesafs does not support.\n\
          Please install the kernel extension (kext) version of macFUSE instead.\n\
          Download from: https://macfuse.github.io/"
     )]

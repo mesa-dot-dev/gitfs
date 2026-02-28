@@ -139,7 +139,7 @@ impl Trc {
         }
 
         let resource = Resource::builder()
-            .with_service_name("git-fs")
+            .with_service_name("mesafs")
             .with_attribute(opentelemetry::KeyValue::new(
                 "service.version",
                 env!("CARGO_PKG_VERSION"),
@@ -204,7 +204,7 @@ impl Trc {
 
                 let otel_layer = provider
                     .as_ref()
-                    .map(|p| tracing_opentelemetry::layer().with_tracer(p.tracer("git-fs")));
+                    .map(|p| tracing_opentelemetry::layer().with_tracer(p.tracer("mesafs")));
 
                 tracing_subscriber::registry()
                     .with(reload_layer)
@@ -216,7 +216,7 @@ impl Trc {
             TrcMode::Ugly { .. } => {
                 let otel_layer = provider
                     .as_ref()
-                    .map(|p| tracing_opentelemetry::layer().with_tracer(p.tracer("git-fs")));
+                    .map(|p| tracing_opentelemetry::layer().with_tracer(p.tracer("mesafs")));
 
                 tracing_subscriber::registry()
                     .with(reload_layer)

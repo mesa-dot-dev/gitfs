@@ -1,6 +1,6 @@
-//! git-fs shared library.
+//! mesafs shared library.
 
-/// Caching primitives for git-fs.
+/// Caching primitives for mesafs.
 pub mod cache;
 pub mod drop_ward;
 /// Filesystem abstractions and caching layers.

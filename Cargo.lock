@@ -817,55 +817,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "git-fs"
-version = "0.2.0-alpha.1"
-dependencies = [
- "async-trait",
- "base64",
- "bimap",
- "bitflags",
- "bytes",
- "bytesize",
- "clap",
- "daemonize",
- "dirs",
- "fuser",
- "futures",
- "hashlink",
- "http",
- "ignore",
- "inquire",
- "libc",
- "mesa-dev",
- "nix",
- "num-traits",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "rand",
- "reqwest",
- "reqwest-middleware",
- "rustc-hash",
- "scc",
- "secrecy",
- "self_update",
- "semver",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "shellexpand",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "toml",
- "tracing",
- "tracing-indicatif",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "vergen-gitcl",
-]
-
-[[package]]
 name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1461,6 +1412,55 @@ dependencies = [
  "serde_repr",
  "serde_with",
  "url",
+]
+
+[[package]]
+name = "mesafs"
+version = "0.2.0-alpha.1"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bimap",
+ "bitflags",
+ "bytes",
+ "bytesize",
+ "clap",
+ "daemonize",
+ "dirs",
+ "fuser",
+ "futures",
+ "hashlink",
+ "http",
+ "ignore",
+ "inquire",
+ "libc",
+ "mesa-dev",
+ "nix",
+ "num-traits",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "rand",
+ "reqwest",
+ "reqwest-middleware",
+ "rustc-hash",
+ "scc",
+ "secrecy",
+ "self_update",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "shellexpand",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-indicatif",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "vergen-gitcl",
 ]
 
 [[package]]
