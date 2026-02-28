@@ -14,6 +14,9 @@ use git_fs::fs::async_fs::{FileReader, FsDataProvider};
 use git_fs::fs::dcache::DCache;
 use git_fs::fs::{INode, INodeType, InodeAddr, InodePerms, OpenFlags};
 
+/// Recorded rename calls: `(old_parent_addr, old_name, new_parent_addr, new_name)`.
+type RenameCalls = Vec<(InodeAddr, OsString, InodeAddr, OsString)>;
+
 /// Create a default `Arc<DCache>` rooted at `/` for test use.
 pub fn make_dcache() -> Arc<DCache> {
     Arc::new(DCache::new(PathBuf::from("/")))
@@ -86,6 +89,12 @@ pub struct MockFsState {
     pub write_notify: Arc<tokio::sync::Notify>,
     /// Notified after each `unlink` call completes.
     pub unlink_notify: Arc<tokio::sync::Notify>,
+    /// Records calls to `rename` as `(old_parent_addr, old_name, new_parent_addr, new_name)` tuples.
+    pub rename_calls: Arc<Mutex<RenameCalls>>,
+    /// When `Some`, `rename` will return this error instead of `Ok(())`.
+    pub rename_error: Option<Arc<str>>,
+    /// Notified after each `rename` call completes.
+    pub rename_notify: Arc<tokio::sync::Notify>,
 }
 
 /// A clonable mock data provider for `AsyncFs` tests.
@@ -206,6 +215,28 @@ impl FsDataProvider for MockFsDataProvider {
             Ok(())
         };
         self.state.unlink_notify.notify_one();
+        result
+    }
+
+    async fn rename(
+        &self,
+        old_parent: INode,
+        old_name: &OsStr,
+        new_parent: INode,
+        new_name: &OsStr,
+    ) -> Result<(), std::io::Error> {
+        self.state.rename_calls.lock().await.push((
+            old_parent.addr,
+            old_name.to_os_string(),
+            new_parent.addr,
+            new_name.to_os_string(),
+        ));
+        let result = if let Some(ref msg) = self.state.rename_error {
+            Err(std::io::Error::other(msg.as_ref()))
+        } else {
+            Ok(())
+        };
+        self.state.rename_notify.notify_one();
         result
     }
 }
