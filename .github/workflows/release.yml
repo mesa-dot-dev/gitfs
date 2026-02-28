@@ -68,9 +68,18 @@ jobs:
             pkg-config \
             libfuse3-dev \
             libssl-dev \
-            protobuf-compiler \
             curl \
-            git
+            git \
+            unzip
+
+      - name: Install protoc
+        run: |
+          PROTOC_VERSION=28.3
+          ARCH=$(dpkg --print-architecture)
+          if [ "$ARCH" = "amd64" ]; then PROTOC_ARCH="x86_64"; else PROTOC_ARCH="aarch_64"; fi
+          curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip" -o /tmp/protoc.zip
+          unzip -o /tmp/protoc.zip -d /usr/local bin/protoc
+          protoc --version
 
       - uses: actions/checkout@v4
 
@@ -170,9 +179,18 @@ jobs:
             pkg-config \
             fuse3-devel \
             openssl-devel \
-            protobuf-compiler \
             curl \
-            git
+            git \
+            unzip
+
+      - name: Install protoc
+        run: |
+          PROTOC_VERSION=28.3
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "x86_64" ]; then PROTOC_ARCH="x86_64"; else PROTOC_ARCH="aarch_64"; fi
+          curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip" -o /tmp/protoc.zip
+          unzip -o /tmp/protoc.zip -d /usr/local bin/protoc
+          protoc --version
 
       - uses: actions/checkout@v4
 
@@ -237,9 +255,18 @@ jobs:
             pkg-config \
             fuse3-devel \
             openssl-devel \
-            protobuf-compiler \
             curl \
-            git
+            git \
+            unzip
+
+      - name: Install protoc
+        run: |
+          PROTOC_VERSION=28.3
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "x86_64" ]; then PROTOC_ARCH="x86_64"; else PROTOC_ARCH="aarch_64"; fi
+          curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip" -o /tmp/protoc.zip
+          unzip -o /tmp/protoc.zip -d /usr/local bin/protoc
+          protoc --version
 
       - uses: actions/checkout@v4
 
