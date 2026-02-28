@@ -68,6 +68,7 @@ jobs:
             pkg-config \
             libfuse3-dev \
             libssl-dev \
+            protobuf-compiler \
             curl \
             git
 
@@ -169,6 +170,7 @@ jobs:
             pkg-config \
             fuse3-devel \
             openssl-devel \
+            protobuf-compiler \
             curl \
             git
 
@@ -235,6 +237,7 @@ jobs:
             pkg-config \
             fuse3-devel \
             openssl-devel \
+            protobuf-compiler \
             curl \
             git
 
@@ -286,8 +289,8 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install macFUSE
-        run: brew install macfuse
+      - name: Install macFUSE and protobuf
+        run: brew install macfuse protobuf
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
