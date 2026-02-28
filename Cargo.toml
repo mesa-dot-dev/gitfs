@@ -13,7 +13,7 @@ path = "lib/lib.rs"
 [dependencies]
 clap = { version = "4.5.54", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-fuser = { version = "0.16.0", features = ["libfuse"] }
+fuser = { git = "https://github.com/mesa-dot-dev/fuser", branch = "0.16.0", features = ["libfuse"] }
 libc = "0.2"
 mesa-dev = "1.24.0"
 num-traits = "0.2"
