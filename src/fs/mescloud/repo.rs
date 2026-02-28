@@ -48,6 +48,7 @@ enum RemoteOp {
     Create { path: String },
     Write { path: String, data: Bytes },
     Unlink { path: String },
+    Rename { old_path: String, new_path: String },
 }
 
 impl ChangeState {
@@ -229,6 +230,21 @@ async fn execute_unlink(state: &ChangeState, path: &str) -> Result<(), std::io::
     state.snapshot_and_flush(&format!("Delete {path}")).await
 }
 
+async fn execute_rename(
+    state: &ChangeState,
+    old_path: &str,
+    new_path: &str,
+) -> Result<(), std::io::Error> {
+    state
+        .client
+        .move_path(&state.change_id, old_path, new_path)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    state
+        .snapshot_and_flush(&format!("Rename {old_path} to {new_path}"))
+        .await
+}
+
 /// Background task that processes remote operations in FIFO order.
 ///
 /// Lazily initializes the `ChangeState` on first operation. If a gRPC
@@ -257,6 +273,9 @@ async fn remote_op_consumer(
             RemoteOp::Create { path } => execute_create(state, path).await,
             RemoteOp::Write { path, data } => execute_write(state, path, data).await,
             RemoteOp::Unlink { path } => execute_unlink(state, path).await,
+            RemoteOp::Rename { old_path, new_path } => {
+                execute_rename(state, old_path, new_path).await
+            }
         };
         if let Err(e) = result {
             // NOTE(MES-854): no backoff — re-init is attempted on every
@@ -688,6 +707,73 @@ impl FsDataProvider for MesRepoProvider {
                     .dcache
                     .clear_ignore_rules(LoadedAddr::new_unchecked(parent.addr), fname);
             }
+
+            Ok(())
+        }
+    }
+
+    fn rename(
+        &self,
+        old_parent: INode,
+        old_name: &OsStr,
+        new_parent: INode,
+        new_name: &OsStr,
+    ) -> impl Future<Output = Result<(), std::io::Error>> + Send {
+        let inner = Arc::clone(&self.inner);
+        let old_name = old_name.to_os_string();
+        let new_name = new_name.to_os_string();
+        async move {
+            let old_parent_path = inner
+                .path_map
+                .get_async(&old_parent.addr)
+                .await
+                .map(|e| e.get().clone())
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+            let new_parent_path = inner
+                .path_map
+                .get_async(&new_parent.addr)
+                .await
+                .map(|e| e.get().clone())
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+
+            let old_child_path = old_parent_path.join(&old_name);
+            let new_child_path = new_parent_path.join(&new_name);
+
+            let old_path_str = old_child_path.to_str().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "path contains non-UTF-8 characters",
+                )
+            })?;
+
+            let new_path_str = new_child_path.to_str().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "path contains non-UTF-8 characters",
+                )
+            })?;
+
+            // Update path_map for the child at the new location.
+            // The dcache has already been updated by AsyncFs::rename before
+            // this provider method is called, so look up the child at the
+            // NEW location.
+            if let Some(child_entry) = inner
+                .dcache
+                .lookup(LoadedAddr::new_unchecked(new_parent.addr), &new_name)
+            {
+                drop(
+                    inner
+                        .path_map
+                        .insert_async(child_entry.ino.addr(), new_child_path.clone())
+                        .await,
+                );
+            }
+
+            drop(inner.op_tx.send(RemoteOp::Rename {
+                old_path: old_path_str.to_owned(),
+                new_path: new_path_str.to_owned(),
+            }));
 
             Ok(())
         }
