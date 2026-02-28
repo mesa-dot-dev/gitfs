@@ -446,6 +446,24 @@ impl FsDataProvider for OrgChildDP {
         }
     }
 
+    fn rename(
+        &self,
+        old_parent: INode,
+        old_name: &OsStr,
+        new_parent: INode,
+        new_name: &OsStr,
+    ) -> impl Future<Output = Result<(), std::io::Error>> + Send {
+        let this = self.clone();
+        let old_name = old_name.to_os_string();
+        let new_name = new_name.to_os_string();
+        async move {
+            match this {
+                Self::Standard(c) => c.rename(old_parent, &old_name, new_parent, &new_name).await,
+                Self::Github(c) => c.rename(old_parent, &old_name, new_parent, &new_name).await,
+            }
+        }
+    }
+
     fn setattr(
         &self,
         inode: INode,
