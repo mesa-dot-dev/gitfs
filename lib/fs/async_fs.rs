@@ -140,6 +140,20 @@ pub trait FsDataProvider: Clone + Send + Sync + 'static {
         async { Err(std::io::Error::from_raw_os_error(libc::EROFS)) }
     }
 
+    /// Rename or move a file from one location to another.
+    ///
+    /// The default implementation returns `EROFS` (read-only filesystem).
+    /// Providers that support renaming should override this.
+    fn rename(
+        &self,
+        _old_parent: INode,
+        _old_name: &OsStr,
+        _new_parent: INode,
+        _new_name: &OsStr,
+    ) -> impl Future<Output = Result<(), std::io::Error>> + Send {
+        async { Err(std::io::Error::from_raw_os_error(libc::EROFS)) }
+    }
+
     /// Returns the shared directory cache, if the provider owns one.
     ///
     /// Providers that need to share their [`DCache`] with the wrapping
